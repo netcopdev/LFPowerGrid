@@ -251,15 +251,15 @@ class LFPG_BTCAtmBase : LFPG_DeviceBase
     }
 
     // ============================================
-    // Lifecycle: init defaults from config
+    // Lifecycle: withdraw-only is not seeded here
     // ============================================
     override void LFPG_OnInit()
     {
         #ifdef SERVER
-        // On first creation (stock=0 and no persist load),
-        // set withdrawOnly from config default.
-        // (Persist load will overwrite if it runs after.)
-        // This is safe because OnStoreLoad runs before EEInit.
+        // The config value is a global floor applied in
+        // LFPG_IsWithdrawOnly under SERVER. It is not written
+        // into persisted ATM state. A per-ATM off cannot
+        // override the floor while the floor is active.
         #endif
     }
 

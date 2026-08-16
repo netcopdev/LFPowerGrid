@@ -1373,23 +1373,23 @@ class LFPG_DeviceInspector
 
         // Declared ports with no matching edge get an explicit empty row.
         // Count before collapse: a device with no edges still lists free ports.
-        LFPG_DeviceBase inspectDev = null;
+        // DeviceAPI covers DeviceBase, duck-typed owners (generator/lamp), and vanilla.
+        EntityAI inspectEnt = null;
         if (m_CurrentDeviceId != "")
         {
-            EntityAI inspectEnt = LFPG_DeviceRegistry.Get().FindById(m_CurrentDeviceId);
-            inspectDev = LFPG_DeviceBase.Cast(inspectEnt);
+            inspectEnt = LFPG_DeviceRegistry.Get().FindById(m_CurrentDeviceId);
         }
 
         int freeCount = 0;
         int portCount = 0;
-        if (inspectDev)
+        if (inspectEnt)
         {
-            portCount = inspectDev.LFPG_GetPortCount();
+            portCount = LFPG_DeviceAPI.GetPortCount(inspectEnt);
         }
         int pi;
         for (pi = 0; pi < portCount; pi = pi + 1)
         {
-            string declaredName = inspectDev.LFPG_GetPortName(pi);
+            string declaredName = LFPG_DeviceAPI.GetPortName(inspectEnt, pi);
             if (declaredName == "")
                 continue;
             if (IsLocalPortOccupied(declaredName))
@@ -1482,7 +1482,7 @@ class LFPG_DeviceInspector
             }
 
             string line = arrow;
-            line = line + ResolvePortDisplayLabel(inspectDev, entry.m_LocalPort);
+            line = line + ResolvePortDisplayLabel(inspectEnt, entry.m_LocalPort);
             line = line + "  >  ";
             line = line + FormatDeviceName(entry.m_RemoteTypeName);
 
@@ -1517,7 +1517,7 @@ class LFPG_DeviceInspector
             if (slotIdx >= maxShow)
                 break;
 
-            string freeName = inspectDev.LFPG_GetPortName(pi);
+            string freeName = LFPG_DeviceAPI.GetPortName(inspectEnt, pi);
             if (freeName == "")
                 continue;
             if (IsLocalPortOccupied(freeName))
@@ -1530,7 +1530,7 @@ class LFPG_DeviceInspector
                 continue;
             }
 
-            int freeDir = inspectDev.LFPG_GetPortDir(pi);
+            int freeDir = LFPG_DeviceAPI.GetPortDir(inspectEnt, pi);
             string freeArrow = "";
             if (freeDir == LFPG_PortDir.OUT)
             {
@@ -1544,7 +1544,7 @@ class LFPG_DeviceInspector
             }
 
             string freeLine = freeArrow;
-            freeLine = freeLine + ResolvePortDisplayLabel(inspectDev, freeName);
+            freeLine = freeLine + ResolvePortDisplayLabel(inspectEnt, freeName);
             freeLine = freeLine + "  >  ";
             freeLine = freeLine + Loc("#STR_LFPG_INSPECT_PORT_EMPTY");
 
@@ -1860,10 +1860,12 @@ class LFPG_DeviceInspector
     }
 
     // True when an inspect-response edge already names this local port.
+    // Empty port indexes as input_main on both sides (same rule as IncomingPortIndexKey).
     protected bool IsLocalPortOccupied(string portName)
     {
-        if (portName == "")
-            return false;
+        string want = portName;
+        if (want == "")
+            want = "input_main";
 
         int i;
         int n = m_RespWires.Count();
@@ -1872,26 +1874,29 @@ class LFPG_DeviceInspector
             LFPG_InspectWireEntry entry = m_RespWires[i];
             if (!entry)
                 continue;
-            if (entry.m_LocalPort == portName)
+            string have = entry.m_LocalPort;
+            if (have == "")
+                have = "input_main";
+            if (have == want)
                 return true;
         }
         return false;
     }
 
     // Declared m_Label wins. FormatPortName only fills a blank label.
-    protected static string ResolvePortDisplayLabel(LFPG_DeviceBase device, string portName)
+    protected static string ResolvePortDisplayLabel(EntityAI device, string portName)
     {
         if (device)
         {
             int i;
-            int n = device.LFPG_GetPortCount();
+            int n = LFPG_DeviceAPI.GetPortCount(device);
             for (i = 0; i < n; i = i + 1)
             {
-                string declaredName = device.LFPG_GetPortName(i);
+                string declaredName = LFPG_DeviceAPI.GetPortName(device, i);
                 if (declaredName != portName)
                     continue;
 
-                string declaredLabel = device.LFPG_GetPortLabel(i);
+                string declaredLabel = LFPG_DeviceAPI.GetPortLabel(device, i);
                 if (declaredLabel != "")
                     return declaredLabel;
                 break;

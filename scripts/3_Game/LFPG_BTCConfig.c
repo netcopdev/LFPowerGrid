@@ -47,7 +47,7 @@ class LFPG_BTCSettingsData
     int maxEurPerOperation;     // BTC large-amount cap 2026-05-19: hard cap on eurAmount per WithdrawCash/DepositCash tx
 
     // ATM behavior
-    bool atmWithdrawOnlyDefault;  // Default for new ATMs
+    bool atmWithdrawOnlyDefault;  // Global floor applied in the getter under SERVER; not written to persisted state; a per-ATM off cannot override it while active
 
     // Balance provider mode: "auto", "native", "lbmaster"
     string balanceMode;
