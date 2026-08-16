@@ -930,124 +930,45 @@ class LFPG_RPCServerHandler
         // Propagate: graph rebuilds from clean wire state, then marks sources dirty.
         // Reverse index already updated incrementally above (no full rebuild needed).
 
-        // v0.7.23 (Bug 6): Also remove wires TARGETING this device's IN ports.
+        // Also remove wires TARGETING this device's IN ports.
         // ClearDeviceWires only removes OWNED wires (output side).
-        // Input wires are owned by the upstream device, so we must
-        // call RemoveWiresTargeting for each IN port to cut them too.
-        int inRemovedTotal = 0;
+        // Rescue fires if any IN port missed the index, then one unfiltered scan.
+        // Devices with ports but no IN (vanilla source) also fire: the frozen
+        // tree scanned on portCount > 0 even when the IN total stayed zero.
+        bool anyPortMissedIndex = false;
+        bool anyInRemovedByIndex = false;
         int portCount = LFPG_DeviceAPI.GetPortCount(obj);
+        int inPortCount = 0;
         int pi;
         for (pi = 0; pi < portCount; pi = pi + 1)
         {
             int portDir = LFPG_DeviceAPI.GetPortDir(obj, pi);
             if (portDir == LFPG_PortDir.IN)
             {
+                inPortCount = inPortCount + 1;
                 string inPort = LFPG_DeviceAPI.GetPortName(obj, pi);
                 int inRemoved = LFPG_NetworkManager.Get().RemoveWiresTargeting(deviceId, inPort, cutPid, allowOthers);
                 if (inRemoved > 0)
                 {
                     changed = true;
-                    inRemovedTotal = inRemovedTotal + inRemoved;
+                    anyInRemovedByIndex = true;
                     LFPG_Util.Info("CutWires: removed " + inRemoved.ToString() + " incoming wire(s) on " + deviceId + ":" + inPort);
+                }
+                else
+                {
+                    anyPortMissedIndex = true;
                 }
             }
         }
 
-        // v0.7.25 (Bug 3): FALLBACK brute-force scan if reverse index missed wires.
-        // The reverse index can become stale after migration, persistence load,
-        // or incremental update edge cases. This direct scan catches any wires
-        // targeting this device that RemoveWiresTargeting couldn't find via index.
-        if (inRemovedTotal == 0 && portCount > 0)
+        if (anyPortMissedIndex || (portCount > 0 && inPortCount == 0))
         {
-            array<EntityAI> allDevs = new array<EntityAI>;
-            LFPG_DeviceRegistry.Get().GetAll(allDevs);
-            int di;
-            for (di = 0; di < allDevs.Count(); di = di + 1)
-            {
-                EntityAI srcDev = allDevs[di];
-                if (!srcDev) continue;
-                if (srcDev == obj) continue;
-                if (!LFPG_DeviceAPI.HasWireStore(srcDev)) continue;
-
-                string srcId = LFPG_DeviceAPI.GetDeviceId(srcDev);
-                ref array<ref LFPG_WireData> srcWires = LFPG_DeviceAPI.GetDeviceWires(srcDev);
-                if (!srcWires) continue;
-
-                bool srcChanged = false;
-                ref array<int> fallbackDeltaOps = new array<int>;
-                ref array<ref LFPG_WireData> fallbackDeltaWires = new array<ref LFPG_WireData>;
-                int sw = srcWires.Count() - 1;
-                while (sw >= 0)
-                {
-                    LFPG_WireData swd = srcWires[sw];
-                    if (swd && swd.m_TargetDeviceId == deviceId && (allowOthers || LFPG_WireHelper.CanCreatorCutWire(swd, cutPid, allowOthers)))
-                    {
-                        LFPG_Util.Warn("[CutWires-Fallback] Found stale wire: " + srcId + ":" + swd.m_SourcePort + " -> " + deviceId + ":" + swd.m_TargetPort);
-                        LFPG_NetworkManager.Get().PlayerWireCountAdd(swd.m_CreatorId, -1);
-                        fallbackDeltaOps.Insert(LFPG_WireDeltaOp.REMOVE);
-                        fallbackDeltaWires.Insert(swd);
-                        srcWires.Remove(sw);
-                        srcChanged = true;
-                        changed = true;
-                    }
-                    sw = sw - 1;
-                }
-
-                if (srcChanged)
-                {
-                    LFPG_WireOwnerBase fallbackWireOwner = LFPG_WireOwnerBase.Cast(srcDev);
-                    if (fallbackWireOwner)
-                    {
-                        fallbackWireOwner.LFPG_CommitWireMutation();
-                        LFPG_NetworkManager.Get().BroadcastOwnerWireDelta(srcDev, fallbackDeltaOps, fallbackDeltaWires);
-                    }
-                    else
-                    {
-                        srcDev.SetSynchDirty();
-                        LFPG_NetworkManager.Get().BroadcastOwnerWires(srcDev);
-                    }
-                    LFPG_NetworkManager.Get().RequestPropagate(srcId);
-                }
-            }
-
-            // Also scan vanilla wire store
-            int vkScan;
-            int vkCount = LFPG_NetworkManager.Get().GetVanillaWireOwnerCount();
-            for (vkScan = 0; vkScan < vkCount; vkScan = vkScan + 1)
-            {
-                string vOwnId = LFPG_NetworkManager.Get().GetVanillaWireOwnerKey(vkScan);
-                array<ref LFPG_WireData> vwScan = LFPG_NetworkManager.Get().GetVanillaWires(vOwnId);
-                if (!vwScan) continue;
-
-                bool vSrcChanged = false;
-                int vsw = vwScan.Count() - 1;
-                while (vsw >= 0)
-                {
-                    LFPG_WireData vswd = vwScan[vsw];
-                    if (vswd && vswd.m_TargetDeviceId == deviceId && (allowOthers || LFPG_WireHelper.CanCreatorCutWire(vswd, cutPid, allowOthers)))
-                    {
-                        LFPG_Util.Warn("[CutWires-Fallback] Found stale vanilla wire: " + vOwnId + " -> " + deviceId + ":" + vswd.m_TargetPort);
-                        LFPG_NetworkManager.Get().PlayerWireCountAdd(vswd.m_CreatorId, -1);
-                        vwScan.Remove(vsw);
-                        vSrcChanged = true;
-                        changed = true;
-                    }
-                    vsw = vsw - 1;
-                }
-
-                if (vSrcChanged)
-                {
-                    EntityAI vOwnerObj = LFPG_DeviceRegistry.Get().FindById(vOwnId);
-                    if (vOwnerObj)
-                    {
-                        LFPG_NetworkManager.Get().BroadcastVanillaWires(vOwnId, vOwnerObj);
-                    }
-                    LFPG_NetworkManager.Get().MarkVanillaDirty();
-                }
-            }
-
-            // If fallback found stale wires, rebuild reverse index to fix it
-            if (changed && inRemovedTotal == 0)
+            int rescued = RescueStaleIncomingWires(obj, deviceId, "", cutPid, allowOthers);
+            if (rescued > 0)
+                changed = true;
+            // Frozen tree rebuilt when changed && no IN index hits, even if
+            // the scan found nothing (phantom reverse-index owners).
+            if (rescued > 0 || (changed && !anyInRemovedByIndex))
             {
                 LFPG_Util.Warn("[CutWires-Fallback] Reverse index was stale â€” rebuilding");
                 LFPG_NetworkManager.Get().RebuildReverseIdx();
@@ -1869,12 +1790,20 @@ class LFPG_RPCServerHandler
         }
         else if (portDir == LFPG_PortDir.IN)
         {
-            // Remove all wires targeting this device+port from ANY source
+            // Remove all wires targeting this device+port from ANY source.
+            // Always scan: an index hit on one owner must not leave the others.
             int removed = LFPG_NetworkManager.Get().RemoveWiresTargeting(deviceId, portName, cutPid, allowOthers);
-            if (removed > 0)
+            int rescued = RescueStaleIncomingWires(obj, deviceId, portName, cutPid, allowOthers);
+            int cutTotal = removed + rescued;
+            if (cutTotal > 0)
             {
                 changed = true;
-                LFPG_Util.Info("[CutPort] Removed " + removed.ToString() + " IN wire(s) on " + deviceId + ":" + portName);
+                LFPG_Util.Info("[CutPort] Removed " + cutTotal.ToString() + " IN wire(s) on " + deviceId + ":" + portName);
+            }
+            if (rescued > 0)
+            {
+                LFPG_Util.Warn("[CutWires-Fallback] Reverse index was stale â€” rebuilding");
+                LFPG_NetworkManager.Get().RebuildReverseIdx();
             }
         }
 
@@ -1893,6 +1822,115 @@ class LFPG_RPCServerHandler
         {
             PlayerBase.LFPG_SendClientMsg(player, "No wire on that port.");
         }
+    }
+
+    // Same key rule as RemoveWiresTargeting / ReverseIdxAdd: empty incoming
+    // port indexes as input_main. No shared helper exists on NetworkManager.
+    protected static string IncomingPortIndexKey(string port)
+    {
+        if (port == "")
+            return "input_main";
+        return port;
+    }
+
+    // Scan every owner store for incoming wires the reverse index missed.
+    // targetPort == "" matches any port: undeclared / renamed / empty names
+    // after migration still get cut. A non-empty port filters to that port,
+    // treating "" and input_main as the same key (see IncomingPortIndexKey).
+    // Returns how many wires were removed. Caller rebuilds the reverse index.
+    protected static int RescueStaleIncomingWires(EntityAI targetObj, string targetDeviceId, string targetPort, string cutPid, bool allowOthers)
+    {
+        if (targetDeviceId == "")
+            return 0;
+
+        int rescued = 0;
+        array<EntityAI> allDevs = new array<EntityAI>;
+        LFPG_DeviceRegistry.Get().GetAll(allDevs);
+        int di;
+        for (di = 0; di < allDevs.Count(); di = di + 1)
+        {
+            EntityAI srcDev = allDevs[di];
+            if (!srcDev) continue;
+            if (srcDev == targetObj) continue;
+            if (!LFPG_DeviceAPI.HasWireStore(srcDev)) continue;
+
+            string srcId = LFPG_DeviceAPI.GetDeviceId(srcDev);
+            ref array<ref LFPG_WireData> srcWires = LFPG_DeviceAPI.GetDeviceWires(srcDev);
+            if (!srcWires) continue;
+
+            bool srcChanged = false;
+            ref array<int> fallbackDeltaOps = new array<int>;
+            ref array<ref LFPG_WireData> fallbackDeltaWires = new array<ref LFPG_WireData>;
+            int sw = srcWires.Count() - 1;
+            while (sw >= 0)
+            {
+                LFPG_WireData swd = srcWires[sw];
+                if (swd && swd.m_TargetDeviceId == targetDeviceId && (targetPort == "" || swd.m_TargetPort == targetPort || IncomingPortIndexKey(swd.m_TargetPort) == IncomingPortIndexKey(targetPort)) && (allowOthers || LFPG_WireHelper.CanCreatorCutWire(swd, cutPid, allowOthers)))
+                {
+                    LFPG_Util.Warn("[CutWires-Fallback] Found stale wire: " + srcId + ":" + swd.m_SourcePort + " -> " + targetDeviceId + ":" + swd.m_TargetPort);
+                    LFPG_NetworkManager.Get().PlayerWireCountAdd(swd.m_CreatorId, -1);
+                    fallbackDeltaOps.Insert(LFPG_WireDeltaOp.REMOVE);
+                    fallbackDeltaWires.Insert(swd);
+                    srcWires.Remove(sw);
+                    srcChanged = true;
+                    rescued = rescued + 1;
+                }
+                sw = sw - 1;
+            }
+
+            if (srcChanged)
+            {
+                LFPG_WireOwnerBase fallbackWireOwner = LFPG_WireOwnerBase.Cast(srcDev);
+                if (fallbackWireOwner)
+                {
+                    fallbackWireOwner.LFPG_CommitWireMutation();
+                    LFPG_NetworkManager.Get().BroadcastOwnerWireDelta(srcDev, fallbackDeltaOps, fallbackDeltaWires);
+                }
+                else
+                {
+                    srcDev.SetSynchDirty();
+                    LFPG_NetworkManager.Get().BroadcastOwnerWires(srcDev);
+                }
+                LFPG_NetworkManager.Get().RequestPropagate(srcId);
+            }
+        }
+
+        int vkScan;
+        int vkCount = LFPG_NetworkManager.Get().GetVanillaWireOwnerCount();
+        for (vkScan = 0; vkScan < vkCount; vkScan = vkScan + 1)
+        {
+            string vOwnId = LFPG_NetworkManager.Get().GetVanillaWireOwnerKey(vkScan);
+            array<ref LFPG_WireData> vwScan = LFPG_NetworkManager.Get().GetVanillaWires(vOwnId);
+            if (!vwScan) continue;
+
+            bool vSrcChanged = false;
+            int vsw = vwScan.Count() - 1;
+            while (vsw >= 0)
+            {
+                LFPG_WireData vswd = vwScan[vsw];
+                if (vswd && vswd.m_TargetDeviceId == targetDeviceId && (targetPort == "" || vswd.m_TargetPort == targetPort || IncomingPortIndexKey(vswd.m_TargetPort) == IncomingPortIndexKey(targetPort)) && (allowOthers || LFPG_WireHelper.CanCreatorCutWire(vswd, cutPid, allowOthers)))
+                {
+                    LFPG_Util.Warn("[CutWires-Fallback] Found stale vanilla wire: " + vOwnId + " -> " + targetDeviceId + ":" + vswd.m_TargetPort);
+                    LFPG_NetworkManager.Get().PlayerWireCountAdd(vswd.m_CreatorId, -1);
+                    vwScan.Remove(vsw);
+                    vSrcChanged = true;
+                    rescued = rescued + 1;
+                }
+                vsw = vsw - 1;
+            }
+
+            if (vSrcChanged)
+            {
+                EntityAI vOwnerObj = LFPG_DeviceRegistry.Get().FindById(vOwnId);
+                if (vOwnerObj)
+                {
+                    LFPG_NetworkManager.Get().BroadcastVanillaWires(vOwnId, vOwnerObj);
+                }
+                LFPG_NetworkManager.Get().MarkVanillaDirty();
+            }
+        }
+
+        return rescued;
     }
 
     static void HandleRequestFullSync(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)

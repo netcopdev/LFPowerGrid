@@ -43,7 +43,7 @@ class LFPG_DeviceLifecycle
 
         LFPG_Util.Warn("[DeviceLifecycle] OnDeviceKilled: id=" + deviceId + " type=" + device.GetType());
         LFPG_NetworkManager nm = LFPG_NetworkManager.Get();
-        if (nm) nm.CutAllWiresFromDevice(device);
+        if (nm) nm.CutAllWiresFromDevice(device, deviceId);
         #endif
     }
 
@@ -59,7 +59,7 @@ class LFPG_DeviceLifecycle
 		if (device && deviceId != "")
 		{
 			LFPG_NetworkManager nm = LFPG_NetworkManager.Get();
-			if (nm) nm.CutAllWiresFromDevice(device);
+			if (nm) nm.CutAllWiresFromDevice(device, deviceId);
 		}
 		#endif
 
@@ -99,9 +99,9 @@ class LFPG_DeviceLifecycle
 			if (nm)
 			{
 				if (oldPos != vector.Zero)
-					nm.CutAllWiresFromMovedDevice(device, oldPos);
+					nm.CutAllWiresFromMovedDevice(device, oldPos, deviceId);
 				else
-					nm.CutAllWiresFromDevice(device);
+					nm.CutAllWiresFromDevice(device, deviceId);
 				nm.RequestGlobalSelfHeal(true);
 			}
 			return true;
@@ -118,7 +118,7 @@ class LFPG_DeviceLifecycle
 		LFPG_Util.Warn("[DeviceLifecycle] Moved " + dist.ToString() + "m id=" + deviceId);
 		if (nm)
 		{
-			nm.CutAllWiresFromMovedDevice(device, oldPos);
+			nm.CutAllWiresFromMovedDevice(device, oldPos, deviceId);
 			nm.RequestGlobalSelfHeal(true);
 		}
 		return true;

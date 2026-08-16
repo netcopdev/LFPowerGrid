@@ -3670,7 +3670,8 @@ class LFPG_NetworkManager
             // CutAllWiresFromDevice handles: owned wires, vanilla wires,
             // incoming wires, graph cleanup, SetPowered(false) on neighbors,
             // and auto-untrack via the hook at the end of CutAllWiresFromDevice.
-            CutAllWiresFromMovedDevice(movedDev, movedOldPosition);
+            // movedId is the pre-move index key; vanilla cannot re-derive it.
+            CutAllWiresFromMovedDevice(movedDev, movedOldPosition, movedId);
 
             // Generator-specific: force source off when physically moved.
             // CutAllWiresFromDevice handles consumers/passthroughs via
@@ -4698,21 +4699,27 @@ class LFPG_NetworkManager
         #endif
     }
 	
-    void CutAllWiresFromMovedDevice(EntityAI device, vector previousOwnerPosition)
+    // previousOwnerPosition is snapshot interest only. knownDeviceId is the
+    // pre-move index key and must not be recomputed from the new position.
+    void CutAllWiresFromMovedDevice(EntityAI device, vector previousOwnerPosition, string knownDeviceId = "")
     {
         m_CutAllHasPreviousOwnerPosition = true;
         m_CutAllPreviousOwnerPosition = previousOwnerPosition;
-        CutAllWiresFromDevice(device);
+        CutAllWiresFromDevice(device, knownDeviceId);
         m_CutAllHasPreviousOwnerPosition = false;
     }
 
-	void CutAllWiresFromDevice(EntityAI device)
+	void CutAllWiresFromDevice(EntityAI device, string knownDeviceId = "")
     {
         #ifdef SERVER
         if (!device)
             return;
 
-        string deviceId = LFPG_DeviceAPI.GetDeviceId(device);
+        // knownDeviceId is required when the live entity cannot yield the
+        // indexed id (vanilla vp: after a move, or a tearing-down object).
+        string deviceId = knownDeviceId;
+        if (deviceId == "")
+            deviceId = LFPG_DeviceAPI.GetDeviceId(device);
         if (deviceId == "")
             return;
 
