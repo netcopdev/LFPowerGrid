@@ -14,26 +14,15 @@ static const string LFPG_SWV2R_RVMAT_OFF    = "\LFPowerGrid\data\switch_v2\data\
 static const string LFPG_SWV2R_RVMAT_GREEN   = "\LFPowerGrid\data\switch_v2\data\led_green.rvmat";
 static const string LFPG_SWV2R_RVMAT_RED     = "\LFPowerGrid\data\switch_v2_remote\data\switch_v2_remote_red.rvmat";
 
-class LFPG_SwitchV2Remote_Kit : LFPG_KitBase
+// Placement geometry is shared with the wired sibling: same skeleton, same
+// LeverToggle animation in model.cfg. Inheriting it keeps pitch/yaw/surface in one
+// place -- declaring them here once cost a 90 deg pitch that the remote kit silently
+// dropped, so it spawned flat against walls.
+class LFPG_SwitchV2Remote_Kit : LFPG_SwitchV2_Kit
 {
     override string LFPG_GetSpawnClassname()
     {
         return "LFPG_SwitchV2Remote";
-    }
-
-    override int LFPG_GetPlacementModes()
-    {
-        return 1;
-    }
-
-    override float LFPG_GetWallSurfaceOffset()
-    {
-        return 0.04;
-    }
-
-    override float LFPG_GetWallYawOffset()
-    {
-        return 180.0;
     }
 };
 
