@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Offline pre-compile sweeps for the LFPowerGrid addon.
+
+Enforce Script only compiles inside DayZ, so a real build gate is impossible in
+CI. What this catches instead are failure classes that otherwise cost a server
+boot to discover, plus the file-corruption modes this tree is exposed to by
+living on a synced drive.
+
+Checks
+  BOM              EF BB BF at byte 0. The Enforce parser reports an unclosed
+                   quoted string on line 1, pointing at a quote that does not
+                   exist, which sends debugging in the wrong direction.
+  NUL_BYTES        NUL inside a text file: an interrupted or racing write.
+  BALANCE          Unbalanced {} () [] after removing strings and comments.
+                   Detects truncation, which is silent otherwise.
+  DUP_CLASS        The same class declared twice in the same preprocessor
+                   branch. Declarations in mutually exclusive branches
+                   (#ifndef SERVER vs #ifdef SERVER) are the client/server
+                   split and are legitimate.
+  FILEHANDLE_INIT  FileHandle initialized to a numeric literal; diag rejects it.
+  CHAINED_REPLACE  Replace is not chainable in Enforce.
+
+LFCOM's script also warns on identifiers beginning with keyword+digit. That is
+not carried over: LFPG_LogicGate.c uses in0/in1 as parameter names throughout a
+shipped, working build, so the rule is too broad here. Whatever narrower
+condition produced it upstream has not been established, so the check is dropped
+rather than kept as permanent noise.
+
+Only .c files are treated as Enforce Script. config.cpp is a config, not a
+script: the same class name legitimately recurs there (one AnimationSources per
+vehicle class), and a config class and a script class of the same name are
+different namespaces.
+
+Ported from LFCOM_dev/tools/enforce-checks.ps1, with one correction: string
+literals must be removed BEFORE line comments. Stripping // first truncates any
+line holding a URL ("https://...") at the scheme separator, taking the closing
+quote with it and corrupting every count that follows.
+
+Usage: python enforce_checks.py [--root DIR] [--strict]
+Exit: 0 clean, 1 failures, 2 bad invocation. --strict also fails on warnings.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+ENFORCE_EXT = {".c"}
+TEXT_EXT = ENFORCE_EXT | {".cpp", ".layout", ".rvmat", ".csv", ".txt", ".xml", ".cfg"}
+
+BOM = b"\xef\xbb\xbf"
+
+STRING_LITERAL = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+LINE_COMMENT = re.compile(r"//.*$", re.M)
+CLASS_DECL = re.compile(r"^\s*(modded\s+)?class\s+([A-Za-z0-9_]+)", re.M)
+PREPROC = re.compile(r"^\s*#\s*(ifdef|ifndef|else|elif|endif)\b\s*(\w*)", re.M)
+FILEHANDLE_NUM_INIT = re.compile(r"^\s*FileHandle\s+\w+\s*=\s*\d", re.M)
+CHAINED_REPLACE = re.compile(r"\.Replace\([^)]*\)\s*\.\s*Replace\(")
+
+
+class Report:
+    def __init__(self):
+        self.fails = []
+        self.warns = []
+
+    def fail(self, kind, where, detail):
+        self.fails.append((kind, where, detail))
+        print("FAIL | %-16s | %s | %s" % (kind, where, detail))
+
+    def warn(self, kind, where, detail):
+        self.warns.append((kind, where, detail))
+        print("WARN | %-16s | %s | %s" % (kind, where, detail))
+
+
+def strip_noncode(raw):
+    """Blank out string literals, then comments. Order matters: see module docstring.
+
+    Newlines are preserved so reported line numbers stay meaningful.
+    """
+    code = STRING_LITERAL.sub('""', raw)
+    code = BLOCK_COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), code)
+    code = LINE_COMMENT.sub("", code)
+    return code
+
+
+def branch_at_line(code):
+    """Map each line number to the preprocessor branch path active on it.
+
+    Two declarations sharing a name but sitting on different paths are mutually
+    exclusive at compile time and are not duplicates.
+    """
+    path = []
+    out = {}
+    counter = 0
+    for lineno, line in enumerate(code.split("\n"), 1):
+        m = PREPROC.match(line)
+        if m:
+            kind, sym = m.group(1), m.group(2)
+            if kind in ("ifdef", "ifndef"):
+                counter += 1
+                path.append("%s:%s#%d" % (kind, sym, counter))
+            elif kind in ("else", "elif") and path:
+                prev = path[-1]
+                path[-1] = prev + "|" + kind
+            elif kind == "endif" and path:
+                path.pop()
+        out[lineno] = "/".join(path)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    ap.add_argument("--strict", action="store_true", help="treat warnings as failures")
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        print("bad --root: %s" % root)
+        return 2
+
+    rep = Report()
+    declarations = {}
+    n_text = n_enforce = 0
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", ".github")]
+        for fn in sorted(filenames):
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in TEXT_EXT:
+                continue
+
+            with open(path, "rb") as fh:
+                data = fh.read()
+            n_text += 1
+
+            if ext in ENFORCE_EXT and data.startswith(BOM):
+                rep.fail("BOM", rel, "EF BB BF at byte 0 breaks CParser")
+            if b"\x00" in data:
+                rep.fail("NUL_BYTES", rel,
+                         "%d NUL bytes: interrupted write" % data.count(b"\x00"))
+
+            if ext not in ENFORCE_EXT:
+                continue
+            n_enforce += 1
+
+            code = strip_noncode(data.decode("utf-8", errors="replace"))
+
+            for opener, closer in (("{", "}"), ("(", ")"), ("[", "]")):
+                n_open, n_close = code.count(opener), code.count(closer)
+                if n_open != n_close:
+                    rep.fail("BALANCE", rel, "%s=%d %s=%d (truncated or unclosed)"
+                             % (opener, n_open, closer, n_close))
+
+            branches = branch_at_line(code)
+            for m in CLASS_DECL.finditer(code):
+                lineno = code.count("\n", 0, m.start()) + 1
+                key = (m.group(2), bool(m.group(1)), branches.get(lineno, ""))
+                declarations.setdefault(key, []).append("%s:%d" % (rel, lineno))
+
+            if FILEHANDLE_NUM_INIT.search(code):
+                rep.fail("FILEHANDLE_INIT", rel,
+                         "FileHandle = <num> is rejected by diag; declare it uninitialized")
+            if CHAINED_REPLACE.search(code):
+                rep.fail("CHAINED_REPLACE", rel, "Replace is not chainable in Enforce")
+
+    for (name, is_modded, _branch), sites in sorted(declarations.items()):
+        if len(sites) > 1:
+            rep.fail("DUP_CLASS", name, "%sclass declared at: %s"
+                     % ("modded " if is_modded else "", ", ".join(sites)))
+
+    print()
+    print("checked %d text files (%d Enforce) under %s" % (n_text, n_enforce, root))
+    print("FAIL=%d  WARN=%d" % (len(rep.fails), len(rep.warns)))
+    if rep.fails or (args.strict and rep.warns):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

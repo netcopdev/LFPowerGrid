@@ -1,0 +1,38 @@
+name: checks
+
+# Enforce Script only compiles inside DayZ, so there is no build gate to run
+# here. What this does instead is sweep for the failure classes that would
+# otherwise be discovered by booting a server: a BOM that makes the parser
+# report a nonexistent unclosed string, an unbalanced file left by a truncated
+# write, a class declared twice in the same compile branch.
+#
+# The checker's own tests run first. A checker that reports zero failures
+# proves nothing until it has been shown to fire.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  enforce-checks:
+    runs-on: ubuntu-latest
+    steps:
+      # Full checkout: the tree carries ~450 MB of .p3d/.paa under data/.
+      # Only .rvmat files there are read, so this can be narrowed with a
+      # sparse checkout if run time becomes a problem.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Self-test the checker (negative controls)
+        run: python .github/tools/test_enforce_checks.py
+
+      - name: Sweep the addon
+        run: python .github/tools/enforce_checks.py --root .
