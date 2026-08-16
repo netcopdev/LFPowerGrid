@@ -25,10 +25,10 @@
 
 class LFPG_InspectWireEntry
 {
+    static const int SCHEMA_VERSION = 2;
+
     int m_Direction;           // LFPG_PortDir.IN or OUT
     string m_LocalPort;        // port name on inspected device
-    string m_RemoteDeviceId;   // target/source device ID
-    string m_RemotePort;       // port name on remote device
     string m_RemoteTypeName;   // entity type name for display
 
     // v0.7.47: Per-wire power data for inspector display
@@ -39,14 +39,13 @@ class LFPG_InspectWireEntry
     {
         m_Direction = -1;
         m_LocalPort = "";
-        m_RemoteDeviceId = "";
-        m_RemotePort = "";
         m_RemoteTypeName = "";
         m_AllocatedPower = 0.0;
         m_EdgeState = 0;
     }
 };
 
+#ifndef SERVER
 class LFPG_DeviceInspector
 {
     // ---- Singleton ----
@@ -90,6 +89,10 @@ class LFPG_DeviceInspector
     static const int COL_OLIVE_GREEN  = 0xFF88AA44;
     static const int COL_RED_ORANGE   = 0xFFDC5032;
 
+    // Three attempts at 1000 ms spacing bound retries to about 3 seconds,
+    // enough for transient packet loss and well below the shared 5 ops/s budget.
+    static const int INSPECT_RPC_MAX_ATTEMPTS = 3;
+
     // ---- Widget references ----
     protected Widget m_Root;
     protected Widget m_Panel;
@@ -111,6 +114,7 @@ class LFPG_DeviceInspector
     protected string m_CurrentDeviceId;
     protected float m_LastRPCSendMs;
     protected bool m_HasServerData;
+    protected int m_InspectRequestAttempts;
     protected int m_VisibleWireCount;
     // H1 fix: periodic client-side SyncVar refresh
     protected float m_LastClientRefreshMs;
@@ -139,6 +143,33 @@ class LFPG_DeviceInspector
 
     // ---- Server response cache ----
     protected ref array<ref LFPG_InspectWireEntry> m_RespWires;
+    protected bool m_WireDataDirty;
+    protected int m_LastTopologyGeneration;
+
+    // Last values sent to widgets.
+    protected ref map<Widget, string> m_LastWidgetText;
+    protected ref map<Widget, int> m_LastWidgetColor;
+    protected ref map<Widget, bool> m_LastWidgetVisible;
+    protected ref map<Widget, vector> m_LastWidgetPos;
+    protected ref map<Widget, vector> m_LastWidgetSize;
+
+    // Primitive snapshot used to skip unchanged 500ms polls.
+    protected bool m_ClientSnapshotValid;
+    protected int m_SnapshotDeviceType;
+    protected int m_SnapshotIntA;
+    protected int m_SnapshotIntB;
+    protected int m_SnapshotIntC;
+    protected bool m_SnapshotBoolA;
+    protected bool m_SnapshotBoolB;
+    protected bool m_SnapshotBoolC;
+    protected float m_SnapshotFloatA;
+    protected float m_SnapshotFloatB;
+    protected float m_SnapshotFloatC;
+    protected float m_SnapshotFloatD;
+    protected float m_SnapshotFloatE;
+    protected float m_SnapshotFloatF;
+    protected float m_SnapshotFloatG;
+    protected EntityAI m_SnapshotEntity;
 
     // ---- Layout path (adjust to match your PBO structure) ----
     static const string LAYOUT_PATH = "LFPowerGrid/gui/layouts/LFPG_DeviceInspector.layout";
@@ -170,7 +201,6 @@ class LFPG_DeviceInspector
         if (s_Instance)
         {
             s_Instance.DestroyWidgets();
-            delete s_Instance;
             s_Instance = null;
         }
     }
@@ -194,10 +224,16 @@ class LFPG_DeviceInspector
     {
         m_wWireSlots = new array<TextWidget>;
         m_RespWires = new array<ref LFPG_InspectWireEntry>;
+        m_LastWidgetText = new map<Widget, string>;
+        m_LastWidgetColor = new map<Widget, int>;
+        m_LastWidgetVisible = new map<Widget, bool>;
+        m_LastWidgetPos = new map<Widget, vector>;
+        m_LastWidgetSize = new map<Widget, vector>;
         m_Visible = false;
         m_CurrentDeviceId = "";
         m_LastRPCSendMs = 0.0;
         m_HasServerData = false;
+        m_InspectRequestAttempts = 0;
         m_VisibleWireCount = 0;
         m_LastClientRefreshMs = 0.0;
         m_SmoothX = 0.0;
@@ -205,6 +241,9 @@ class LFPG_DeviceInspector
         m_SmoothInit = false;
         m_FlippedLeft = false;
         m_CurrentPanelH = 0.0;
+        m_WireDataDirty = true;
+        m_LastTopologyGeneration = -1;
+        m_ClientSnapshotValid = false;
     }
 
     // =========================================================
@@ -418,6 +457,11 @@ class LFPG_DeviceInspector
         m_wWiresHeader = null;
         m_wWireSlots.Clear();
         m_RespWires.Clear();
+        m_LastWidgetText.Clear();
+        m_LastWidgetColor.Clear();
+        m_LastWidgetVisible.Clear();
+        m_LastWidgetPos.Clear();
+        m_LastWidgetSize.Clear();
     }
 
     // =========================================================
@@ -472,36 +516,60 @@ class LFPG_DeviceInspector
         }
 
         float nowMs = g_Game.GetTime();
+        int topologyGeneration = -1;
+        LFPG_WireOwnerBase inspectedWireOwner = LFPG_WireOwnerBase.Cast(target);
+        if (inspectedWireOwner)
+        {
+            topologyGeneration = inspectedWireOwner.LFPG_GetWireGeneration();
+        }
 
         // ---- New device? Full populate + request RPC ----
         if (deviceId != inst.m_CurrentDeviceId)
         {
             inst.m_CurrentDeviceId = deviceId;
             inst.m_HasServerData = false;
+            inst.m_InspectRequestAttempts = 0;
             inst.m_RespWires.Clear();
             inst.m_SmoothInit = false;
             inst.m_FlippedLeft = false;
+            inst.m_WireDataDirty = true;
+            inst.m_LastTopologyGeneration = topologyGeneration;
+            inst.m_ClientSnapshotValid = false;
+            inst.ClientDataChanged(target);
             inst.PopulateClientData(target, deviceId);
             inst.RequestServerData(player, deviceId, target);
             inst.m_LastClientRefreshMs = nowMs;
         }
         else
         {
-            // H1 fix: Periodic SyncVar refresh while looking at same device.
-            // Catches state changes (gen on/off, load ratio updates) without
-            // requiring the player to look away and back.
-            // 500ms = 2Hz refresh, negligible cost (DeviceAPI calls are cached SyncVars).
-            float sinceLast = nowMs - inst.m_LastClientRefreshMs;
-            if (sinceLast >= LFPG_INSPECT_REFRESH_MS)
+            bool topologyChanged = (topologyGeneration != inst.m_LastTopologyGeneration);
+            if (topologyChanged)
             {
+                inst.m_LastTopologyGeneration = topologyGeneration;
+                inst.m_HasServerData = false;
+                inst.m_InspectRequestAttempts = 0;
+                inst.m_WireDataDirty = true;
+                inst.ClientDataChanged(target);
                 inst.PopulateClientData(target, deviceId);
                 inst.m_LastClientRefreshMs = nowMs;
+            }
+            else
+            {
+                float sinceLast = nowMs - inst.m_LastClientRefreshMs;
+                if (sinceLast >= LFPG_INSPECT_REFRESH_MS)
+                {
+                    if (inst.ClientDataChanged(target))
+                    {
+                        inst.PopulateClientData(target, deviceId);
+                    }
+                    inst.m_LastClientRefreshMs = nowMs;
+                }
             }
 
             // H2 fix: Retry RPC if cooldown blocked the initial request.
             // Without this, rapidly switching devices leaves panel stuck on
             // "Connections ..." because the cooldown guard returns early.
-            if (!inst.m_HasServerData)
+            if (!inst.m_HasServerData && inst.m_InspectRequestAttempts < INSPECT_RPC_MAX_ATTEMPTS)
             {
                 inst.RequestServerData(player, deviceId, target);
             }
@@ -545,6 +613,156 @@ class LFPG_DeviceInspector
         return item.IsKindOf(LFPG_CABLE_REEL_TYPE);
     }
 
+    protected bool ClientDataChanged(EntityAI device)
+    {
+        int deviceType = LFPG_DeviceAPI.GetDeviceType(device);
+        int intA = 0;
+        int intB = 0;
+        int intC = 0;
+        bool boolA = false;
+        bool boolB = false;
+        bool boolC = false;
+        float floatA = 0.0;
+        float floatB = 0.0;
+        float floatC = 0.0;
+        float floatD = 0.0;
+        float floatE = 0.0;
+        float floatF = 0.0;
+        float floatG = 0.0;
+        EntityAI snapshotEntity = null;
+
+        if (deviceType == LFPG_DeviceType.SOURCE)
+        {
+            boolA = LFPG_DeviceAPI.GetSourceOn(device);
+            floatA = LFPG_DeviceAPI.GetLoadRatio(device);
+            floatF = LFPG_DeviceAPI.GetCapacity(device);
+        }
+        else
+        {
+            boolA = LFPG_DeviceAPI.GetPowered(device);
+            if (deviceType == LFPG_DeviceType.PASSTHROUGH)
+            {
+                floatF = LFPG_DeviceAPI.GetCapacity(device);
+            }
+            if (deviceType == LFPG_DeviceType.CONSUMER || deviceType == LFPG_DeviceType.CAMERA || deviceType == LFPG_DeviceType.PASSTHROUGH)
+            {
+                floatG = LFPG_DeviceAPI.GetConsumption(device);
+            }
+        }
+
+        LFPG_MemoryCell memoryCell = LFPG_MemoryCell.Cast(device);
+        if (memoryCell)
+        {
+            boolB = memoryCell.LFPG_GetCellActive();
+        }
+
+        LFPG_WaterPump_T2 t2Pump = LFPG_WaterPump_T2.Cast(device);
+        if (t2Pump)
+        {
+            floatB = t2Pump.LFPG_GetTankLevel();
+            intA = t2Pump.LFPG_GetTankLiquidType();
+            boolB = t2Pump.LFPG_GetPoweredNet();
+        }
+
+        LFPG_Furnace furnace = LFPG_Furnace.Cast(device);
+        if (furnace)
+        {
+            intA = furnace.LFPG_GetFuelCurrent();
+            intB = furnace.LFPG_GetCargoItemCount();
+            intC = furnace.LFPG_GetCargoFuelEstimate();
+            boolB = furnace.LFPG_GetSourceOn();
+        }
+
+        LFPG_Sorter sorter = LFPG_Sorter.Cast(device);
+        if (sorter)
+        {
+            snapshotEntity = sorter.LFPG_GetLinkedContainer();
+        }
+
+        LFPG_BatteryBase battery = LFPG_BatteryBase.Cast(device);
+        if (battery)
+        {
+            floatC = battery.LFPG_GetStoredEnergy();
+            floatD = battery.LFPG_GetMaxStoredEnergy();
+            floatE = battery.LFPG_GetChargeRateCurrent();
+            boolC = battery.LFPG_IsOutputEnabled();
+        }
+
+        bool changed = (!m_ClientSnapshotValid || deviceType != m_SnapshotDeviceType || intA != m_SnapshotIntA || intB != m_SnapshotIntB || intC != m_SnapshotIntC || boolA != m_SnapshotBoolA || boolB != m_SnapshotBoolB || boolC != m_SnapshotBoolC || floatA != m_SnapshotFloatA || floatB != m_SnapshotFloatB || floatC != m_SnapshotFloatC || floatD != m_SnapshotFloatD || floatE != m_SnapshotFloatE || floatF != m_SnapshotFloatF || floatG != m_SnapshotFloatG || snapshotEntity != m_SnapshotEntity);
+        m_ClientSnapshotValid = true;
+        m_SnapshotDeviceType = deviceType;
+        m_SnapshotIntA = intA;
+        m_SnapshotIntB = intB;
+        m_SnapshotIntC = intC;
+        m_SnapshotBoolA = boolA;
+        m_SnapshotBoolB = boolB;
+        m_SnapshotBoolC = boolC;
+        m_SnapshotFloatA = floatA;
+        m_SnapshotFloatB = floatB;
+        m_SnapshotFloatC = floatC;
+        m_SnapshotFloatD = floatD;
+        m_SnapshotFloatE = floatE;
+        m_SnapshotFloatF = floatF;
+        m_SnapshotFloatG = floatG;
+        m_SnapshotEntity = snapshotEntity;
+        return changed;
+    }
+
+    protected void SetTextDirty(TextWidget widget, string value)
+    {
+        if (!widget)
+            return;
+        string previous;
+        if (m_LastWidgetText.Find(widget, previous) && previous == value)
+            return;
+        m_LastWidgetText[widget] = value;
+        widget.SetText(value);
+    }
+
+    protected void SetColorDirty(Widget widget, int value)
+    {
+        if (!widget)
+            return;
+        int previous;
+        if (m_LastWidgetColor.Find(widget, previous) && previous == value)
+            return;
+        m_LastWidgetColor[widget] = value;
+        widget.SetColor(value);
+    }
+
+    protected void ShowDirty(Widget widget, bool value)
+    {
+        if (!widget)
+            return;
+        bool previous;
+        if (m_LastWidgetVisible.Find(widget, previous) && previous == value)
+            return;
+        m_LastWidgetVisible[widget] = value;
+        widget.Show(value);
+    }
+
+    protected void SetPosDirty(Widget widget, float x, float y)
+    {
+        if (!widget)
+            return;
+        vector previous;
+        if (m_LastWidgetPos.Find(widget, previous) && previous[0] == x && previous[1] == y)
+            return;
+        m_LastWidgetPos[widget] = Vector(x, y, 0.0);
+        widget.SetPos(x, y);
+    }
+
+    protected void SetSizeDirty(Widget widget, float width, float height)
+    {
+        if (!widget)
+            return;
+        vector previous;
+        if (m_LastWidgetSize.Find(widget, previous) && previous[0] == width && previous[1] == height)
+            return;
+        m_LastWidgetSize[widget] = Vector(width, height, 0.0);
+        widget.SetSize(width, height);
+    }
+
     // =========================================================
     // Populate panel with client-side data (instant, no RPC)
     // =========================================================
@@ -555,7 +773,7 @@ class LFPG_DeviceInspector
 
         // ---- Device name (entity type, cleaned up) ----
         string typeName = device.GetType();
-        m_wDeviceName.SetText(FormatDeviceName(typeName));
+        SetTextDirty(m_wDeviceName, FormatDeviceName(typeName));
 
         // ---- Device type badge ----
         int devType = LFPG_DeviceAPI.GetDeviceType(device);
@@ -583,8 +801,8 @@ class LFPG_DeviceInspector
             typeColor = COL_BLUE;
         }
 
-        m_wDeviceType.SetText(typeStr);
-        m_wDeviceType.SetColor(typeColor);
+        SetTextDirty(m_wDeviceType, typeStr);
+        SetColorDirty(m_wDeviceType, typeColor);
 
         // ---- Power status ----
         string statusText = "";
@@ -675,8 +893,8 @@ class LFPG_DeviceInspector
             }
         }
 
-        m_wStatusLine.SetText(statusText);
-        m_wStatusLine.SetColor(statusColor);
+        SetTextDirty(m_wStatusLine, statusText);
+        SetColorDirty(m_wStatusLine, statusColor);
 
         // ---- Capacity / consumption line ----
         string capText = "";
@@ -735,14 +953,14 @@ class LFPG_DeviceInspector
             capText = capText + FormatFloat1(ptTotalLoad);
             capText = capText + " u/s";
         }
-        m_wCapLine.SetText(capText);
+        SetTextDirty(m_wCapLine, capText);
         if (capText != "")
         {
-            m_wCapLine.Show(true);
+            ShowDirty(m_wCapLine, true);
         }
         else
         {
-            m_wCapLine.Show(false);
+            ShowDirty(m_wCapLine, false);
         }
 
         // ---- v1.1.0: Tank line (T2 Water Pump only) ----
@@ -793,36 +1011,36 @@ class LFPG_DeviceInspector
                     tankText = tankText + "  [EMPTY]";
                 }
 
-                m_wTankLine.SetText(tankText);
+                SetTextDirty(m_wTankLine, tankText);
 
                 // Color: filling=cyan, full=green, offline=yellow, empty=grey
                 if (tankPow && !isFull)
                 {
-                    m_wTankLine.SetColor(COL_CYAN);
+                    SetColorDirty(m_wTankLine, COL_CYAN);
                 }
                 else if (tankPow && isFull)
                 {
-                    m_wTankLine.SetColor(COL_GREEN_OK);
+                    SetColorDirty(m_wTankLine, COL_GREEN_OK);
                 }
                 else if (tankLvl < 0.01)
                 {
-                    m_wTankLine.SetColor(COL_GRAY_DIM);
+                    SetColorDirty(m_wTankLine, COL_GRAY_DIM);
                 }
                 else if (tankLiq == LIQUID_CLEANWATER)
                 {
-                    m_wTankLine.SetColor(COL_BLUE_BRIGHT);
+                    SetColorDirty(m_wTankLine, COL_BLUE_BRIGHT);
                 }
                 else
                 {
-                    m_wTankLine.SetColor(COL_OLIVE_GREEN);
+                    SetColorDirty(m_wTankLine, COL_OLIVE_GREEN);
                 }
 
-                m_wTankLine.Show(true);
+                ShowDirty(m_wTankLine, true);
                 m_TankLineOffset = 20.0;
             }
             else
             {
-                m_wTankLine.Show(false);
+                ShowDirty(m_wTankLine, false);
                 m_TankLineOffset = 0.0;
             }
         }
@@ -888,10 +1106,10 @@ class LFPG_DeviceInspector
                 {
                     fuelText = fuelText + " [EMPTY]";
                 }
-                m_wFuelLine.SetColor(fuelLineColor);
+                SetColorDirty(m_wFuelLine, fuelLineColor);
 
-                m_wFuelLine.SetText(fuelText);
-                m_wFuelLine.Show(true);
+                SetTextDirty(m_wFuelLine, fuelText);
+                ShowDirty(m_wFuelLine, true);
                 m_FuelLineOffset = 20.0;
 
                 // ---- v1.2.2: Reserve line (separate widget below fuel) ----
@@ -908,26 +1126,26 @@ class LFPG_DeviceInspector
                         resText = resText + cargoCount.ToString();
                         resText = resText + " | " + resDays.ToString() + "D " + resHours.ToString() + "H approx";
 
-                        m_wReserveLine.SetText(resText);
-                        m_wReserveLine.SetColor(fuelLineColor);
-                        m_wReserveLine.SetPos(14, 94 + m_FuelLineOffset);
-                        m_wReserveLine.Show(true);
+                        SetTextDirty(m_wReserveLine, resText);
+                        SetColorDirty(m_wReserveLine, fuelLineColor);
+                        SetPosDirty(m_wReserveLine, 14, 94 + m_FuelLineOffset);
+                        ShowDirty(m_wReserveLine, true);
                         m_ReserveLineOffset = 20.0;
                     }
                     else
                     {
-                        m_wReserveLine.Show(false);
+                        ShowDirty(m_wReserveLine, false);
                         m_ReserveLineOffset = 0.0;
                     }
                 }
             }
             else
             {
-                m_wFuelLine.Show(false);
+                ShowDirty(m_wFuelLine, false);
                 m_FuelLineOffset = 0.0;
                 if (m_wReserveLine)
                 {
-                    m_wReserveLine.Show(false);
+                    ShowDirty(m_wReserveLine, false);
                     m_ReserveLineOffset = 0.0;
                 }
             }
@@ -941,28 +1159,28 @@ class LFPG_DeviceInspector
             if (sorterInspect)
             {
                 float linkY = 94.0 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset;
-                m_wLinkLine.SetPos(14, linkY);
+                SetPosDirty(m_wLinkLine, 14, linkY);
 
                 EntityAI linkedEnt = sorterInspect.LFPG_GetLinkedContainer();
                 if (linkedEnt)
                 {
                     string linkText = "Linked: ";
                     linkText = linkText + linkedEnt.GetDisplayName();
-                    m_wLinkLine.SetText(linkText);
-                    m_wLinkLine.SetColor(COL_EMERALD);
+                    SetTextDirty(m_wLinkLine, linkText);
+                    SetColorDirty(m_wLinkLine, COL_EMERALD);
                 }
                 else
                 {
                     string noLinkText = "Not linked";
-                    m_wLinkLine.SetText(noLinkText);
-                    m_wLinkLine.SetColor(COL_RED_SOFT);
+                    SetTextDirty(m_wLinkLine, noLinkText);
+                    SetColorDirty(m_wLinkLine, COL_RED_SOFT);
                 }
-                m_wLinkLine.Show(true);
+                ShowDirty(m_wLinkLine, true);
                 m_LinkLineOffset = 20.0;
             }
             else
             {
-                m_wLinkLine.Show(false);
+                ShowDirty(m_wLinkLine, false);
             }
         }
 
@@ -1050,15 +1268,15 @@ class LFPG_DeviceInspector
                 }
 
                 float batY = 94.0 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + m_LinkLineOffset;
-                m_wBatteryLine.SetPos(14, batY);
-                m_wBatteryLine.SetText(batText);
-                m_wBatteryLine.SetColor(batColor);
-                m_wBatteryLine.Show(true);
+                SetPosDirty(m_wBatteryLine, 14, batY);
+                SetTextDirty(m_wBatteryLine, batText);
+                SetColorDirty(m_wBatteryLine, batColor);
+                ShowDirty(m_wBatteryLine, true);
                 m_BatteryLineOffset = 26.0;
             }
             else
             {
-                m_wBatteryLine.Show(false);
+                ShowDirty(m_wBatteryLine, false);
                 m_BatteryLineOffset = 0.0;
             }
         }
@@ -1068,36 +1286,37 @@ class LFPG_DeviceInspector
         float extraLineOffset = m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + m_LinkLineOffset + m_BatteryLineOffset;
         if (m_wSeparator)
         {
-            m_wSeparator.SetPos(12, 93 + extraLineOffset);
+            SetPosDirty(m_wSeparator, 12, 93 + extraLineOffset);
         }
         if (m_wWiresHeader)
         {
-            m_wWiresHeader.SetPos(14, 99 + extraLineOffset);
+            SetPosDirty(m_wWiresHeader, 14, 99 + extraLineOffset);
         }
 
-        // ---- Wire section: re-display cached data or show loading ----
-        if (m_HasServerData)
+        // ---- Wire section: refresh only on response or topology change ----
+        if (m_WireDataDirty)
         {
-            PopulateWireData();
-        }
-        else
-        {
-            // Ensure separator + header visible (P2-A may have collapsed them)
-            if (m_wSeparator)
+            if (m_HasServerData)
             {
-                m_wSeparator.Show(true);
+                PopulateWireData();
             }
-            m_wWiresHeader.Show(true);
-            m_wWiresHeader.SetText(Loc("#STR_LFPG_INSPECT_CONN_LOADING"));
-            HideAllWireSlots();
-            ResizePanelHeight(0);
+            else
+            {
+                // Ensure separator + header visible (P2-A may have collapsed them)
+                ShowDirty(m_wSeparator, true);
+                ShowDirty(m_wWiresHeader, true);
+                SetTextDirty(m_wWiresHeader, Loc("#STR_LFPG_INSPECT_CONN_LOADING"));
+                HideAllWireSlots();
+                ResizePanelHeight(0);
+            }
+            m_WireDataDirty = false;
         }
     }
 
     // =========================================================
     // Apply server RPC response (wire topology)
     // =========================================================
-    static void OnInspectResponse(string deviceId, ref array<ref LFPG_InspectWireEntry> wires)
+    static void OnInspectResponse(string deviceId, array<ref LFPG_InspectWireEntry> wires)
     {
         LFPG_DeviceInspector inst = Get();
         if (!inst.m_Root)
@@ -1116,6 +1335,8 @@ class LFPG_DeviceInspector
         }
 
         inst.m_HasServerData = true;
+        inst.m_InspectRequestAttempts = 0;
+        inst.m_WireDataDirty = true;
         inst.m_RespWires.Clear();
 
         int wi;
@@ -1139,6 +1360,7 @@ class LFPG_DeviceInspector
             // Entity gone (destroyed/despawned) — just update wires section.
             // Next Tick() will detect missing entity and hide panel.
             inst.PopulateWireData();
+            inst.m_WireDataDirty = false;
         }
     }
 
@@ -1152,10 +1374,10 @@ class LFPG_DeviceInspector
         if (wireCount == 0)
         {
             // P2-A: Collapse wire section entirely — cleaner look
-            m_wWiresHeader.Show(false);
+            ShowDirty(m_wWiresHeader, false);
             if (m_wSeparator)
             {
-                m_wSeparator.Show(false);
+                ShowDirty(m_wSeparator, false);
             }
             HideAllWireSlots();
             m_VisibleWireCount = 0;
@@ -1166,11 +1388,11 @@ class LFPG_DeviceInspector
         // Ensure separator + header are visible (may have been hidden by 0-wire collapse)
         if (m_wSeparator)
         {
-            m_wSeparator.Show(true);
-            m_wSeparator.SetPos(12, 93 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset);
+            ShowDirty(m_wSeparator, true);
+            SetPosDirty(m_wSeparator, 12, 93 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset);
         }
-        m_wWiresHeader.Show(true);
-        m_wWiresHeader.SetPos(14, 99 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset);
+        ShowDirty(m_wWiresHeader, true);
+        SetPosDirty(m_wWiresHeader, 14, 99 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset);
 
         // Reposition wire slots with tank/fuel offset
         int ri;
@@ -1180,7 +1402,7 @@ class LFPG_DeviceInspector
             if (rSlot)
             {
                 float rY = LFPG_INSPECT_PANEL_BASE_H + 2.0 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + (ri * LFPG_INSPECT_WIRE_ROW_H);
-                rSlot.SetPos(14, rY);
+                SetPosDirty(rSlot, 14, rY);
             }
         }
 
@@ -1202,7 +1424,7 @@ class LFPG_DeviceInspector
             hdrText = hdrText + maxShow.ToString();
         }
         hdrText = hdrText + ")";
-        m_wWiresHeader.SetText(hdrText);
+        SetTextDirty(m_wWiresHeader, hdrText);
 
         int si;
         for (si = 0; si < maxShow; si = si + 1)
@@ -1238,7 +1460,7 @@ class LFPG_DeviceInspector
                 line = line + " u/s";
             }
 
-            slot.SetText(line);
+            SetTextDirty(slot, line);
 
             // v0.7.47: Color based on edge state (overrides direction color)
             int wireColor = COL_BLUE_WIRE;
@@ -1251,8 +1473,8 @@ class LFPG_DeviceInspector
             {
                 wireColor = COL_GREEN_WIRE;
             }
-            slot.SetColor(wireColor);
-            slot.Show(true);
+            SetColorDirty(slot, wireColor);
+            ShowDirty(slot, true);
         }
 
         // Hide unused slots
@@ -1262,7 +1484,7 @@ class LFPG_DeviceInspector
             TextWidget hideSlot = m_wWireSlots[hi];
             if (hideSlot)
             {
-                hideSlot.Show(false);
+                ShowDirty(hideSlot, false);
             }
         }
 
@@ -1308,14 +1530,14 @@ class LFPG_DeviceInspector
 
         m_CurrentPanelH = h;
 
-        m_Panel.SetSize(LFPG_INSPECT_PANEL_W, h);
+        SetSizeDirty(m_Panel, LFPG_INSPECT_PANEL_W, h);
         if (m_wPanelBg)
         {
-            m_wPanelBg.SetSize(LFPG_INSPECT_PANEL_W, h);
+            SetSizeDirty(m_wPanelBg, LFPG_INSPECT_PANEL_W, h);
         }
         if (m_wAccentBar)
         {
-            m_wAccentBar.SetSize(LFPG_INSPECT_ACCENT_W, h);
+            SetSizeDirty(m_wAccentBar, LFPG_INSPECT_ACCENT_W, h);
         }
     }
 
@@ -1441,6 +1663,7 @@ class LFPG_DeviceInspector
         {
             m_CurrentDeviceId = "";
             m_HasServerData = false;
+            m_InspectRequestAttempts = 0;
             m_RespWires.Clear();
         }
     }
@@ -1453,7 +1676,7 @@ class LFPG_DeviceInspector
             TextWidget tw = m_wWireSlots[i];
             if (tw)
             {
-                tw.Show(false);
+                ShowDirty(tw, false);
             }
         }
         m_VisibleWireCount = 0;
@@ -1495,6 +1718,7 @@ class LFPG_DeviceInspector
         rpc.Write(netHigh);
         rpc.Write(deviceId);
         rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
+        m_InspectRequestAttempts = m_InspectRequestAttempts + 1;
 
         LFPG_Util.Debug("[DeviceInspector] Sent INSPECT_DEVICE for " + deviceId);
     }
@@ -1664,3 +1888,4 @@ class LFPG_DeviceInspector
         return bar;
     }
 };
+#endif

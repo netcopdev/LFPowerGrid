@@ -34,6 +34,10 @@ class LFPG_Fridge : LFPG_DeviceBase
     // ---- Client-local ----
     protected int m_PrevLedState = -1;
 
+    // T2: stable cargo sleeps between full temperature walks.
+    protected int m_LastCargoCount = -1;
+    protected int m_CoolSleepTicks = 0;
+
     void LFPG_Fridge()
     {
         string pIn = "input_1";
@@ -76,6 +80,8 @@ class LFPG_Fridge : LFPG_DeviceBase
             return;
 
         m_PoweredNet = powered;
+        m_CoolSleepTicks = 0;
+        m_LastCargoCount = -1;
         SetSynchDirty();
 
         string msg = "[LFPG_Fridge] SetPowered(";
@@ -84,6 +90,20 @@ class LFPG_Fridge : LFPG_DeviceBase
         msg = msg + m_DeviceId;
         LFPG_Util.Debug(msg);
         #endif
+    }
+
+    // ---- Port world pos (p3d uses "port_input_0", logical port is "input_1") ----
+    override vector LFPG_GetPortWorldPos(string portName)
+    {
+        if (portName == "input_1")
+        {
+            string memPoint = "port_input_0";
+            if (MemoryPointExists(memPoint))
+            {
+                return ModelToWorld(GetMemoryPointPos(memPoint));
+            }
+        }
+        return super.LFPG_GetPortWorldPos(portName);
     }
 
     // ---- Lifecycle hooks ----
@@ -122,6 +142,8 @@ class LFPG_Fridge : LFPG_DeviceBase
         if (m_PoweredNet)
         {
             m_PoweredNet = false;
+            m_CoolSleepTicks = 0;
+            m_LastCargoCount = -1;
             SetSynchDirty();
         }
         #endif
@@ -194,6 +216,8 @@ class LFPG_Fridge : LFPG_DeviceBase
         {
             m_IsOpen = true;
         }
+        m_CoolSleepTicks = 0;
+        m_LastCargoCount = -1;
         SetSynchDirty();
 
         string toggleMsg = "[LFPG_Fridge] ToggleDoor: open=";
@@ -239,65 +263,110 @@ class LFPG_Fridge : LFPG_DeviceBase
         return false;
     }
 
+    override void EECargoIn(EntityAI item)
+    {
+        super.EECargoIn(item);
+        #ifdef SERVER
+        m_CoolSleepTicks = 0;
+        #endif
+    }
+
+    override void EECargoOut(EntityAI item)
+    {
+        super.EECargoOut(item);
+        #ifdef SERVER
+        m_CoolSleepTicks = 0;
+        #endif
+    }
+
+    override void EECargoMove(EntityAI item)
+    {
+        super.EECargoMove(item);
+        #ifdef SERVER
+        m_CoolSleepTicks = 0;
+        #endif
+    }
+
     // ---- Cooling tick (NM centralized timer) ----
     void LFPG_OnCoolTick()
     {
         #ifdef SERVER
+        CargoBase cargo;
+        int itemCount;
+        int cooled;
+        float targetTemp;
+        float tolerance;
+        int itemIndex;
+        float curTemp;
+        float diffHigh;
+        float diffLow;
+        bool outsideBand;
+        ItemBase coolItem;
+
         if (!m_PoweredNet)
             return;
-
         if (m_IsOpen)
             return;
 
-        CargoBase cargo = GetInventory().GetCargo();
+        cargo = GetInventory().GetCargo();
         if (!cargo)
             return;
 
-        int itemCount = cargo.GetItemCount();
-        if (itemCount <= 0)
-            return;
-
-        int cooled = 0;
-        float targetTemp = LFPG_FRIDGE_TEMP;
-        float tolerance = 0.5;
-        int i = 0;
-        float curTemp = 0.0;
-        float diffHigh = 0.0;
-        float diffLow = 0.0;
-        bool outsideBand = false;
-
-        for (i = 0; i < itemCount; i = i + 1)
+        itemCount = cargo.GetItemCount();
+        if (itemCount != m_LastCargoCount)
         {
-            ItemBase it = ItemBase.Cast(cargo.GetItem(i));
-            if (!it)
+            m_LastCargoCount = itemCount;
+            m_CoolSleepTicks = 0;
+        }
+        if (itemCount <= 0)
+        {
+            m_CoolSleepTicks = 2;
+            return;
+        }
+        if (m_CoolSleepTicks > 0)
+        {
+            m_CoolSleepTicks = m_CoolSleepTicks - 1;
+            return;
+        }
+
+        cooled = 0;
+        targetTemp = LFPG_FRIDGE_TEMP;
+        tolerance = 0.5;
+        curTemp = 0.0;
+        diffHigh = 0.0;
+        diffLow = 0.0;
+        outsideBand = false;
+
+        for (itemIndex = 0; itemIndex < itemCount; itemIndex = itemIndex + 1)
+        {
+            coolItem = ItemBase.Cast(cargo.GetItem(itemIndex));
+            if (!coolItem)
+                continue;
+            if (coolItem.IsDamageDestroyed())
+                continue;
+            if (!coolItem.CanHaveTemperature())
                 continue;
 
-            if (it.IsDamageDestroyed())
-                continue;
-
-            if (!it.CanHaveTemperature())
-                continue;
-
-            curTemp = it.GetTemperature();
+            curTemp = coolItem.GetTemperature();
             diffHigh = curTemp - targetTemp;
             diffLow = targetTemp - curTemp;
-
             outsideBand = false;
             if (diffHigh > tolerance)
-            {
                 outsideBand = true;
-            }
             if (diffLow > tolerance)
-            {
                 outsideBand = true;
-            }
 
             if (outsideBand)
             {
-                it.SetTemperature(targetTemp);
+                coolItem.SetTemperature(targetTemp);
                 cooled = cooled + 1;
             }
         }
+
+        if (cooled == 0)
+            m_CoolSleepTicks = 2;
+        else
+            m_CoolSleepTicks = 0;
 
         if (cooled > 0)
         {

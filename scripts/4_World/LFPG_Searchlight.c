@@ -49,6 +49,9 @@ class LFPG_Searchlight : LFPG_DeviceBase
     protected float m_SplashX    = 0.0;
     protected float m_SplashY    = 0.0;
     protected float m_SplashZ    = 0.0;
+    protected float m_SplashRaycastLastMs = -1.0;
+    protected int m_PerfDiagAimCommitCount;
+    protected int m_PerfDiagSplashRaycastCount;
 
     // ---- Server-only: operator tracking (NOT SyncVars, NOT persisted) ----
     protected int m_OperatorNetLow  = 0;
@@ -62,6 +65,53 @@ class LFPG_Searchlight : LFPG_DeviceBase
 
     // ---- Base orientation yaw (set once in LFPG_OnInit, never synced/persisted) ----
     protected float m_BaseOriYaw = 0.0;
+
+    // ---- Transient persistence recovery state (NOT SyncVar, NOT persisted) ----
+    protected static bool s_InvalidAimLoadWarned = false;
+
+    // Pure aim validation keeps RPC and persistence policy identical.
+    static bool LFPG_IsInvalidAimValue(float value)
+    {
+        float witness = value - value;
+        if (value != value || witness != witness)
+            return true;
+        return false;
+    }
+
+    // Preserve the existing [-180, 180] boundary convention in constant time.
+    static float LFPG_NormalizeAimYaw(float yaw)
+    {
+        if (yaw >= -180.0 && yaw <= 180.0)
+            return yaw;
+
+        bool wasNegative = false;
+        float magnitude = yaw;
+        if (magnitude < 0.0)
+        {
+            wasNegative = true;
+            magnitude = -magnitude;
+        }
+
+        float turns = magnitude / 360.0;
+        float wholeTurns = Math.Floor(turns);
+        float normalizedYaw = 0.0;
+        // Keep exact-size subtraction below the float integer boundary.
+        if (magnitude <= 16777216.0)
+        {
+            normalizedYaw = magnitude - wholeTurns * 360.0;
+        }
+        else
+        {
+            // The fractional path avoids multiplying a huge quotient by 360.
+            float fraction = turns - wholeTurns;
+            normalizedYaw = fraction * 360.0;
+        }
+        if (normalizedYaw > 180.0)
+            normalizedYaw = normalizedYaw - 360.0;
+        if (wasNegative && normalizedYaw != 0.0)
+            normalizedYaw = -normalizedYaw;
+        return normalizedYaw;
+    }
 
     // ============================================
     // Constructor — port + SyncVars
@@ -262,19 +312,44 @@ class LFPG_Searchlight : LFPG_DeviceBase
 
     override bool LFPG_OnStoreLoadExtra(ParamsReadContext ctx, int ver)
     {
-        if (!ctx.Read(m_AimYaw))
+        float loadedYaw = 0.0;
+        float loadedPitch = 0.0;
+
+        if (!ctx.Read(loadedYaw))
         {
             string errYaw = "[LFPG_Searchlight] OnStoreLoad failed: m_AimYaw";
             LFPG_Util.Error(errYaw);
             return false;
         }
 
-        if (!ctx.Read(m_AimPitch))
+        if (!ctx.Read(loadedPitch))
         {
             string errPitch = "[LFPG_Searchlight] OnStoreLoad failed: m_AimPitch";
             LFPG_Util.Error(errPitch);
             return false;
         }
+
+        if (LFPG_IsInvalidAimValue(loadedYaw) || LFPG_IsInvalidAimValue(loadedPitch))
+        {
+            m_AimYaw = 0.0;
+            m_AimPitch = 0.0;
+            if (!s_InvalidAimLoadWarned)
+            {
+                s_InvalidAimLoadWarned = true;
+                LFPG_Util.Warn("[LFPG_Searchlight] Non-finite persisted aim reset to neutral");
+            }
+            return true;
+        }
+
+        float normalizedYaw = LFPG_NormalizeAimYaw(loadedYaw);
+        float clampedPitch = loadedPitch;
+        if (clampedPitch < LFPG_SEARCHLIGHT_PITCH_MIN)
+            clampedPitch = LFPG_SEARCHLIGHT_PITCH_MIN;
+        if (clampedPitch > LFPG_SEARCHLIGHT_PITCH_MAX)
+            clampedPitch = LFPG_SEARCHLIGHT_PITCH_MAX;
+
+        m_AimYaw = normalizedYaw;
+        m_AimPitch = clampedPitch;
 
         return true;
     }
@@ -315,6 +390,12 @@ class LFPG_Searchlight : LFPG_DeviceBase
             m_LightSplash.SetBrightnessTo(0.0);
         }
 
+        LFPG_SearchlightBeamCore coreLight = LFPG_SearchlightBeamCore.Cast(m_LightBeamCore);
+        if (coreLight)
+        {
+            coreLight.LFPG_SetRig(this, m_LightBeamSpill, m_LightHalo);
+        }
+
         string logMsg = "[LFPG_Searchlight] CreateAllLights id=";
         logMsg = logMsg + m_DeviceId;
         LFPG_Util.Debug(logMsg);
@@ -326,6 +407,11 @@ class LFPG_Searchlight : LFPG_DeviceBase
         #ifndef SERVER
         if (m_LightBeamCore)
         {
+            LFPG_SearchlightBeamCore coreLight = LFPG_SearchlightBeamCore.Cast(m_LightBeamCore);
+            if (coreLight)
+            {
+                coreLight.LFPG_ClearRig();
+            }
             m_LightBeamCore.Destroy();
             m_LightBeamCore = null;
         }
@@ -460,7 +546,6 @@ class LFPG_Searchlight : LFPG_DeviceBase
         #ifdef SERVER
         m_AimYaw   = yaw;
         m_AimPitch = pitch;
-        SetSynchDirty();
         #endif
     }
 
@@ -534,14 +619,41 @@ class LFPG_Searchlight : LFPG_DeviceBase
         m_SplashX   = sx;
         m_SplashY   = sy;
         m_SplashZ   = sz;
-        SetSynchDirty();
         #endif
     }
 
-    void LFPG_FlushSyncVars()
+    bool LFPG_ShouldRefreshSplash(float nowMs)
+    {
+        if (m_SplashRaycastLastMs < 0.0 || (nowMs - m_SplashRaycastLastMs) >= LFPG_SEARCHLIGHT_SPLASH_RAYCAST_MS)
+        {
+            m_SplashRaycastLastMs = nowMs;
+            return true;
+        }
+        return false;
+    }
+
+    void LFPG_FlushSyncVars(bool splashRaycasted)
     {
         #ifdef SERVER
         SetSynchDirty();
+
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            m_PerfDiagAimCommitCount = m_PerfDiagAimCommitCount + 1;
+            if (splashRaycasted)
+            {
+                m_PerfDiagSplashRaycastCount = m_PerfDiagSplashRaycastCount + 1;
+            }
+            string perfAim = "LFPG_PERFDIAG searchlight_commit count=";
+            perfAim = perfAim + m_PerfDiagAimCommitCount.ToString();
+            perfAim = perfAim + " raycast_count=";
+            perfAim = perfAim + m_PerfDiagSplashRaycastCount.ToString();
+            perfAim = perfAim + " raycasted=";
+            perfAim = perfAim + splashRaycasted.ToString();
+            perfAim = perfAim + " deviceId=";
+            perfAim = perfAim + m_DeviceId;
+            Print(perfAim);
+        }
         #endif
     }
 

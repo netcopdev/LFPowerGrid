@@ -16,6 +16,28 @@ class LFPG_Util
     static void Info(string msg)  { LFPG_LogInternal(1, msg); }
     static void Debug(string msg) { LFPG_LogInternal(2, msg); }
 
+    // Per-sender rate-limited warn (anti RPT spam from malicious clients).
+    // PR-C 2026-05-26: gate for RPC target-mismatch warnings; cooldown is
+    // per (sender plain id + key) so different bug-categories do not mask
+    // each other. Default 1 s.
+    protected static ref map<string, ref LFPG_RateLimiter> s_WarnRateLimits;
+
+    static void RateLimitedWarn(PlayerIdentity sender, string key, string msg, float cooldownSeconds = 1.0)
+    {
+        if (!sender) { Warn(msg); return; }
+        if (!s_WarnRateLimits) s_WarnRateLimits = new map<string, ref LFPG_RateLimiter>();
+        string mapKey = sender.GetPlainId() + ":" + key;
+        LFPG_RateLimiter limiter = s_WarnRateLimits.Get(mapKey);
+        if (!limiter)
+        {
+            limiter = new LFPG_RateLimiter();
+            s_WarnRateLimits.Set(mapKey, limiter);
+        }
+        float nowSec = GetGame().GetTickTime();
+        if (limiter.Allow(nowSec, cooldownSeconds))
+            Warn(msg);
+    }
+
     // Persistent device id helpers
     static void GenerateDeviceId(out int low, out int high)
     {

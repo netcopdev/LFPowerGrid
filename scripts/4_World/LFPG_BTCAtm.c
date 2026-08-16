@@ -86,8 +86,31 @@ class LFPG_BTCAtmBase : LFPG_DeviceBase
         {
             stock = 0;
         }
+        if (stock == m_BtcStock)
+            return;
+        string deviceId = LFPG_GetDeviceId();
+        if (!LFPG_BalanceProvider_Native.PrepareStockMutation(deviceId, m_BtcStock, stock))
+            return;
+
         m_BtcStock = stock;
         SetSynchDirty();
+        #endif
+    }
+
+    bool LFPG_CanAddBtcStock(int count)
+    {
+        #ifdef SERVER
+        if (count <= 0)
+            return false;
+
+        int maxStock = LFPG_BTCConfig.GetMaxBtcPerMachine();
+        if (count > maxStock - m_BtcStock)
+            return false;
+        int newStock = m_BtcStock + count;
+        string deviceId = LFPG_GetDeviceId();
+        return LFPG_BalanceProvider_Native.CanPrepareStockMutation(deviceId, m_BtcStock, newStock);
+        #else
+        return false;
         #endif
     }
 
@@ -98,8 +121,14 @@ class LFPG_BTCAtmBase : LFPG_DeviceBase
             return false;
 
         int maxStock = LFPG_BTCConfig.GetMaxBtcPerMachine();
-        int newStock = m_BtcStock + amount;
-        if (newStock > maxStock)
+        // Overflow-safe
+        if (amount > maxStock - m_BtcStock)
+            return false;
+        int newStock = m_BtcStock;
+        newStock = newStock + amount;
+
+        string deviceId = LFPG_GetDeviceId();
+        if (!LFPG_BalanceProvider_Native.PrepareStockMutation(deviceId, m_BtcStock, newStock))
             return false;
 
         m_BtcStock = newStock;
@@ -119,12 +148,31 @@ class LFPG_BTCAtmBase : LFPG_DeviceBase
         if (amount > m_BtcStock)
             return false;
 
-        m_BtcStock = m_BtcStock - amount;
+        int newStock = m_BtcStock - amount;
+        string deviceId = LFPG_GetDeviceId();
+        if (!LFPG_BalanceProvider_Native.PrepareStockMutation(deviceId, m_BtcStock, newStock))
+            return false;
+
+        m_BtcStock = newStock;
         SetSynchDirty();
         return true;
         #else
         return false;
         #endif
+    }
+
+    // Applies a durable claim target without creating a fold for itself.
+    bool LFPG_ApplyClaimedStockTarget(int stock)
+    {
+        if (!g_Game || !g_Game.IsServer())
+            return false;
+        int maxStock = LFPG_BTCConfig.GetMaxBtcPerMachine();
+        if (stock < 0 || stock > maxStock)
+            return false;
+
+        m_BtcStock = stock;
+        SetSynchDirty();
+        return true;
     }
 
     // ============================================
@@ -157,6 +205,13 @@ class LFPG_BTCAtmBase : LFPG_DeviceBase
         if (val < 0.0)
         {
             val = 0.0;
+        }
+        // Logical assertion: this field stores fractions only. Integer EUR
+        // belongs to account/cash delivery and must never enter persistence.
+        if (val >= 1.0)
+        {
+            LFPG_Util.Error("[LFPG_BTCAtm] Decimal remainder invariant violated (value >= 1); clamping fail-closed on " + LFPG_GetDeviceId());
+            val = 0.999999;
         }
         m_DecimalRemainder = val;
         #endif
@@ -255,6 +310,12 @@ class LFPG_BTCAtmBase : LFPG_DeviceBase
         LFPG_Util.Info(loadMsg);
 
         return true;
+    }
+
+    override void AfterStoreLoad()
+    {
+        super.AfterStoreLoad();
+        LFPG_BalanceProvider_Native.ReconcileLoadedAtm(this);
     }
 
     // ============================================

@@ -41,12 +41,18 @@ class LFPG_WireOwnerBase : LFPG_DeviceBase
     // NOT persisted — session-only, starts at 0 each restart.
     protected int m_WireGeneration = 0;
 
+    // Cached canonical JSON shared by persistence and owner sync.
+    protected string m_WireJSONCache;
+    protected int m_WireJSONCacheGeneration = -1;
+
     // ============================================
     // Constructor
     // ============================================
     void LFPG_WireOwnerBase()
     {
         m_Wires = new array<ref LFPG_WireData>;
+        m_WireJSONCache = "";
+        m_WireJSONCacheGeneration = -1;
 
         string varWireGen = "m_WireGeneration";
         RegisterNetSyncVariableInt(varWireGen);
@@ -94,26 +100,37 @@ class LFPG_WireOwnerBase : LFPG_DeviceBase
     // ---- Persistence: save wireJSON + device extras ----
     override void LFPG_OnStoreSaveExtra(ParamsWriteContext ctx)
     {
-        string json;
-        LFPG_WireHelper.SerializeJSON(m_Wires, json);
+        string json = LFPG_GetWiresJSON();
         ctx.Write(json);
 
         LFPG_OnStoreSaveDevice(ctx);
     }
 
     // ---- Persistence: load wireJSON + device extras ----
+    // PR-A P0-7: on truncated wireJSON, preserve the entity instead of letting
+    // the engine discard it (which would orphan vanilla wires linked to this
+    // device). Trade-off: device-specific extras (BTCAtm balance, Searchlight
+    // dir, etc.) are LOST for this entity in this boot because the ctx cursor
+    // is now in an unknown position and reading further would yield garbage.
+    // Entity survives with defaults; admin/player can rebuild/resync in-game.
     override bool LFPG_OnStoreLoadExtra(ParamsReadContext ctx, int ver)
     {
         string json;
         if (!ctx.Read(json))
         {
-            string errJson = "[LFPG_WireOwnerBase] OnStoreLoad failed: wireJSON on " + GetType();
+            string errJson = "[LFPG_WireOwnerBase] OnStoreLoad wireJSON truncated on ";
+            errJson = errJson + GetType();
+            errJson = errJson + ". Preserving entity with empty wires; device-specific state defaults applied (cursor misaligned, downstream Reads skipped).";
             LFPG_Util.Error(errJson);
-            return false;
+            m_Wires = new array<ref LFPG_WireData>;
+        m_WireJSONCache = "";
+        m_WireJSONCacheGeneration = -1;
+            return true;
         }
 
         string debugLabel = GetType();
         LFPG_WireHelper.DeserializeJSON(m_Wires, json, debugLabel);
+        m_WireJSONCacheGeneration = -1;
 
         return LFPG_OnStoreLoadDevice(ctx, ver);
     }
@@ -128,7 +145,31 @@ class LFPG_WireOwnerBase : LFPG_DeviceBase
 
     string LFPG_GetWiresJSON()
     {
-        return LFPG_WireHelper.GetJSON(m_Wires);
+        if (m_WireJSONCacheGeneration != m_WireGeneration)
+        {
+            LFPG_WireHelper.SerializeJSON(m_Wires, m_WireJSONCache);
+            m_WireJSONCacheGeneration = m_WireGeneration;
+        }
+        return m_WireJSONCache;
+    }
+
+    void LFPG_InvalidateWireJSONCache()
+    {
+        m_WireJSONCacheGeneration = -1;
+    }
+
+    int LFPG_GetWireGeneration()
+    {
+        return m_WireGeneration;
+    }
+
+    // Server mutation paths that edit m_Wires directly use one explicit commit.
+    void LFPG_CommitWireMutation()
+    {
+        #ifdef SERVER
+        m_WireGeneration = m_WireGeneration + 1;
+        SetSynchDirty();
+        #endif
     }
 
     bool LFPG_AddWire(LFPG_WireData wd)

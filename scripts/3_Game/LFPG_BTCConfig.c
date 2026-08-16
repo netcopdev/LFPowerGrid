@@ -44,6 +44,7 @@ class LFPG_BTCSettingsData
     // BTC item
     string btcItemClassname;    // Classname of the physical BTC item
     int maxBtcPerMachine;       // Max BTC stock per ATM machine
+    int maxEurPerOperation;     // BTC large-amount cap 2026-05-19: hard cap on eurAmount per WithdrawCash/DepositCash tx
 
     // ATM behavior
     bool atmWithdrawOnlyDefault;  // Default for new ATMs
@@ -65,6 +66,7 @@ class LFPG_BTCSettingsData
         refreshSeconds = 60;
         btcItemClassname = "Ammo_9x19_25Rnd";
         maxBtcPerMachine = 100;
+        maxEurPerOperation = 100000;
         atmWithdrawOnlyDefault = false;
         balanceMode = "auto";
         currencies = new array<ref LFPG_BTCCurrency>;
@@ -213,6 +215,16 @@ class LFPG_BTCConfig
             s_Data.maxBtcPerMachine = 10000;
         }
 
+        // maxEurPerOperation: min 100, max 10000000
+        if (s_Data.maxEurPerOperation < 100)
+        {
+            s_Data.maxEurPerOperation = 100;
+        }
+        if (s_Data.maxEurPerOperation > 10000000)
+        {
+            s_Data.maxEurPerOperation = 10000000;
+        }
+
         // apiUrl: must not be empty
         if (s_Data.apiUrl == "")
         {
@@ -280,6 +292,17 @@ class LFPG_BTCConfig
 
         // Validate each currency entry
         int ci;
+        // B2 fix 2026-05-17: compact null entries before validation.
+        // Iterate in reverse so Remove() doesn't break indices.
+        for (ci = s_Data.currencies.Count() - 1; ci >= 0; ci = ci - 1)
+        {
+            if (!s_Data.currencies[ci])
+            {
+                s_Data.currencies.Remove(ci);
+                LFPG_Util.Warn("[LFPG_BTCConfig] Removed null currency entry at idx " + ci.ToString());
+            }
+        }
+
         for (ci = 0; ci < s_Data.currencies.Count(); ci = ci + 1)
         {
             ref LFPG_BTCCurrency cur = s_Data.currencies[ci];
@@ -416,6 +439,12 @@ class LFPG_BTCConfig
     {
         LFPG_BTCSettingsData d = Get();
         return d.maxBtcPerMachine;
+    }
+
+    static int GetMaxEurPerOperation()
+    {
+        LFPG_BTCSettingsData d = Get();
+        return d.maxEurPerOperation;
     }
 
     static bool GetAtmWithdrawOnlyDefault()

@@ -137,17 +137,29 @@ class LFPG_ActionPairRemote : ActionSingleUseBase
         {
             // Pair
             vector devPos = targetEnt.GetPosition();
-            rc.LFPG_PairDevice(devId, devPos);
+            bool pairAdded = rc.LFPG_PairDevice(devId, devPos);
 
             if (pb)
             {
-                string typeName2 = targetEnt.GetType();
-                string onMsg = "[LFPG] Paired: ";
-                onMsg = onMsg + typeName2;
-                onMsg = onMsg + " (";
-                onMsg = onMsg + rc.LFPG_GetPairedCount().ToString();
-                onMsg = onMsg + " total)";
-                pb.MessageStatus(onMsg);
+                if (pairAdded)
+                {
+                    string typeName2 = targetEnt.GetType();
+                    string onMsg = "[LFPG] Paired: ";
+                    onMsg = onMsg + typeName2;
+                    onMsg = onMsg + " (";
+                    onMsg = onMsg + rc.LFPG_GetPairedCount().ToString();
+                    onMsg = onMsg + " total)";
+                    if (rc.LFPG_DidLastPairEvictOldest())
+                        onMsg = onMsg + ". Oldest pairing evicted.";
+                    pb.MessageStatus(onMsg);
+                }
+                else
+                {
+                    string fullMsg = "[LFPG] Pair list full (";
+                    fullMsg = fullMsg + LFPG_REMOTE_PAIR_CAP.ToString();
+                    fullMsg = fullMsg + " devices).";
+                    pb.MessageStatus(fullMsg);
+                }
             }
         }
 

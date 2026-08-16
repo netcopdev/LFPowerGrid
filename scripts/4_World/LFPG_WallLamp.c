@@ -33,8 +33,10 @@ class LFPG_WallLamp : LFPG_WireOwnerBase
     protected bool m_PoweredNet = false;
     protected bool m_Overloaded = false;
 
+#ifndef SERVER
     // Client-side light effect (NOT ref -- engine object)
     protected ScriptedLightBase m_LFPG_Light;
+#endif
 
     void LFPG_WallLamp()
     {
@@ -127,6 +129,7 @@ class LFPG_WallLamp : LFPG_WireOwnerBase
     }
 
     // ---- Client-side light effects ----
+#ifndef SERVER
     protected void LFPG_CreateLight()
     {
         if (m_LFPG_Light)
@@ -153,7 +156,9 @@ class LFPG_WallLamp : LFPG_WireOwnerBase
             m_LFPG_Light.SetEnabled(true);
         }
     }
+#endif
 
+#ifndef SERVER
     protected void LFPG_DestroyLight()
     {
         if (!m_LFPG_Light)
@@ -162,14 +167,19 @@ class LFPG_WallLamp : LFPG_WireOwnerBase
         m_LFPG_Light.FadeOut();
         m_LFPG_Light = null;
     }
+#endif
 
+#ifndef SERVER
     protected void LFPG_SetRvmatOn()
     {
         SetObjectMaterial(0, LFPG_WALLLAMP_RVMAT_ON);
     }
+#endif
 
+#ifndef SERVER
     protected void LFPG_SetRvmatOff()
     {
         SetObjectMaterial(0, LFPG_WALLLAMP_RVMAT_OFF);
     }
+#endif
 };

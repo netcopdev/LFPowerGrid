@@ -57,6 +57,7 @@ class LFPG_PairedEntry : Managed
     float  m_PosX;
     float  m_PosY;
     float  m_PosZ;
+    int    m_LastSeenOrder;
 
     void LFPG_PairedEntry()
     {
@@ -64,6 +65,7 @@ class LFPG_PairedEntry : Managed
         m_PosX = 0.0;
         m_PosY = 0.0;
         m_PosZ = 0.0;
+        m_LastSeenOrder = 0;
     }
 };
 
@@ -78,6 +80,10 @@ class LFPG_RemoteController : Inventory_Base
 
     // Cooldown (server only)
     protected int m_LastActivateTime;
+    protected int m_LastSeenSerial;
+    protected bool m_LastPairEvictedOldest;
+    protected ref array<string> m_PruneEvictedIds;
+    protected ref array<ref LFPG_PairedEntry> m_PairOrderBuffer;
 
     // ============================================
     // Constructor
@@ -87,6 +93,10 @@ class LFPG_RemoteController : Inventory_Base
         m_PairedEntries = new array<ref LFPG_PairedEntry>;
         m_ClientPairedIds = new array<string>;
         m_LastActivateTime = 0;
+        m_LastSeenSerial = 0;
+        m_LastPairEvictedOldest = false;
+        m_PruneEvictedIds = new array<string>;
+        m_PairOrderBuffer = new array<ref LFPG_PairedEntry>;
     }
 
     // ============================================
@@ -134,17 +144,41 @@ class LFPG_RemoteController : Inventory_Base
     // ============================================
     // Pairing API (server only)
     // ============================================
-    void LFPG_PairDevice(string deviceId, vector pos)
+    bool LFPG_PairDevice(string deviceId, vector pos)
     {
         #ifdef SERVER
+        m_LastPairEvictedOldest = false;
         if (LFPG_IsPaired(deviceId))
-            return;
+            return true;
+
+        LFPG_PruneStalePairs("pair");
+        if (m_PairedEntries.Count() >= LFPG_REMOTE_PAIR_CAP)
+        {
+            int oldestIndex = LFPG_FindOldestPairIndex();
+            if (oldestIndex < 0)
+                return false;
+
+            LFPG_PairedEntry oldestEntry = m_PairedEntries[oldestIndex];
+            string oldestId = "<null>";
+            if (oldestEntry)
+                oldestId = oldestEntry.m_DeviceId;
+            m_PairedEntries.Remove(oldestIndex);
+            m_LastPairEvictedOldest = true;
+
+            string evictMsg = "[LFPG_RemoteController] Pair list full at ";
+            evictMsg = evictMsg + LFPG_REMOTE_PAIR_CAP.ToString();
+            evictMsg = evictMsg + " entries; evicted oldest deviceId=";
+            evictMsg = evictMsg + oldestId;
+            LFPG_Util.Warn(evictMsg);
+        }
 
         LFPG_PairedEntry entry = new LFPG_PairedEntry();
         entry.m_DeviceId = deviceId;
         entry.m_PosX = pos[0];
         entry.m_PosY = pos[1];
         entry.m_PosZ = pos[2];
+        m_LastSeenSerial = m_LastSeenSerial + 1;
+        entry.m_LastSeenOrder = m_LastSeenSerial;
         m_PairedEntries.Insert(entry);
 
         string pairMsg = "[LFPG_RemoteController] Paired deviceId=";
@@ -152,9 +186,107 @@ class LFPG_RemoteController : Inventory_Base
         pairMsg = pairMsg + " total=";
         pairMsg = pairMsg + m_PairedEntries.Count().ToString();
         LFPG_Util.Info(pairMsg);
+        return true;
         #endif
+        return false;
+    }
+    bool LFPG_DidLastPairEvictOldest()
+    {
+        return m_LastPairEvictedOldest;
+    }
+    protected int LFPG_FindOldestPairIndex()
+    {
+        int oldestIndex = -1;
+        int oldestOrder = 0;
+        int i;
+        for (i = 0; i < m_PairedEntries.Count(); i = i + 1)
+        {
+            LFPG_PairedEntry entry = m_PairedEntries[i];
+            if (!entry)
+                return i;
+            if (oldestIndex < 0 || entry.m_LastSeenOrder < oldestOrder)
+            {
+                oldestIndex = i;
+                oldestOrder = entry.m_LastSeenOrder;
+            }
+        }
+        return oldestIndex;
     }
 
+    protected void LFPG_OrderPairsByLastSeen()
+    {
+        m_PairOrderBuffer.Clear();
+        while (m_PairedEntries.Count() > 0)
+        {
+            int oldestIndex = LFPG_FindOldestPairIndex();
+            if (oldestIndex < 0)
+                break;
+            m_PairOrderBuffer.Insert(m_PairedEntries[oldestIndex]);
+            m_PairedEntries.Remove(oldestIndex);
+        }
+
+        int i;
+        for (i = 0; i < m_PairOrderBuffer.Count(); i = i + 1)
+            m_PairedEntries.Insert(m_PairOrderBuffer[i]);
+        m_PairOrderBuffer.Clear();
+    }
+    protected bool LFPG_IsPairEntryStale(LFPG_PairedEntry entry)
+    {
+        if (!entry || entry.m_DeviceId == "")
+            return true;
+
+        EntityAI device = LFPG_DeviceRegistry.Get().FindById(entry.m_DeviceId);
+        if (!device)
+        {
+            return false;
+        }
+
+        vector storedPos;
+        storedPos[0] = entry.m_PosX;
+        storedPos[1] = entry.m_PosY;
+        storedPos[2] = entry.m_PosZ;
+        if (LFPG_WorldUtil.DistSq(device.GetPosition(), storedPos) > LFPG_REMOTE_POS_TOLERANCE_SQ)
+            return true;
+        if (!LFPG_DeviceAPI.IsRFCapable(device))
+            return true;
+        return false;
+    }
+
+    protected int LFPG_PruneStalePairs(string reason)
+    {
+        m_PruneEvictedIds.Clear();
+        int i = m_PairedEntries.Count() - 1;
+        while (i >= 0)
+        {
+            LFPG_PairedEntry entry = m_PairedEntries[i];
+            if (LFPG_IsPairEntryStale(entry))
+            {
+                string removedId = "<null>";
+                if (entry)
+                    removedId = entry.m_DeviceId;
+                m_PruneEvictedIds.Insert(removedId);
+                m_PairedEntries.Remove(i);
+            }
+            i = i - 1;
+        }
+
+        int removed = m_PruneEvictedIds.Count();
+        if (removed > 0)
+        {
+            string pruneMsg = "[LFPG_RemoteController] Pruned stale pairs before ";
+            pruneMsg = pruneMsg + reason;
+            pruneMsg = pruneMsg + ": ";
+            int pi;
+            for (pi = 0; pi < removed; pi = pi + 1)
+            {
+                if (pi > 0)
+                    pruneMsg = pruneMsg + ",";
+                pruneMsg = pruneMsg + m_PruneEvictedIds[pi];
+            }
+            LFPG_Util.Warn(pruneMsg);
+        }
+        return removed;
+    }
     void LFPG_UnpairDevice(string deviceId)
     {
         #ifdef SERVER
@@ -195,6 +327,8 @@ class LFPG_RemoteController : Inventory_Base
         #ifdef SERVER
         if (!recipient)
             return;
+
+        LFPG_PruneStalePairs("sync");
 
         ScriptRPC rpc = new ScriptRPC();
 
@@ -313,10 +447,7 @@ class LFPG_RemoteController : Inventory_Base
 
             if (!device)
             {
-                // Device no longer exists — auto-unpair
-                m_PairedEntries.Remove(i);
-                removed = removed + 1;
-                listChanged = true;
+                // Registry miss can be transient (streamed out / boot ordering).
                 i = i - 1;
                 continue;
             }
@@ -359,6 +490,9 @@ class LFPG_RemoteController : Inventory_Base
             }
 
             // Toggle!
+            m_LastSeenSerial = m_LastSeenSerial + 1;
+            entry.m_LastSeenOrder = m_LastSeenSerial;
+
             bool result = LFPG_DeviceAPI.RemoteToggle(device);
             if (result)
             {
@@ -438,6 +572,9 @@ class LFPG_RemoteController : Inventory_Base
     {
         super.OnStoreSave(ctx);
 
+        LFPG_PruneStalePairs("save");
+        LFPG_OrderPairsByLastSeen();
+
         ctx.Write(LFPG_REMOTE_PERSIST_VER);
 
         int count = m_PairedEntries.Count();
@@ -492,6 +629,8 @@ class LFPG_RemoteController : Inventory_Base
         }
 
         m_PairedEntries.Clear();
+        m_PruneEvictedIds.Clear();
+        m_LastSeenSerial = 0;
 
         int i;
         for (i = 0; i < count; i = i + 1)
@@ -518,15 +657,42 @@ class LFPG_RemoteController : Inventory_Base
 
             if (devId != "")
             {
+                if (m_PairedEntries.Count() >= LFPG_REMOTE_PAIR_CAP)
+                {
+                    int oldestIndex = LFPG_FindOldestPairIndex();
+                    if (oldestIndex >= 0)
+                    {
+                        LFPG_PairedEntry oldestEntry = m_PairedEntries[oldestIndex];
+                        string oldestId = "<null>";
+                        if (oldestEntry)
+                            oldestId = oldestEntry.m_DeviceId;
+                        m_PruneEvictedIds.Insert(oldestId);
+                        m_PairedEntries.Remove(oldestIndex);
+                    }
+                }
                 LFPG_PairedEntry entry = new LFPG_PairedEntry();
                 entry.m_DeviceId = devId;
                 entry.m_PosX = px;
                 entry.m_PosY = py;
                 entry.m_PosZ = pz;
+                m_LastSeenSerial = m_LastSeenSerial + 1;
+                entry.m_LastSeenOrder = m_LastSeenSerial;
                 m_PairedEntries.Insert(entry);
             }
         }
 
+        if (m_PruneEvictedIds.Count() > 0)
+        {
+            string legacyMsg = "[LFPG_RemoteController] Legacy over-cap load evicted oldest IDs: ";
+            int ei;
+            for (ei = 0; ei < m_PruneEvictedIds.Count(); ei = ei + 1)
+            {
+                if (ei > 0)
+                    legacyMsg = legacyMsg + ",";
+                legacyMsg = legacyMsg + m_PruneEvictedIds[ei];
+            }
+            LFPG_Util.Warn(legacyMsg);
+        }
         string loadMsg = "[LFPG_RemoteController] OnStoreLoad: ";
         loadMsg = loadMsg + m_PairedEntries.Count().ToString();
         loadMsg = loadMsg + " entries loaded";

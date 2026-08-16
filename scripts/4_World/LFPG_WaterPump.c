@@ -83,14 +83,6 @@ class LFPG_WaterPump : LFPG_WireOwnerBase
     }
 
     // ============================================
-    // Attachment override
-    // ============================================
-    override bool CanReleaseAttachment(EntityAI attachment)
-    {
-        return super.CanReleaseAttachment(attachment);
-    }
-
-    // ============================================
     // Virtual interface — PASSTHROUGH
     // ============================================
     override int LFPG_GetDeviceType()
@@ -354,6 +346,7 @@ class LFPG_WaterPump_T2 : LFPG_WireOwnerBase
     protected bool  m_Overloaded             = false;
     protected float m_TankLevel              = 0.0;
     protected int   m_TankLiquidType         = 0;
+    protected int   m_PerfDiagTankDirtyCount = 0;
     protected int   m_ConnectedSprinklerCount = 0;
 
     // ---- Server-only ----
@@ -421,14 +414,6 @@ class LFPG_WaterPump_T2 : LFPG_WireOwnerBase
     {
         string empty = "";
         return empty;
-    }
-
-    // ============================================
-    // Attachment override
-    // ============================================
-    override bool CanReleaseAttachment(EntityAI attachment)
-    {
-        return super.CanReleaseAttachment(attachment);
     }
 
     // ============================================
@@ -671,8 +656,32 @@ class LFPG_WaterPump_T2 : LFPG_WireOwnerBase
     void LFPG_SetTankLevel(float level)
     {
         #ifdef SERVER
-        m_TankLevel = level;
+        float clampedLevel = level;
+        if (clampedLevel < 0.0)
+        {
+            clampedLevel = 0.0;
+        }
+        if (clampedLevel > LFPG_PUMP_TANK_MAX)
+        {
+            clampedLevel = LFPG_PUMP_TANK_MAX;
+        }
+        if (m_TankLevel == clampedLevel)
+            return;
+
+        m_TankLevel = clampedLevel;
         SetSynchDirty();
+
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            m_PerfDiagTankDirtyCount = m_PerfDiagTankDirtyCount + 1;
+            string perfLevel = "LFPG_PERFDIAG pump_dirty cause=level count=";
+            perfLevel = perfLevel + m_PerfDiagTankDirtyCount.ToString();
+            perfLevel = perfLevel + " deviceId=";
+            perfLevel = perfLevel + m_DeviceId;
+            perfLevel = perfLevel + " level=";
+            perfLevel = perfLevel + clampedLevel.ToString();
+            Print(perfLevel);
+        }
         #endif
     }
 
@@ -684,8 +693,23 @@ class LFPG_WaterPump_T2 : LFPG_WireOwnerBase
     void LFPG_SetTankLiquidType(int liqType)
     {
         #ifdef SERVER
+        if (m_TankLiquidType == liqType)
+            return;
+
         m_TankLiquidType = liqType;
         SetSynchDirty();
+
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            m_PerfDiagTankDirtyCount = m_PerfDiagTankDirtyCount + 1;
+            string perfType = "LFPG_PERFDIAG pump_dirty cause=liquid_type count=";
+            perfType = perfType + m_PerfDiagTankDirtyCount.ToString();
+            perfType = perfType + " deviceId=";
+            perfType = perfType + m_DeviceId;
+            perfType = perfType + " liquidType=";
+            perfType = perfType + liqType.ToString();
+            Print(perfType);
+        }
         #endif
     }
 

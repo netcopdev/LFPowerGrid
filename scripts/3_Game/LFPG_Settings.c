@@ -530,8 +530,8 @@ class LFPG_Settings
         if (!FileExist(SETTINGS_DIR))
             MakeDirectory(SETTINGS_DIR);
 
-        // v0.7.15 (Sprint 3 P2b): Backup restore if main file missing
-        LFPG_FileUtil.EnsureFileOrRestore(SETTINGS_FILE);
+        // PR-A: typed recovery prefers parseable orphan .tmp over .bak.new/.bak.
+        LFPG_FileUtil.EnsureSettingsFileOrRestore(SETTINGS_FILE);
 
         if (FileExist(SETTINGS_FILE))
         {

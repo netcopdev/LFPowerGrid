@@ -65,8 +65,10 @@ class LFPG_ActionSyncSorter : ActionInteractBase
             return false;
 
         // Don't allow if UI is open
+#ifndef SERVER
         if (LFPG_SorterView.IsOpen())
             return false;
+#endif
 
         return true;
     }

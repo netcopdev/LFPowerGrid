@@ -80,15 +80,20 @@ class LFPG_DeviceRegistry
 
         outArr.Clear();
 
+        // Dedup by entity pointer in O(n): a hashed seen-map replaces the former
+        // O(n^2) outArr.Find() scan. Object-keyed maps are a vanilla pattern
+        // (scripts/4_world/classes/useractionscomponent/actiontargets.c:4
+        // map<Object,Object>). Output order and contents are unchanged.
+        map<EntityAI, bool> seen = new map<EntityAI, bool>;
+        bool alreadySeen;
+
         int i;
         for (i = 0; i < m_ById.Count(); i = i + 1)
         {
             EntityAI ent = m_ById.GetElement(i);
             if (!ent) continue;
 
-            // Dedup: skip if this exact entity object is already in outArr
-            int already = outArr.Find(ent);
-            if (already != -1)
+            if (seen.Find(ent, alreadySeen))
             {
                 // Log the duplicate key for debugging
                 string dupKey = m_ById.GetKey(i);
@@ -100,6 +105,7 @@ class LFPG_DeviceRegistry
                 continue;
             }
 
+            seen.Set(ent, true);
             outArr.Insert(ent);
         }
     }

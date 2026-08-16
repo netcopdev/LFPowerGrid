@@ -461,36 +461,32 @@ class LFPG_MotionSensor : LFPG_WireOwnerBase
         vector sensorPos = GetPosition();
 
         // ---- Compute sensorEye (raycast origin in open space) ----
-        // mountProbeDir (0,-1,0) is a reference vector to determine
-        // mounting surface. NOT the dome direction (dome is +Z).
-        vector mountProbe = Vector(0, -1, 0);
-        vector probePt = ModelToWorld(mountProbe);
-        float probeX = probePt[0] - sensorPos[0];
-        float probeY = probePt[1] - sensorPos[1];
-        float probeZ = probePt[2] - sensorPos[2];
-
-        float horizLenSq = probeX * probeX + probeZ * probeZ;
-        float horizLen = Math.Sqrt(horizLenSq);
+        // The dome of the motion sensor is at model +Y (verified against the
+        // p3d geometry: ~818 verts at Y≈0.22 vs ~88 at Y≈0, plus port_*_dir
+        // markers at Y=-0.016 confirming -Y is the cable-side / mount face).
+        // The placement system orients the model so +Y faces away from the
+        // mount surface; pushing the eye 0.4 m in that direction lands it in
+        // open air regardless of mount type (floor/ceiling/wall). Replaces
+        // the previous "(0,-1,0) probe" heuristic which placed the eye inside
+        // the wall on wall mounts.
+        vector domeFwd = ModelToWorld(Vector(0, 1, 0));
+        float domeX = domeFwd[0] - sensorPos[0];
+        float domeY = domeFwd[1] - sensorPos[1];
+        float domeZ = domeFwd[2] - sensorPos[2];
+        float domeLen = Math.Sqrt(domeX * domeX + domeY * domeY + domeZ * domeZ);
 
         vector sensorEye = sensorPos;
-
-        if (horizLen > 0.1)
+        if (domeLen >= 0.001)
         {
-            // Wall mount: push eye outward from wall surface
-            float hNorm = 0.4 / horizLen;
-            sensorEye[0] = sensorEye[0] + probeX * hNorm;
-            sensorEye[2] = sensorEye[2] + probeZ * hNorm;
-            sensorEye[1] = sensorEye[1] + 0.15;
-        }
-        else if (probeY > 0.5)
-        {
-            // Ceiling mount: eye below sensor
-            sensorEye[1] = sensorEye[1] - 0.5;
+            float domeOffset = 0.4 / domeLen;
+            sensorEye[0] = sensorPos[0] + domeX * domeOffset;
+            sensorEye[1] = sensorPos[1] + domeY * domeOffset;
+            sensorEye[2] = sensorPos[2] + domeZ * domeOffset;
         }
         else
         {
-            // Floor mount: eye above sensor
-            sensorEye[1] = sensorEye[1] + 0.5;
+            // Degenerate transform — safe upward fallback.
+            sensorEye[1] = sensorPos[1] + 0.4;
         }
 
         // ---- Scan players (360° omnidirectional) ----

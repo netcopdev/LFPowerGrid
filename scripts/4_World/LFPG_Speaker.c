@@ -363,11 +363,14 @@ class LFPG_Speaker : LFPG_DeviceBase
     {
         ctx.Write(m_SpeakerOn);
 
-        string saveMsg = "[LFPG_Speaker] Saved id=";
-        saveMsg = saveMsg + m_DeviceId;
-        saveMsg = saveMsg + " speakerOn=";
-        saveMsg = saveMsg + m_SpeakerOn.ToString();
-        LFPG_Util.Info(saveMsg);
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            string saveMsg = "[LFPG_Speaker] Saved id=";
+            saveMsg = saveMsg + m_DeviceId;
+            saveMsg = saveMsg + " speakerOn=";
+            saveMsg = saveMsg + m_SpeakerOn.ToString();
+            LFPG_Util.Info(saveMsg);
+        }
     }
 
     override bool LFPG_OnStoreLoadExtra(ParamsReadContext ctx, int ver)

@@ -64,9 +64,15 @@ class LFPG_ConnectionRules
     //       The server handles replacement logic in HandleLFPG_FinishWiring.
     //       We only flag it as a warning/info for the semaforo.
     // =========================================================
-    static LFPG_PreConnectResult CanPreConnect(LFPG_PreConnectParams p)
+    static LFPG_PreConnectResult CanPreConnect(LFPG_PreConnectParams p, LFPG_PreConnectResult reuseResult = null, float prefixTotalLen = -1.0, float prefixMaxSegLen = -1.0)
     {
-        LFPG_PreConnectResult result = new LFPG_PreConnectResult();
+        LFPG_PreConnectResult result = reuseResult;
+        if (!result)
+        {
+            result = new LFPG_PreConnectResult();
+        }
+        result.m_Status = LFPG_PreConnectStatus.OK;
+        result.m_Reason = "";
 
         // ------- No target -------
         if (!p.dstEntity)
@@ -122,15 +128,27 @@ class LFPG_ConnectionRules
         vector prev = p.startPos;
 
         int w;
-        for (w = 0; w < wpCount; w = w + 1)
+        if (prefixTotalLen >= 0.0 && prefixMaxSegLen >= 0.0)
         {
-            float segLen = vector.Distance(prev, p.waypoints[w]);
-            totalLen = totalLen + segLen;
-            if (segLen > maxSegLen)
+            totalLen = prefixTotalLen;
+            maxSegLen = prefixMaxSegLen;
+            if (wpCount > 0)
             {
-                maxSegLen = segLen;
+                prev = p.waypoints[wpCount - 1];
             }
-            prev = p.waypoints[w];
+        }
+        else
+        {
+            for (w = 0; w < wpCount; w = w + 1)
+            {
+                float segLen = vector.Distance(prev, p.waypoints[w]);
+                totalLen = totalLen + segLen;
+                if (segLen > maxSegLen)
+                {
+                    maxSegLen = segLen;
+                }
+                prev = p.waypoints[w];
+            }
         }
 
         // Last segment: last waypoint (or startPos) -> endPos

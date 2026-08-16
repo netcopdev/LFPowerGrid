@@ -336,9 +336,11 @@ class LFPG_Sprinkler : LFPG_DeviceBase
     // Phase C: Find PlayerBase within radius → wet attachments + cargo
     //          (rain parity — vanilla Environment handles GetStatWet)
     // =========================================================
-    void LFPG_TickWatering()
+    void LFPG_TickWatering(bool allowPlayerInventory, array<Man> coalescedPlayers, out int wetApplied, out int wetCoalesced)
     {
         #ifdef SERVER
+        wetApplied = 0;
+        wetCoalesced = 0;
         vector sprPos = GetPosition();
 
         // Clear reusable arrays
@@ -449,6 +451,16 @@ class LFPG_Sprinkler : LFPG_DeviceBase
                 // Skip dead players (corpses still return as PlayerBase)
                 if (!player.IsAlive())
                     continue;
+                if (!allowPlayerInventory)
+                    continue;
+                if (coalescedPlayers)
+                {
+                    if (coalescedPlayers.Find(player) >= 0)
+                    {
+                        wetCoalesced = wetCoalesced + 1;
+                        continue;
+                    }
+                }
 
                 playerInv = player.GetInventory();
                 if (!playerInv)
@@ -527,6 +539,9 @@ class LFPG_Sprinkler : LFPG_DeviceBase
                     }
                 }
 
+                if (coalescedPlayers)
+                    coalescedPlayers.Insert(player);
+                wetApplied = wetApplied + 1;
                 playersWetted = playersWetted + 1;
                 continue;
             }

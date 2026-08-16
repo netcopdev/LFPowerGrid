@@ -187,7 +187,7 @@ class CfgPatches
         units[] = { "LFPG_CableReel", "LFPG_Generator", "LF_TestLamp", "LF_TestLampHeavy", "LFPG_Splitter_Kit", "LFPG_Splitter", "LFPG_CeilingLight_Kit", "LFPG_CeilingLight", "LFPG_WallLamp_Kit", "LFPG_WallLamp", "LFPG_SolarPanel_Kit", "LFPG_SolarPanel", "LFPG_SolarPanel_T2", "LFPG_Combiner_Kit", "LFPG_Combiner", "LFPG_Camera_Kit", "LFPG_Camera", "LFPG_Monitor_Kit", "LFPG_Monitor", "LFPG_PushButton_Kit", "LFPG_PushButton", "LFPG_SwitchV2_Kit", "LFPG_SwitchV2", "LFPG_WaterPump_Kit", "LFPG_WaterPump", "LFPG_WaterPump_T2", "LFPG_Furnace_Kit", "LFPG_Furnace", "LFPG_Sorter_Kit", "LFPG_Sorter", "LFPG_Searchlight_Kit", "LFPG_Searchlight", "LFPG_MotionSensor_Kit", "LFPG_MotionSensor", "LFPG_AND_Gate_Kit", "LFPG_AND_Gate", "LFPG_OR_Gate_Kit", "LFPG_OR_Gate", "LFPG_XOR_Gate_Kit", "LFPG_XOR_Gate", "LFPG_MemoryCell_Kit", "LFPG_MemoryCell", "LFPG_PressurePad_Kit", "LFPG_PressurePad", "LFPG_LaserDetector_Kit", "LFPG_LaserDetector", "LFPG_ElectronicCounter_Kit", "LFPG_ElectronicCounter", "LFPG_BatteryMedium_Kit", "LFPG_BatteryMedium", "LFPG_BatteryLarge_Kit", "LFPG_BatteryLarge", "LFPG_DoorController_Kit", "LFPG_DoorController", "LFPG_Intercom_Kit", "LFPG_Intercom", "LFPG_GhostRadio", "LFPG_SwitchRemote_Kit", "LFPG_SwitchRemote", "LFPG_SwitchV2Remote_Kit", "LFPG_SwitchV2Remote", "LFPG_Fridge_Kit", "LFPG_Fridge", "LFPG_Sprinkler_Kit", "LFPG_Sprinkler", "LFPG_BatteryAdapter_Kit", "LFPG_BatteryAdapter", "LFPG_ElectricStove_Kit", "LFPG_ElectricStove", "LFPG_BTCAtm_Kit", "LFPG_BTCAtm", "LFPG_BTCAtmAdmin_Kit", "LFPG_BTCAtmAdmin", "LFPG_RemoteController", "LFPG_Speaker_Kit", "LFPG_Speaker", "LFPG_GhostPASReceiver"};
         weapons[] = {};
         requiredVersion = 0.1;
-        requiredAddons[] = { "DZ_Data", "DZ_Scripts", "DZ_Gear_Tools", "DZ_Gear_Camping", "DZ_Gear_Containers", "DZ_Gear_Consumables", "DZ_Radio", "DZ_Gear_Cooking"};
+        requiredAddons[] = { "DZ_Data", "DZ_Scripts", "DZ_Gear_Tools", "DZ_Gear_Camping", "DZ_Gear_Containers", "DZ_Gear_Consumables", "DZ_Radio", "DZ_Gear_Cooking", "DF_Scripts"};
     };
 };
 
@@ -205,7 +205,7 @@ class CfgMods
         credits = "Extanator";
         author = "Return";
         authorID = "0";
-        version = "1.2.0";
+        version = "1.2.2";
         type = "mod";
 
         dependencies[] = { "Game", "World", "Mission" };
@@ -215,17 +215,17 @@ class CfgMods
             class gameScriptModule
             {
                 value = "";
-                files[] = { "LFPowerGrid/scripts/3_Game", "LFPowerGrid/Scripts/3_Game", "scripts/3_Game", "Scripts/3_Game" };
+                files[] = { "LFPowerGrid/scripts/3_Game" };
             };
             class worldScriptModule
             {
                 value = "";
-                files[] = { "LFPowerGrid/scripts/4_World", "LFPowerGrid/Scripts/4_World", "scripts/4_World", "Scripts/4_World" };
+                files[] = { "LFPowerGrid/scripts/4_World" };
             };
             class missionScriptModule
             {
                 value = "";
-                files[] = { "LFPowerGrid/scripts/5_Mission", "LFPowerGrid/Scripts/5_Mission", "scripts/5_Mission", "Scripts/5_Mission" };
+                files[] = { "LFPowerGrid/scripts/5_Mission" };
             };
         };
     };
@@ -1071,6 +1071,23 @@ class CfgVehicles
         hiddenSelections[] = { "sorter_led" };
         hiddenSelectionsTextures[] = { "\LFPowerGrid\data\sorter\textures\led_co.paa" };
         hiddenSelectionsMaterials[] = { "\LFPowerGrid\data\sorter\materials\lf_sorter_led_off.rvmat" };
+    };
+
+    // ---- Sprint 0 (2026-04-26): V4 TEST variant ----
+    // Same model, same physics, same wire ports as V3. Differs only in
+    // displayName (admin-visible test marker) and the action that opens
+    // the configuration UI (LFPG_ActionOpenSorterPanel_TEST -> v4 view).
+    class LFPG_Sorter_TEST_Kit : LFPG_Sorter_Kit
+    {
+        scope = 2;
+        displayName = "[V4 TEST] Power Sorter Kit";
+        descriptionShort = "Test variant — duplicate of LFPG_Sorter_Kit. Spawns LFPG_Sorter_TEST.";
+    };
+    class LFPG_Sorter_TEST : LFPG_Sorter
+    {
+        scope = 2;
+        displayName = "[V4 TEST] Power Sorter";
+        descriptionShort = "Test variant — V3 functionality with experimental UI. Will replace V3 once stable.";
     };
 
     // =========================================================
@@ -2075,6 +2092,11 @@ class CfgVehicles
     // =========================================================
 
     // ---- BatteryAdapter Kit (holdable, deployable, same-model) ----
+    // Kept public: the adapter is the only device that lets a vanilla CarBattery
+    // or TruckBattery feed the grid. The vanilla BatteryCharger is a consumer with
+    // a single IN port (LFPG_IDevice.c:818-819, :850-852) and cannot replace that.
+    // It also covers the small-battery tier left open when LF_BatterySmall was
+    // removed (LFPG_Battery.c:10-12).
     class LFPG_BatteryAdapter_Kit : Inventory_Base
     {
         scope = 2;
@@ -2093,6 +2115,8 @@ class CfgVehicles
     };
 
     // ---- BatteryAdapter (placed device, PASSTHROUGH 1 IN + 1 OUT) ----
+    // Kept public: see Kit comment above. Live consumer of the type is
+    // LFPG_NetworkManager.c:7497 / :7511 (LFPG_TickBatteriesInternal).
     class LFPG_BatteryAdapter : Inventory_Base
     {
         scope = 2;

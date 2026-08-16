@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - CCTV Viewport Manager (v1.3.2)
 //
@@ -109,6 +111,14 @@ class LFPG_CameraViewport
     protected TextWidget     m_wTimestamp;
     protected float          m_BlinkTimer;
     protected bool           m_RecVisible;
+    protected bool           m_ScanOverlayBuilt;
+    protected int            m_ScanOverlayW;
+    protected int            m_ScanOverlayH;
+    protected int            m_LastTimestampYear;
+    protected int            m_LastTimestampMonth;
+    protected int            m_LastTimestampDay;
+    protected int            m_LastTimestampHour;
+    protected int            m_LastTimestampMinute;
 
     // ---- Camera pan (WASD rotation from base orientation) ----
     protected vector    m_BaseOrientation;  // Original camera orientation
@@ -155,6 +165,14 @@ class LFPG_CameraViewport
         m_wTimestamp      = null;
         m_BlinkTimer     = 0.0;
         m_RecVisible     = true;
+        m_ScanOverlayBuilt = false;
+        m_ScanOverlayW = 0;
+        m_ScanOverlayH = 0;
+        m_LastTimestampYear = -1;
+        m_LastTimestampMonth = -1;
+        m_LastTimestampDay = -1;
+        m_LastTimestampHour = -1;
+        m_LastTimestampMinute = -1;
         m_BaseOrientation = vector.Zero;
         m_YawOffset      = 0.0;
         m_PitchOffset    = 0.0;
@@ -191,7 +209,6 @@ class LFPG_CameraViewport
         if (s_Instance)
         {
             s_Instance.ForceCleanup();
-            delete s_Instance;
             s_Instance = null;
         }
     }
@@ -237,7 +254,7 @@ class LFPG_CameraViewport
         if (s_Instance.m_ExitPhase > 0)
             return;
 
-        Print("[CameraViewport] DIAG: SafeAbort — device destroyed, queueing exit");
+        LFPG_Util.Debug("[CameraViewport] DIAG: SafeAbort — device destroyed, queueing exit");
         s_Instance.m_ExitPhase = 1;
     }
 
@@ -250,14 +267,14 @@ class LFPG_CameraViewport
         if (m_OverlayRoot)
             return true;
 
-        Print("[CameraViewport] DIAG: InitWidgets — pre-CreateWidgets");
+        LFPG_Util.Debug("[CameraViewport] DIAG: InitWidgets — pre-CreateWidgets");
         m_OverlayRoot = g_Game.GetWorkspace().CreateWidgets(LFPG_CCTV_LAYOUT);
         if (!m_OverlayRoot)
         {
             LFPG_Util.Error("[CameraViewport] Failed to create overlay from: " + LFPG_CCTV_LAYOUT);
             return false;
         }
-        Print("[CameraViewport] DIAG: InitWidgets — CreateWidgets OK");
+        LFPG_Util.Debug("[CameraViewport] DIAG: InitWidgets — CreateWidgets OK");
 
         m_OverlayRoot.SetSort(10002);
 
@@ -328,7 +345,7 @@ class LFPG_CameraViewport
 
         m_OverlayRoot.Show(false);
 
-        Print("[CameraViewport] DIAG: InitWidgets complete");
+        LFPG_Util.Debug("[CameraViewport] DIAG: InitWidgets complete");
         LFPG_Util.Info("[CameraViewport] Overlay widgets created (hidden)");
         return true;
     }
@@ -350,24 +367,9 @@ class LFPG_CameraViewport
     // =========================================================
     // EnterFromList
     // =========================================================
-    void EnterFromList(array<ref LFPG_CameraListEntry> entries)
+    void EnterFromList(PlayerBase player, array<ref LFPG_CameraListEntry> entries)
     {
-        Print("[CameraViewport] DIAG: EnterFromList entry");
-
-        PlayerBase p = PlayerBase.Cast(g_Game.GetPlayer());
-
-        if (!entries)
-        {
-            LFPG_Util.Warn("[CameraViewport] EnterFromList: entries null");
-            return;
-        }
-
-        if (entries.Count() == 0)
-        {
-            if (p)
-                p.MessageStatus("[LFPG] No hay camaras activas conectadas.");
-            return;
-        }
+        LFPG_Util.Debug("[CameraViewport] DIAG: EnterFromList entry");
 
         if (m_Active)
         {
@@ -381,14 +383,34 @@ class LFPG_CameraViewport
             return;
         }
 
+        // Dispatch supplies the original RPC target even while g_Game.GetPlayer() is null.
+        m_PlayerRef = player;
+
+        if (!entries)
+        {
+            LFPG_Util.Warn("[CameraViewport] EnterFromList: entries null");
+            m_ExitPhase = 1;
+            return;
+        }
+
+        if (entries.Count() == 0)
+        {
+            if (m_PlayerRef)
+                m_PlayerRef.MessageStatus("[LFPG] No hay camaras activas conectadas.");
+            m_ExitPhase = 1;
+            return;
+        }
+
+        if (!m_PlayerRef || !m_PlayerRef.IsAlive() || m_PlayerRef.IsUnconscious())
+        {
+            LFPG_Util.Warn("[CameraViewport] EnterFromList: player unavailable or vital state invalid");
+            m_ExitPhase = 1;
+            return;
+        }
+
         m_CameraList  = entries;
         m_CameraTotal = entries.Count();
         m_CameraIndex = 0;
-
-        // Guardar referencia al player ANTES de entrar en spectator mode.
-        // Después de SelectSpectator, GetPlayer() puede retornar null.
-        // Se usa en Phase 2 para enviar RPC CCTV_EXIT.
-        m_PlayerRef = p;
 
         // Widgets: NO crear aquí — EnterFromList corre en contexto RPC
         // y CreateWidgets cuelga el engine desde RPC handlers.
@@ -399,20 +421,15 @@ class LFPG_CameraViewport
         LockFocus();
         HideHUD();
 
-        Print("[CameraViewport] DIAG: pre-EnterCamera(0)");
+        LFPG_Util.Debug("[CameraViewport] DIAG: pre-EnterCamera(0)");
         bool camOk = EnterCamera(0);
         if (!camOk)
         {
-            LFPG_Util.Error("[CameraViewport] EnterCamera failed — aborting");
-            if (m_OverlayRoot)
-                m_OverlayRoot.Show(false);
-            UnlockFocus();
-            RestoreHUD();
-            m_CameraList  = null;
-            m_CameraTotal = 0;
+            LFPG_Util.Error("[CameraViewport] EnterCamera failed — queueing coordinated exit");
+            m_ExitPhase = 1;
             return;
         }
-        Print("[CameraViewport] DIAG: post-EnterCamera OK");
+        LFPG_Util.Debug("[CameraViewport] DIAG: post-EnterCamera OK");
 
         m_Active         = true;
         m_ScanlineOffset = 0.0;
@@ -443,7 +460,7 @@ class LFPG_CameraViewport
 
         UpdateOverlayLabel();
 
-        if (p)
+        if (m_PlayerRef)
         {
             string totalStr = m_CameraTotal.ToString();
             string enterMsg = "[LFPG] ";
@@ -451,7 +468,7 @@ class LFPG_CameraViewport
             enterMsg = enterMsg + " (1/";
             enterMsg = enterMsg + totalStr;
             enterMsg = enterMsg + ")  SPACE=Salir  Q/E=Ciclar";
-            p.MessageStatus(enterMsg);
+            m_PlayerRef.MessageStatus(enterMsg);
         }
 
         string logEntry = "[CameraViewport] EnterFromList: ";
@@ -510,7 +527,7 @@ class LFPG_CameraViewport
             m_ViewCamObj.SetPosition(viewPos);
             m_ViewCamObj.SetOrientation(camOri);
             m_CameraIndex = index;
-            Print("[CameraViewport] DIAG: Reused existing camera object");
+            LFPG_Util.Debug("[CameraViewport] DIAG: Reused existing camera object");
             return true;
         }
 
@@ -518,7 +535,7 @@ class LFPG_CameraViewport
         // COT Client_Enter pattern: Camera.GetCurrentCamera() devuelve la cámara
         // que el engine creó via SelectSpectator. NO usar CreateObject.
         // CreateObject crea un world object sin tracking → crash 0x68 al salir.
-        Print("[CameraViewport] DIAG: Camera.GetCurrentCamera (SelectSpectator)");
+        LFPG_Util.Debug("[CameraViewport] DIAG: Camera.GetCurrentCamera (SelectSpectator)");
         Camera currentCam = Camera.GetCurrentCamera();
         if (!currentCam)
         {
@@ -529,7 +546,7 @@ class LFPG_CameraViewport
         currentCam.SetActive(true);
         currentCam.SetPosition(viewPos);
         currentCam.SetOrientation(camOri);
-        Print("[CameraViewport] DIAG: Engine camera acquired + positioned OK");
+        LFPG_Util.Debug("[CameraViewport] DIAG: Engine camera acquired + positioned OK");
 
         m_ViewCamObj  = currentCam;
         m_CameraIndex = index;
@@ -547,7 +564,7 @@ class LFPG_CameraViewport
 
         if (key == LFPG_KC_SPACE || key == LFPG_KC_ESCAPE)
         {
-            Print("[CameraViewport] DIAG: EXIT queued via key=" + key.ToString());
+            LFPG_Util.Debug("[CameraViewport] DIAG: EXIT queued via key=" + key.ToString());
             m_ExitPhase = 1;
             return true;
         }
@@ -679,7 +696,7 @@ class LFPG_CameraViewport
     // =========================================================
     protected void ForceCleanup()
     {
-        Print("[CameraViewport] DIAG: ForceCleanup");
+        LFPG_Util.Debug("[CameraViewport] DIAG: ForceCleanup");
         m_Active    = false;
         m_ExitPhase = 0;
         m_ExitWaitTimer = 0.0;
@@ -739,11 +756,19 @@ class LFPG_CameraViewport
     // =========================================================
     void DoExitCleanup()
     {
-        Print("[CameraViewport] DIAG: DoExitCleanup — server confirmed");
+        // A duplicated confirm after the terminal transition is a strict no-op.
+        if (!m_Active && m_ExitPhase == 0 && !m_ViewCamObj && !m_PlayerRef)
+            return;
 
-        // Deactivate spectator camera. Phase 1 keeps it active to avoid
-        // engine crash (no active camera). Now that SelectPlayer has
-        // restored the player camera, safe to deactivate.
+        LFPG_Util.Debug("[CameraViewport] DIAG: DoExitCleanup — server confirmed");
+
+        m_Active = false;
+        m_ExitCooldown = LFPG_CCTV_EXIT_COOLDOWN;
+
+        if (m_OverlayRoot)
+            m_OverlayRoot.Show(false);
+
+        // Deactivate spectator camera only after SelectPlayer restored the player camera.
         if (m_ViewCamObj)
         {
             Camera viewCamTyped = Camera.Cast(m_ViewCamObj);
@@ -754,23 +779,38 @@ class LFPG_CameraViewport
             m_ViewCamObj = null;
         }
 
-        // Safety: re-enable HIC if still disabled
-        Human localPlayer = g_Game.GetPlayer();
-        if (localPlayer)
+        HumanInputController cleanupHic = null;
+        if (m_PlayerRef)
         {
-            HumanInputController hic = localPlayer.GetInputController();
-            if (hic)
-            {
-                hic.SetDisabled(false);
-            }
+            cleanupHic = m_PlayerRef.GetInputController();
         }
+        else
+        {
+            Human localPlayer = g_Game.GetPlayer();
+            if (localPlayer)
+                cleanupHic = localPlayer.GetInputController();
+        }
+        if (cleanupHic)
+            cleanupHic.SetDisabled(false);
 
         m_PlayerRef = null;
 
         UnlockFocus();
         RestoreHUD();
 
-        m_ExitPhase     = 0;
+        m_CameraLabel = "";
+        m_ActiveDuration = 0.0;
+        m_ScanlineOffset = 0.0;
+        m_YawOffset = 0.0;
+        m_PitchOffset = 0.0;
+        m_KeyW = false;
+        m_KeyA = false;
+        m_KeyS = false;
+        m_KeyD = false;
+        m_CameraList = null;
+        m_CameraIndex = 0;
+        m_CameraTotal = 0;
+        m_ExitPhase = 0;
         m_ExitWaitTimer = 0.0;
 
         LFPG_Util.Info("[CameraViewport] DoExitCleanup complete — camera released");
@@ -790,6 +830,16 @@ class LFPG_CameraViewport
     // =========================================================
     void Tick(float timeslice)
     {
+        // Vital-state loss is a terminal transition and joins the existing exit FSM.
+        if (m_Active && m_ExitPhase == 0)
+        {
+            if (!m_PlayerRef || !m_PlayerRef.IsAlive() || m_PlayerRef.IsUnconscious())
+            {
+                LFPG_Util.Info("[CameraViewport] Auto-exit (vital state)");
+                m_ExitPhase = 1;
+            }
+        }
+
         // ---- Phase 2: waiting for server confirmation ----
         // DON'T touch camera here. Server is processing SelectPlayer.
         // DoExitCleanup() will be called from RPC handler.
@@ -815,7 +865,7 @@ class LFPG_CameraViewport
         // UpdateUDAngleUnlocked reads player input state.
         if (m_ExitPhase == 1)
         {
-            Print("[CameraViewport] DIAG: Phase 1 — m_Active=false + RPC EXIT_REQUEST");
+            LFPG_Util.Debug("[CameraViewport] DIAG: Phase 1 — m_Active=false + RPC EXIT_REQUEST");
 
             m_Active       = false;
             m_ExitCooldown = LFPG_CCTV_EXIT_COOLDOWN;
@@ -858,7 +908,7 @@ class LFPG_CameraViewport
                 int exitSubId = LFPG_RPC_SubId.CCTV_EXIT_REQUEST;
                 exitRpc.Write(exitSubId);
                 exitRpc.Send(m_PlayerRef, LFPG_RPC_CHANNEL, true, null);
-                Print("[CameraViewport] DIAG: RPC EXIT_REQUEST sent");
+                LFPG_Util.Debug("[CameraViewport] DIAG: RPC EXIT_REQUEST sent");
             }
 
             m_ExitWaitTimer = 0.0;
@@ -913,16 +963,25 @@ class LFPG_CameraViewport
             int minute = 0;
             g_Game.GetWorld().GetDate(year, month, day, hour, minute);
 
-            string ts = year.ToStringLen(4);
-            ts = ts + "-";
-            ts = ts + month.ToStringLen(2);
-            ts = ts + "-";
-            ts = ts + day.ToStringLen(2);
-            ts = ts + "  ";
-            ts = ts + hour.ToStringLen(2);
-            ts = ts + ":";
-            ts = ts + minute.ToStringLen(2);
-            m_wTimestamp.SetText(ts);
+            bool timestampDirty = (year != m_LastTimestampYear || month != m_LastTimestampMonth || day != m_LastTimestampDay || hour != m_LastTimestampHour || minute != m_LastTimestampMinute);
+            if (timestampDirty)
+            {
+                string ts = year.ToStringLen(4);
+                ts = ts + "-";
+                ts = ts + month.ToStringLen(2);
+                ts = ts + "-";
+                ts = ts + day.ToStringLen(2);
+                ts = ts + "  ";
+                ts = ts + hour.ToStringLen(2);
+                ts = ts + ":";
+                ts = ts + minute.ToStringLen(2);
+                m_wTimestamp.SetText(ts);
+                m_LastTimestampYear = year;
+                m_LastTimestampMonth = month;
+                m_LastTimestampDay = day;
+                m_LastTimestampHour = hour;
+                m_LastTimestampMinute = minute;
+            }
         }
 
         // ---- WASD camera pan ----
@@ -996,15 +1055,13 @@ class LFPG_CameraViewport
     // CableHUD canvas doesn't render over SelectSpectator view.
     // Our canvas is part of the overlay widget tree → renders correctly.
     // =========================================================
-    void DrawOverlay(LFPG_CableHUD hud)
+    void DrawOverlay()
     {
         if (!m_Active)
             return;
 
         if (!m_wScanCanvas)
             return;
-
-        m_wScanCanvas.Clear();
 
         int scrW = 0;
         int scrH = 0;
@@ -1015,8 +1072,17 @@ class LFPG_CameraViewport
         if (sw <= 0.0 || sh <= 0.0)
             return;
 
-        // Scanlines: horizontal lines scrolling down
-        float lineY = m_ScanlineOffset;
+        // Static cached Canvas geometry. Rebuild only when resolution changes.
+        if (m_ScanOverlayBuilt && scrW == m_ScanOverlayW && scrH == m_ScanOverlayH)
+            return;
+
+        m_wScanCanvas.Clear();
+        m_ScanOverlayBuilt = true;
+        m_ScanOverlayW = scrW;
+        m_ScanOverlayH = scrH;
+
+        // Scanlines: horizontal lines cached on the overlay canvas.
+        float lineY = 0.0;
         while (lineY < sh)
         {
             m_wScanCanvas.DrawLine(0.0, lineY, sw, lineY, 1.0, m_ScanColor);
@@ -1121,3 +1187,88 @@ class LFPG_CameraViewport
         }
     }
 }
+#endif
+
+#ifdef SERVER
+static const float LFPG_CCTV_LENS_OFFSET_M = 0.2;
+
+// Server-side no-op stub: keeps LFPG_CameraViewport type plus the public and
+// externally consumed protected surface resolvable after the client boundary
+// removed the implementation from the server type surface (SP-075).
+class LFPG_CameraViewport
+{
+    protected Object m_ViewCamObj;
+    protected ref array<ref LFPG_CameraListEntry> m_CameraList;
+    protected vector m_BaseOrientation;
+
+    void LFPG_CameraViewport()
+    {
+    }
+
+    static LFPG_CameraViewport Get()
+    {
+        return null;
+    }
+
+    static void Reset()
+    {
+    }
+
+    static void SafeAbort()
+    {
+    }
+
+    bool IsActive()
+    {
+        return false;
+    }
+
+    bool ShouldSkipInspector()
+    {
+        return false;
+    }
+
+    bool InitWidgets()
+    {
+        return false;
+    }
+
+    void EnterFromList(array<ref LFPG_CameraListEntry> entries)
+    {
+    }
+
+    protected bool EnterCamera(int index)
+    {
+        return false;
+    }
+
+    bool HandleKeyDown(int key)
+    {
+        return false;
+    }
+
+    void HandleKeyUp(int key)
+    {
+    }
+
+    void CycleNext()
+    {
+    }
+
+    void CyclePrev()
+    {
+    }
+
+    void DoExitCleanup()
+    {
+    }
+
+    void Tick(float timeslice)
+    {
+    }
+
+    void DrawOverlay()
+    {
+    }
+};
+#endif

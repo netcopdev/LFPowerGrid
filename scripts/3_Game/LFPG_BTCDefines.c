@@ -57,11 +57,49 @@ static const int LFPG_BTC_ERR_TOO_FAR         = 8;   // player too far from ATM
 static const int LFPG_BTC_ERR_INVALID         = 9;   // generic validation failure
 static const int LFPG_BTC_ERR_NO_CASH         = 10;  // player has no EUR bills
 static const int LFPG_BTC_ERR_NO_BALANCE_PROVIDER = 11;  // no balance provider active
+// A3 patch 2026-05-17: race / refund visibility codes
+static const int LFPG_BTC_ERR_REFUNDED        = 12;  // race after charge, full refund applied
+static const int LFPG_BTC_ERR_REFUND_PARTIAL  = 13;  // race after charge, refund INCOMPLETE - admin required
+// BTC large-amount cap 2026-05-19: input rejection by server cap
+static const int LFPG_BTC_ERR_AMOUNT_TOO_LARGE = 14;  // amount exceeds per-tx server cap
+
+// ---- BTC ATM: Protocol ----
+static const int LFPG_BTC_PROTOCOL_VERSION = 2;
+
+class LFPG_BTCTxTypeMapper
+{
+    static int GetTxTypeForSubId(int subId)
+    {
+        if (subId == LFPG_RPC_SubId.BTC_BUY)
+            return LFPG_BTC_TX_BUY;
+        if (subId == LFPG_RPC_SubId.BTC_SELL)
+            return LFPG_BTC_TX_SELL;
+        if (subId == LFPG_RPC_SubId.BTC_WITHDRAW)
+            return LFPG_BTC_TX_WITHDRAW;
+        if (subId == LFPG_RPC_SubId.BTC_DEPOSIT)
+            return LFPG_BTC_TX_DEPOSIT;
+        if (subId == LFPG_RPC_SubId.BTC_WITHDRAW_CASH)
+            return LFPG_BTC_TX_WITHDRAW_CASH;
+        if (subId == LFPG_RPC_SubId.BTC_DEPOSIT_CASH)
+            return LFPG_BTC_TX_DEPOSIT_CASH;
+        return 0;
+    }
+};
 
 // ---- BTC ATM: Client-side data holder (Sprint BTC-3) ----
 // Populated by client RPC handlers, read by UI (Sprint BTC-4).
+#ifndef SERVER
+class LFPG_BTCClientPending
+{
+    int m_Sequence;
+    int m_TxType;
+};
+
 class LFPG_BTCAtmClientData
 {
+    protected static const int LFPG_BTC_CLIENT_MAX_SEQUENCE = 2000000000;
+    protected static const int LFPG_BTC_CLIENT_PENDING_LIMIT = 64;
+
     // From BTC_OPEN_RESPONSE
     static float  s_Price          = -1.0;
     static int    s_Stock          = 0;
@@ -76,6 +114,14 @@ class LFPG_BTCAtmClientData
     static int    s_NetLow         = 0;
     static int    s_NetHigh        = 0;
 
+    // Server-session nonce state. Pending entries are runtime-only.
+    static bool   s_MutationsEnabled = false;
+    static int    s_ServerSessionLow = 0;
+    static int    s_ServerSessionHigh = 0;
+    static int    s_NextSequence = 1;
+    protected static bool s_SequenceRefreshNeeded = false;
+    protected static ref array<ref LFPG_BTCClientPending> s_Pending;
+
     // From BTC_TX_RESULT
     static int    s_LastTxType     = 0;
     static int    s_LastErrCode    = 0;
@@ -84,7 +130,58 @@ class LFPG_BTCAtmClientData
     static int    s_LastBtcMoved   = 0;
     static float  s_LastEurAmount  = 0.0;
 
-    static void OnOpenResponse(float price, int stock, int balance, int cashOnInv, bool wo, int btcOnInv, float priceChange24h)
+    protected static void EnsurePending()
+    {
+        if (!s_Pending)
+            s_Pending = new array<ref LFPG_BTCClientPending>;
+    }
+
+    static bool BeginMutation(int subId, out int serverSessionLow, out int serverSessionHigh, out int sequence)
+    {
+        serverSessionLow = 0;
+        serverSessionHigh = 0;
+        sequence = 0;
+
+        if (!s_MutationsEnabled)
+            return false;
+        if (s_NextSequence <= 0 || s_NextSequence > LFPG_BTC_CLIENT_MAX_SEQUENCE)
+        {
+            s_MutationsEnabled = false;
+            s_SequenceRefreshNeeded = true;
+            return false;
+        }
+
+        int txType = LFPG_BTCTxTypeMapper.GetTxTypeForSubId(subId);
+        if (txType <= 0)
+            return false;
+
+        EnsurePending();
+        while (s_Pending.Count() >= LFPG_BTC_CLIENT_PENDING_LIMIT)
+        {
+            s_Pending.Remove(0);
+        }
+
+        LFPG_BTCClientPending pending = new LFPG_BTCClientPending();
+        pending.m_Sequence = s_NextSequence;
+        pending.m_TxType = txType;
+        s_Pending.Insert(pending);
+
+        serverSessionLow = s_ServerSessionLow;
+        serverSessionHigh = s_ServerSessionHigh;
+        sequence = s_NextSequence;
+        s_NextSequence = s_NextSequence + 1;
+        return true;
+    }
+
+    static bool TakeSessionRefreshRequest()
+    {
+        if (!s_SequenceRefreshNeeded)
+            return false;
+        s_SequenceRefreshNeeded = false;
+        return true;
+    }
+
+    static void OnOpenResponse(float price, int stock, int balance, int cashOnInv, bool wo, int btcOnInv, float priceChange24h, int protocolVersion, int serverSessionLow, int serverSessionHigh, int highWatermark)
     {
         s_Stock = stock;
         s_Balance = balance;
@@ -104,21 +201,76 @@ class LFPG_BTCAtmClientData
             s_Price = price;
             s_PriceUnavailable = false;
         }
+
+        EnsurePending();
+        bool sessionPairChanged = s_ServerSessionLow != serverSessionLow || s_ServerSessionHigh != serverSessionHigh;
+        if (sessionPairChanged)
+            s_Pending.Clear();
+
+        bool protocolReady = (protocolVersion == LFPG_BTC_PROTOCOL_VERSION);
+        if (serverSessionLow == 0 && serverSessionHigh == 0)
+            protocolReady = false;
+        if (highWatermark < 0 || highWatermark > LFPG_BTC_CLIENT_MAX_SEQUENCE)
+            protocolReady = false;
+
+        if (protocolReady)
+        {
+            s_ServerSessionLow = serverSessionLow;
+            s_ServerSessionHigh = serverSessionHigh;
+            int nextFromWatermark = highWatermark + 1;
+            if (nextFromWatermark > s_NextSequence)
+                s_NextSequence = nextFromWatermark;
+            s_MutationsEnabled = s_NextSequence > 0 && s_NextSequence <= LFPG_BTC_CLIENT_MAX_SEQUENCE;
+        }
+        else
+        {
+            s_ServerSessionLow = 0;
+            s_ServerSessionHigh = 0;
+            s_NextSequence = 1;
+            s_MutationsEnabled = false;
+        }
+        s_SequenceRefreshNeeded = false;
     }
 
-    static void OnTxResult(int txType, int errCode, int newStock, int newBalance, int btcMoved, float eurAmount, int cashOnInv, int btcOnInv)
+    static bool OnTxResult(int txType, int errCode, int newStock, int newBalance, int btcMoved, float eurAmount, int cashOnInv, int btcOnInv, int serverSessionLow, int serverSessionHigh, int sequence)
     {
-        s_LastTxType = txType;
-        s_LastErrCode = errCode;
-        s_LastNewStock = newStock;
-        s_LastNewBalance = newBalance;
-        s_LastBtcMoved = btcMoved;
-        s_LastEurAmount = eurAmount;
-        // Also update live stock/balance/cash
-        s_Stock = newStock;
-        s_Balance = newBalance;
-        s_CashOnInventory = cashOnInv;
-        s_BtcOnInventory = btcOnInv;
+        if (!s_MutationsEnabled)
+            return false;
+        if (serverSessionLow != s_ServerSessionLow || serverSessionHigh != s_ServerSessionHigh)
+            return false;
+        if (sequence <= 0)
+            return false;
+
+        EnsurePending();
+        int pendingIndex = 0;
+        while (pendingIndex < s_Pending.Count())
+        {
+            LFPG_BTCClientPending pending = s_Pending[pendingIndex];
+            if (pending && pending.m_Sequence == sequence)
+            {
+                if (pending.m_TxType != txType)
+                    return false;
+
+                s_Pending.Remove(pendingIndex);
+                s_LastTxType = txType;
+                s_LastErrCode = errCode;
+                bool preserveDisplay = errCode == LFPG_BTC_ERR_INVALID && newStock == 0 && newBalance == 0;
+                if (!preserveDisplay)
+                {
+                    s_LastNewStock = newStock;
+                    s_LastNewBalance = newBalance;
+                    s_Stock = newStock;
+                    s_Balance = newBalance;
+                    s_CashOnInventory = cashOnInv;
+                    s_BtcOnInventory = btcOnInv;
+                }
+                s_LastBtcMoved = btcMoved;
+                s_LastEurAmount = eurAmount;
+                return true;
+            }
+            pendingIndex = pendingIndex + 1;
+        }
+        return false;
     }
 
     static void OnPriceUnavailable()
@@ -139,6 +291,13 @@ class LFPG_BTCAtmClientData
         s_PriceChange24h = 0.0;
         s_NetLow = 0;
         s_NetHigh = 0;
+        s_MutationsEnabled = false;
+        s_ServerSessionLow = 0;
+        s_ServerSessionHigh = 0;
+        s_NextSequence = 1;
+        s_SequenceRefreshNeeded = false;
+        EnsurePending();
+        s_Pending.Clear();
         s_LastTxType = 0;
         s_LastErrCode = 0;
         s_LastNewStock = 0;
@@ -147,3 +306,4 @@ class LFPG_BTCAtmClientData
         s_LastEurAmount = 0.0;
     }
 };
+#endif

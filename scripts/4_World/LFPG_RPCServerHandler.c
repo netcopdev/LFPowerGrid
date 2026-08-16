@@ -11,12 +11,56 @@
 
 class LFPG_RPCServerHandler
 {
+    protected static int s_PerfDiagDeviceSyncBatchCount;
+    protected static int s_PerfDiagPreviewResponseCount;
     // =========================================================
     // Dispatch: routes subId to individual server handlers.
     // Called from modded PlayerBase.OnRPC inside #ifdef SERVER.
+    //
+    // PR-C 2026-05-26 â€” A1 RPC sender authority fix.
+    // `player` arrives bound to whatever PlayerBase the sender's RPC was
+    // addressed to. A malicious client can choose another player's body
+    // as target (rpc.Send(victimPB, ...)), so handlers downstream were
+    // executing with the victim's GetPosition / GetInventory / balance.
+    // Resolve the real owning player from the sender identity and rebind
+    // `player` to it before any handler runs. Policy: fail-open with
+    // rate-limited warn (matches v2 remediation spec) so legitimate
+    // engine flows that route through a foreign target are not killed â€”
+    // we only drop if the sender cannot be resolved to any PlayerBase.
     // =========================================================
     static void Dispatch(PlayerBase player, PlayerIdentity sender, int subId, ParamsReadContext ctx)
     {
+        if (!sender)
+            return;
+
+        // Classify inbound before any ctx.Read. Missing classification = deny.
+        if (LFPG_RPCGuard.PolicyForSubId(subId) == 0)
+        {
+            LFPG_Util.RateLimitedWarn(sender, "rpc_guard_unknown_subid", "[LFPG_RPCGuard] Dispatch denied: unknown inbound subId");
+            return;
+        }
+
+        // CCTV exit must remain routable while SelectPlayer(null) makes GetPlayer unavailable.
+        if (subId == LFPG_RPC_SubId.CCTV_EXIT_REQUEST)
+        {
+            HandleCCTVExitRequest(player, sender);
+            return;
+        }
+
+        PlayerBase realPlayer = PlayerBase.Cast(sender.GetPlayer());
+        if (!realPlayer)
+        {
+            string nullMsg = "[LFPG_RPC] Dispatch: sender.GetPlayer() null, dropping subId=" + subId.ToString() + " sender=" + sender.GetPlainId();
+            LFPG_Util.Warn(nullMsg);
+            return;
+        }
+        if (player != realPlayer)
+        {
+            string mismatchMsg = "[LFPG_RPC] target mismatch from " + sender.GetPlainId() + " subId=" + subId.ToString() + " â€” rebinding to realPlayer";
+            LFPG_Util.RateLimitedWarn(sender, "rpc_target_mismatch", mismatchMsg);
+            player = realPlayer;
+        }
+
         if (subId == LFPG_RPC_SubId.FINISH_WIRING)
         {
             HandleFinishWiring(player, sender, ctx);
@@ -41,9 +85,13 @@ class LFPG_RPCServerHandler
         {
             HandleRequestDeviceSync(player, sender, ctx);
         }
+        else if (subId == LFPG_RPC_SubId.REQUEST_DEVICE_SYNC_BATCH)
+        {
+            HandleRequestDeviceSyncBatch(player, sender, ctx);
+        }
         else if (subId == LFPG_RPC_SubId.INSPECT_DEVICE)
         {
-            HandleInspectDevice(player, sender, ctx);
+            HandleInspectDevice(player, sender, ctx, LFPG_RPCGuard.POLICY_INSPECT_READ);
         }
         else if (subId == LFPG_RPC_SubId.CAMERA_CYCLE)
         {
@@ -57,29 +105,57 @@ class LFPG_RPCServerHandler
         {
             HandleRequestCameraList(player, sender, ctx);
         }
-        else if (subId == LFPG_RPC_SubId.CCTV_EXIT_REQUEST)
-        {
-            HandleCCTVExitRequest(player, sender);
-        }
+
         else if (subId == LFPG_RPC_SubId.SORTER_CONFIG_REQUEST)
         {
-            HandleSorterConfigRequest(player, sender, ctx);
+            int srvCfgRespId = LFPG_RPC_SubId.SORTER_CONFIG_RESPONSE;
+            HandleSorterConfigRequest(player, sender, ctx, srvCfgRespId);
+        }
+        else if (subId == LFPG_RPC_SubId.SORTER_TEST_CONFIG_REQUEST)
+        {
+            // Sprint 0 (2026-04-26): V4 routes to same handler with V4 response SubId
+            int srvCfgRespIdT = LFPG_RPC_SubId.SORTER_TEST_CONFIG_RESPONSE;
+            HandleSorterConfigRequest(player, sender, ctx, srvCfgRespIdT);
         }
         else if (subId == LFPG_RPC_SubId.SORTER_CONFIG_SAVE)
         {
-            HandleSorterConfigSave(player, sender, ctx);
+            int srvSaveAckId = LFPG_RPC_SubId.SORTER_SAVE_ACK;
+            HandleSorterConfigSave(player, sender, ctx, srvSaveAckId);
+        }
+        else if (subId == LFPG_RPC_SubId.SORTER_TEST_CONFIG_SAVE)
+        {
+            int srvSaveAckIdT = LFPG_RPC_SubId.SORTER_TEST_SAVE_ACK;
+            HandleSorterConfigSave(player, sender, ctx, srvSaveAckIdT);
         }
         else if (subId == LFPG_RPC_SubId.SORTER_REQUEST_SORT)
         {
-            HandleSorterRequestSort(player, sender, ctx);
+            int srvSortAckId = LFPG_RPC_SubId.SORTER_SORT_ACK;
+            HandleSorterRequestSort(player, sender, ctx, srvSortAckId);
+        }
+        else if (subId == LFPG_RPC_SubId.SORTER_TEST_REQUEST_SORT)
+        {
+            int srvSortAckIdT = LFPG_RPC_SubId.SORTER_TEST_SORT_ACK;
+            HandleSorterRequestSort(player, sender, ctx, srvSortAckIdT);
         }
         else if (subId == LFPG_RPC_SubId.SORTER_RESYNC)
         {
-            HandleSorterResync(player, sender, ctx);
+            int srvResyncAckId = LFPG_RPC_SubId.SORTER_RESYNC_ACK;
+            HandleSorterResync(player, sender, ctx, srvResyncAckId);
+        }
+        else if (subId == LFPG_RPC_SubId.SORTER_TEST_RESYNC)
+        {
+            int srvResyncAckIdT = LFPG_RPC_SubId.SORTER_TEST_RESYNC_ACK;
+            HandleSorterResync(player, sender, ctx, srvResyncAckIdT);
         }
         else if (subId == LFPG_RPC_SubId.SORTER_PREVIEW_REQUEST)
         {
-            HandleSorterPreviewRequest(player, sender, ctx);
+            int srvPrevRespId = LFPG_RPC_SubId.SORTER_PREVIEW_RESPONSE;
+            HandleSorterPreviewRequest(player, sender, ctx, srvPrevRespId);
+        }
+        else if (subId == LFPG_RPC_SubId.SORTER_TEST_PREVIEW_REQUEST)
+        {
+            int srvPrevRespIdT = LFPG_RPC_SubId.SORTER_TEST_PREVIEW_RESPONSE;
+            HandleSorterPreviewRequest(player, sender, ctx, srvPrevRespIdT);
         }
         else if (subId == LFPG_RPC_SubId.SEARCHLIGHT_AIM)
         {
@@ -92,6 +168,10 @@ class LFPG_RPCServerHandler
         else if (subId == LFPG_RPC_SubId.SEARCHLIGHT_EXIT_REQUEST)
         {
             HandleSearchlightExit(player, sender, ctx);
+        }
+        else if (subId == LFPG_RPC_SubId.SEARCHLIGHT_EXIT_V2)
+        {
+            HandleSearchlightExitV2(player, sender, ctx);
         }
         else if (subId == LFPG_RPC_SubId.BTC_OPEN_REQUEST)
         {
@@ -143,7 +223,7 @@ class LFPG_RPCServerHandler
         // v0.7.38 (RC-07): Reject during startup validation window.
         // ValidateAllWiresAndPropagate runs at T+5s and does a full rebuild.
         // Wires created before that would be overwritten, causing flicker.
-        if (!LFPG_NetworkManager.Get().IsStartupValidationDone())
+        if (!LFPG_NetworkManager.Get().IsStartupValidationDone() || LFPG_NetworkManager.Get().IsValidationActive())
         {
             LFPG_Util.Info("[FinishWiring-Server] denied (startup validation pending)");
             PlayerBase.LFPG_SendClientMsg(player, "Server starting, please wait...");
@@ -493,12 +573,17 @@ class LFPG_RPCServerHandler
 
         // ============================================================
         // REPLACEMENT PHASE: remove ALL conflicting wires BEFORE adding
-        // v0.7.34 (Bloque E): Atomic mutation — prevents premature node
+        // v0.7.34 (Bloque E): Atomic mutation â€” prevents premature node
         // deletion between remove + add (same-target replace bug).
         // ============================================================
 
         // v0.7.34: Begin atomic mutation batch
         LFPG_NetworkManager.Get().BeginGraphMutation();
+
+        ref array<int> srcDeltaOps = new array<int>;
+        ref array<ref LFPG_WireData> srcDeltaWires = new array<ref LFPG_WireData>;
+        bool lfpgSourceRemoved = false;
+        LFPG_WireOwnerBase srcWireOwner = LFPG_WireOwnerBase.Cast(srcObj);
 
         // 1) Source port replacement: 1 wire per output port.
         //    Remove any existing wire from this source:port.
@@ -524,15 +609,14 @@ class LFPG_RPCServerHandler
                         // Incremental reverse index and player count update
                         LFPG_NetworkManager.Get().ReverseIdxRemove(srcExisting.m_TargetDeviceId, srcExisting.m_TargetPort, srcRealId);
                         LFPG_NetworkManager.Get().PlayerWireCountAdd(srcExisting.m_CreatorId, -1);
+                        srcDeltaOps.Insert(LFPG_WireDeltaOp.REMOVE);
+                        srcDeltaWires.Insert(srcExisting);
                         srcWires.Remove(sw);
                         anyRemoved = true;
+                        lfpgSourceRemoved = true;
                     }
                     sw = sw - 1;
                 }
-            }
-            if (anyRemoved)
-            {
-                srcObj.SetSynchDirty();
             }
         }
         else
@@ -620,13 +704,22 @@ class LFPG_RPCServerHandler
             {
                 LFPG_NetworkManager.Get().MarkVanillaDirty();
             }
+            if (anyRemoved)
+            {
+                LFPG_NetworkManager.Get().FlushVanillaIfDirty();
+            }
+            if (lfpgSourceRemoved && srcWireOwner)
+            {
+                srcWireOwner.LFPG_CommitWireMutation();
+                LFPG_NetworkManager.Get().BroadcastOwnerWireDelta(srcObj, srcDeltaOps, srcDeltaWires);
+            }
 
             // v0.7.38 (RC-06): If replacement removed wires but AddWire failed,
             // the graph and reverse index are inconsistent. Force a full rebuild
             // to restore data integrity from the authoritative wire arrays.
             if (anyRemoved)
             {
-                LFPG_Util.Warn("[FinishWiring-Server] RC-06: store failed after replacement — forcing rebuild");
+                LFPG_Util.Warn("[FinishWiring-Server] RC-06: store failed after replacement â€” forcing rebuild");
                 LFPG_NetworkManager.Get().PostBulkRebuildAndPropagate();
             }
 
@@ -642,20 +735,15 @@ class LFPG_RPCServerHandler
         // Sync wire data to clients for cable rendering
         if (isLfpgOwner)
         {
-            LFPG_NetworkManager.Get().BroadcastOwnerWires(EntityAI.Cast(srcObj));
+            srcDeltaOps.Insert(LFPG_WireDeltaOp.ADD);
+            srcDeltaWires.Insert(wd);
+            LFPG_NetworkManager.Get().BroadcastOwnerWireDelta(EntityAI.Cast(srcObj), srcDeltaOps, srcDeltaWires);
         }
         else
         {
             LFPG_NetworkManager.Get().BroadcastVanillaWires(srcRealId, srcObj);
-            // v4.7: Immediate flush for vanilla wire creation.
-            // v0.7.33 marked dirty but relied on the 30s periodic flush.
-            // If server crashes within that window, the wire is lost.
-            // LFPG device wires survive crashes (OnStoreSave on the entity)
-            // but vanilla wires only exist in the JSON file.
-            // Flush immediately to close the data-loss window.
-            // Cost: one JSON write per player wire action — negligible.
+            // Vanilla stores use a bounded 5s write-behind window.
             LFPG_NetworkManager.Get().MarkVanillaDirty();
-            LFPG_NetworkManager.Get().FlushVanillaIfDirty();
         }
 
         // Propagate power to all consumers (LFPG and vanilla via SetPowered)
@@ -666,7 +754,7 @@ class LFPG_RPCServerHandler
 
         // v0.7.34 (Bloque E): Close atomic mutation batch.
         // All removes + the add are now committed atomically.
-        // Deferred orphan cleanup runs here — nodes that lost edges
+        // Deferred orphan cleanup runs here â€” nodes that lost edges
         // during remove but gained new ones during add are preserved.
         LFPG_NetworkManager.Get().EndGraphMutation();
 
@@ -681,7 +769,7 @@ class LFPG_RPCServerHandler
             // no incoming edge from our perspective). Force full rebuild to
             // reconcile graph with wire data. This is a rare edge case
             // (requires saturating LFPG_MAX_NODES_GLOBAL).
-            LFPG_Util.Warn("[FinishWiring-Server] Graph edge not inserted (limit or missing node) — forcing rebuild");
+            LFPG_Util.Warn("[FinishWiring-Server] Graph edge not inserted (limit or missing node) â€” forcing rebuild");
             LFPG_NetworkManager.Get().PostBulkRebuildAndPropagate();
         }
         else
@@ -701,7 +789,7 @@ class LFPG_RPCServerHandler
         }
 
         // v0.7.38 (RC-07): Reject during startup validation window.
-        if (!LFPG_NetworkManager.Get().IsStartupValidationDone())
+        if (!LFPG_NetworkManager.Get().IsStartupValidationDone() || LFPG_NetworkManager.Get().IsValidationActive())
         {
             PlayerBase.LFPG_SendClientMsg(player, "Server starting, please wait...");
             return;
@@ -733,6 +821,10 @@ class LFPG_RPCServerHandler
 
         bool changed = false;
         LFPG_ServerSettings st = LFPG_Settings.Get();
+        string cutPid = sender.GetPlainId();
+        bool allowOthers = false;
+        if (st)
+            allowOthers = st.AllowCutOthersWires;
 
         // Try LFPG wire-owning device first (Generator, Splitter, etc.)
         if (LFPG_DeviceAPI.HasWireStore(obj))
@@ -740,9 +832,10 @@ class LFPG_RPCServerHandler
             // Pre-scan wires for incremental reverse index + player count updates.
             // Must mirror exactly what ClearDeviceWires / ClearDeviceWiresForCreator will remove.
             ref array<ref LFPG_WireData> preWires = LFPG_DeviceAPI.GetDeviceWires(obj);
+            ref array<int> cutDeltaOps = new array<int>;
+            ref array<ref LFPG_WireData> cutDeltaWires = new array<ref LFPG_WireData>;
             if (preWires)
             {
-                string cutPid = sender.GetPlainId();
                 int pw;
                 for (pw = 0; pw < preWires.Count(); pw = pw + 1)
                 {
@@ -752,6 +845,8 @@ class LFPG_RPCServerHandler
                     // (mirrors ClearForCreator which removes matching CreatorId + empty)
                     if (st && !st.AllowCutOthersWires && pwd.m_CreatorId != "" && pwd.m_CreatorId != cutPid)
                         continue;
+                    cutDeltaOps.Insert(LFPG_WireDeltaOp.REMOVE);
+                    cutDeltaWires.Insert(pwd);
                     LFPG_NetworkManager.Get().ReverseIdxRemove(pwd.m_TargetDeviceId, pwd.m_TargetPort, deviceId);
                     LFPG_NetworkManager.Get().PlayerWireCountAdd(pwd.m_CreatorId, -1);
                 }
@@ -759,7 +854,7 @@ class LFPG_RPCServerHandler
 
             if (st && !st.AllowCutOthersWires)
             {
-                changed = LFPG_DeviceAPI.ClearDeviceWiresForCreator(obj, sender.GetPlainId());
+                changed = LFPG_DeviceAPI.ClearDeviceWiresForCreator(obj, cutPid);
             }
             else
             {
@@ -769,7 +864,7 @@ class LFPG_RPCServerHandler
             if (changed)
             {
                 LFPG_Util.Info("Wires cleared LFPG " + deviceId);
-                LFPG_NetworkManager.Get().BroadcastOwnerWires(obj);
+                LFPG_NetworkManager.Get().BroadcastOwnerWireDelta(obj, cutDeltaOps, cutDeltaWires);
             }
         }
         else
@@ -781,14 +876,13 @@ class LFPG_RPCServerHandler
                 if (st && !st.AllowCutOthersWires)
                 {
                     // Cut own wires + unclaimed wires (empty CreatorId)
-                    string pid = sender.GetPlainId();
                     int vw = vWires.Count() - 1;
                     while (vw >= 0)
                     {
                         LFPG_WireData vwd = vWires[vw];
                         if (vwd)
                         {
-                            if (vwd.m_CreatorId == "" || vwd.m_CreatorId == pid)
+                            if (vwd.m_CreatorId == "" || vwd.m_CreatorId == cutPid)
                             {
                                 LFPG_NetworkManager.Get().ReverseIdxRemove(vwd.m_TargetDeviceId, vwd.m_TargetPort, deviceId);
                                 LFPG_NetworkManager.Get().PlayerWireCountAdd(vwd.m_CreatorId, -1);
@@ -841,7 +935,7 @@ class LFPG_RPCServerHandler
             if (portDir == LFPG_PortDir.IN)
             {
                 string inPort = LFPG_DeviceAPI.GetPortName(obj, pi);
-                int inRemoved = LFPG_NetworkManager.Get().RemoveWiresTargeting(deviceId, inPort);
+                int inRemoved = LFPG_NetworkManager.Get().RemoveWiresTargeting(deviceId, inPort, cutPid, allowOthers);
                 if (inRemoved > 0)
                 {
                     changed = true;
@@ -872,14 +966,18 @@ class LFPG_RPCServerHandler
                 if (!srcWires) continue;
 
                 bool srcChanged = false;
+                ref array<int> fallbackDeltaOps = new array<int>;
+                ref array<ref LFPG_WireData> fallbackDeltaWires = new array<ref LFPG_WireData>;
                 int sw = srcWires.Count() - 1;
                 while (sw >= 0)
                 {
                     LFPG_WireData swd = srcWires[sw];
-                    if (swd && swd.m_TargetDeviceId == deviceId)
+                    if (swd && swd.m_TargetDeviceId == deviceId && (allowOthers || LFPG_WireHelper.CanCreatorCutWire(swd, cutPid, allowOthers)))
                     {
                         LFPG_Util.Warn("[CutWires-Fallback] Found stale wire: " + srcId + ":" + swd.m_SourcePort + " -> " + deviceId + ":" + swd.m_TargetPort);
                         LFPG_NetworkManager.Get().PlayerWireCountAdd(swd.m_CreatorId, -1);
+                        fallbackDeltaOps.Insert(LFPG_WireDeltaOp.REMOVE);
+                        fallbackDeltaWires.Insert(swd);
                         srcWires.Remove(sw);
                         srcChanged = true;
                         changed = true;
@@ -889,8 +987,17 @@ class LFPG_RPCServerHandler
 
                 if (srcChanged)
                 {
-                    srcDev.SetSynchDirty();
-                    LFPG_NetworkManager.Get().BroadcastOwnerWires(srcDev);
+                    LFPG_WireOwnerBase fallbackWireOwner = LFPG_WireOwnerBase.Cast(srcDev);
+                    if (fallbackWireOwner)
+                    {
+                        fallbackWireOwner.LFPG_CommitWireMutation();
+                        LFPG_NetworkManager.Get().BroadcastOwnerWireDelta(srcDev, fallbackDeltaOps, fallbackDeltaWires);
+                    }
+                    else
+                    {
+                        srcDev.SetSynchDirty();
+                        LFPG_NetworkManager.Get().BroadcastOwnerWires(srcDev);
+                    }
                     LFPG_NetworkManager.Get().RequestPropagate(srcId);
                 }
             }
@@ -909,7 +1016,7 @@ class LFPG_RPCServerHandler
                 while (vsw >= 0)
                 {
                     LFPG_WireData vswd = vwScan[vsw];
-                    if (vswd && vswd.m_TargetDeviceId == deviceId)
+                    if (vswd && vswd.m_TargetDeviceId == deviceId && (allowOthers || LFPG_WireHelper.CanCreatorCutWire(vswd, cutPid, allowOthers)))
                     {
                         LFPG_Util.Warn("[CutWires-Fallback] Found stale vanilla wire: " + vOwnId + " -> " + deviceId + ":" + vswd.m_TargetPort);
                         LFPG_NetworkManager.Get().PlayerWireCountAdd(vswd.m_CreatorId, -1);
@@ -934,15 +1041,16 @@ class LFPG_RPCServerHandler
             // If fallback found stale wires, rebuild reverse index to fix it
             if (changed && inRemovedTotal == 0)
             {
-                LFPG_Util.Warn("[CutWires-Fallback] Reverse index was stale — rebuilding");
+                LFPG_Util.Warn("[CutWires-Fallback] Reverse index was stale â€” rebuilding");
                 LFPG_NetworkManager.Get().RebuildReverseIdx();
             }
         }
 
         if (changed)
         {
-            // PostBulkRebuildAndPropagate: Rebuild → PopulateStates → MarkSourcesDirty
+            // PostBulkRebuildAndPropagate: Rebuild â†’ PopulateStates â†’ MarkSourcesDirty
             LFPG_NetworkManager.Get().PostBulkRebuildAndPropagate();
+            LFPG_NetworkManager.Get().FlushVanillaIfDirty();
             PlayerBase.LFPG_SendClientMsg(player, "Wires cut.");
         }
         else
@@ -953,24 +1061,24 @@ class LFPG_RPCServerHandler
 
     static void HandleCameraLink(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
     {
-        // v0.9.1: DEPRECATED — camera linking is now physical (cables).
+        // v0.9.1: DEPRECATED â€” camera linking is now physical (cables).
         // Read params to drain the stream (avoid corruption).
         int discardLow = 0;
         int discardHigh = 0;
         ctx.Read(discardLow);
         ctx.Read(discardHigh);
-        LFPG_Util.Warn("[CameraLink] DEPRECATED RPC received — ignoring");
+        LFPG_Util.Warn("[CameraLink] DEPRECATED RPC received â€” ignoring");
     }
 
     static void HandleCameraUnlink(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
     {
-        // v0.9.1: DEPRECATED — camera unlinking is now physical (cut cable).
+        // v0.9.1: DEPRECATED â€” camera unlinking is now physical (cut cable).
         // Read params to drain the stream (avoid corruption).
         int discardLow = 0;
         int discardHigh = 0;
         ctx.Read(discardLow);
         ctx.Read(discardHigh);
-        LFPG_Util.Warn("[CameraUnlink] DEPRECATED RPC received — ignoring");
+        LFPG_Util.Warn("[CameraUnlink] DEPRECATED RPC received â€” ignoring");
     }
 
     static void HandleRequestCameraList(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
@@ -978,7 +1086,12 @@ class LFPG_RPCServerHandler
         if (!sender)
             return;
 
-        if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
+        LFPG_NetworkManager manager = LFPG_NetworkManager.Get();
+        LFPG_ControlSessionRegistry sessions = manager.GetControlSessionRegistry();
+        if (!sessions)
+            return;
+
+        if (!manager.AllowPlayerAction(sender))
         {
             PlayerBase.LFPG_SendClientMsg(player, "Too fast! Wait a moment.");
             return;
@@ -990,6 +1103,21 @@ class LFPG_RPCServerHandler
             return;
         if (!ctx.Read(monNetHigh))
             return;
+
+        LFPG_ControlSessionRecord currentSession = sessions.Get(sender);
+        if (currentSession)
+        {
+            if (sessions.Matches(currentSession, LFPG_CONTROL_KIND_CCTV, monNetLow, monNetHigh))
+            {
+                sessions.SendCCTVEnterResponse(currentSession);
+                LFPG_Util.Info("[RequestCameraList] Replayed cached camera response");
+            }
+            else
+            {
+                PlayerBase.LFPG_SendClientMsg(player, "Another control session is already active.");
+            }
+            return;
+        }
 
         // Resolve monitor entity by NetworkID
         EntityAI monEnt = EntityAI.Cast(g_Game.GetObjectByNetworkId(monNetLow, monNetHigh));
@@ -1031,11 +1159,11 @@ class LFPG_RPCServerHandler
         wireCountLog = wireCountLog + " wire count=" + wires.Count().ToString();
         LFPG_Util.Info(wireCountLog);
 
-        // Build camera list — up to LFPG_MONITOR_MAX_CAMERAS entries
+        // Build camera list â€” up to LFPG_MONITOR_MAX_CAMERAS entries
         // v1.3.1: Per-camera power check REMOVED. The monitor is PASSTHROUGH:
         // if the monitor itself is powered (checked above), cameras on its
         // outputs WILL receive power once graph propagation completes.
-        // After server restart, propagation runs asynchronously — cameras
+        // After server restart, propagation runs asynchronously â€” cameras
         // may still have m_PoweredNet=false (derived state, not persisted).
         // Requiring powered cameras caused "no cameras" on every restart.
         // Hoist all variables before loop (Enforce Script)
@@ -1092,8 +1220,8 @@ class LFPG_RPCServerHandler
             }
 
             camPositions.Insert(cam.GetPosition());
-            // v1.0.1: Camera model lens points 90° right of entity forward.
-            // Apply +90° yaw so the viewport aligns with the optic.
+            // v1.0.1: Camera model lens points 90Â° right of entity forward.
+            // Apply +90Â° yaw so the viewport aligns with the optic.
             // DayZ yaw: positive = clockwise from above = right.
             rawOri = cam.GetOrientation();
             adjYaw = rawOri[0] + 90.0;
@@ -1115,10 +1243,17 @@ class LFPG_RPCServerHandler
             return;
         }
 
+        LFPG_ControlSessionRecord cameraSession = sessions.BeginCCTV(sender, player, monitor, monNetLow, monNetHigh, camCount, camPositions, camOrientations, camLabels);
+        if (!cameraSession)
+        {
+            LFPG_Util.Warn("[RequestCameraList] control session registration failed");
+            return;
+        }
+
         // COT pattern: engine spectator system for camera lifecycle.
         // 1. Set skip flag to prevent vanilla OnSelectPlayer side effects
-        // 2. SelectPlayer(sender, NULL) → desasociar player del identity
-        // 3. SelectSpectator(sender, cls, pos) → engine crea+trackea cámara
+        // 2. SelectPlayer(sender, NULL) â†’ desasociar player del identity
+        // 3. SelectSpectator(sender, cls, pos) â†’ engine crea+trackea cÃ¡mara
         vector firstCamPos = camPositions[0];
 
         player.LFPG_SetSkipOnSelectPlayer(true);
@@ -1129,36 +1264,9 @@ class LFPG_RPCServerHandler
         specLog = specLog + firstCamPos.ToString();
         LFPG_Util.Info(specLog);
 
-        // Send CAMERA_LIST_RESPONSE to the requesting player only (sender).
-        ScriptRPC rpc = new ScriptRPC();
-        rpc.Write((int)LFPG_RPC_SubId.CAMERA_LIST_RESPONSE);
-        rpc.Write(camCount);
-
-        int ci = 0;
-        vector writePos = "0 0 0";
-        vector writeOri = "0 0 0";
-        float wf = 0.0;
-        while (ci < camCount)
-        {
-            writePos = camPositions[ci];
-            wf = writePos[0];
-            rpc.Write(wf);
-            wf = writePos[1];
-            rpc.Write(wf);
-            wf = writePos[2];
-            rpc.Write(wf);
-            writeOri = camOrientations[ci];
-            wf = writeOri[0];
-            rpc.Write(wf);
-            wf = writeOri[1];
-            rpc.Write(wf);
-            wf = writeOri[2];
-            rpc.Write(wf);
-            rpc.Write(camLabels[ci]);
-            ci = ci + 1;
-        }
-
-        rpc.Send(player, LFPG_RPC_CHANNEL, true, sender);
+        // Cache was frozen before the switch; every identical retry reuses this payload.
+        sessions.MarkActive(cameraSession);
+        sessions.SendCCTVEnterResponse(cameraSession);
 
         string logMsg = "[RequestCameraList] Sent " + camCount.ToString() + " cameras to player";
         LFPG_Util.Info(logMsg);
@@ -1169,22 +1277,64 @@ class LFPG_RPCServerHandler
         if (!sender)
             return;
 
-        PlayerBase resolvedPlayer = PlayerBase.Cast(sender.GetPlayer());
-        if (!resolvedPlayer)
+        LFPG_NetworkManager manager = LFPG_NetworkManager.Get();
+        LFPG_ControlSessionRegistry sessions = manager.GetControlSessionRegistry();
+        if (!sessions)
             return;
 
-        // Restore player camera — engine updates internal pointer
-        g_Game.SelectPlayer(sender, resolvedPlayer);
-
-        // Send confirmation back to client — NOW safe to cleanup camera
-        ScriptRPC confirmRpc = new ScriptRPC();
-        int confirmSubId = LFPG_RPC_SubId.CCTV_EXIT_CONFIRM;
-        confirmRpc.Write(confirmSubId);
-        confirmRpc.Send(resolvedPlayer, LFPG_RPC_CHANNEL, true, sender);
+        // The original PlayerBase comes exclusively from the server-owned session.
+        if (!sessions.EndCCTV(sender, true))
+            return;
 
         string logMsg = "[CCTV_EXIT] SelectPlayer + confirm sent for ";
         logMsg = logMsg + sender.GetName();
         LFPG_Util.Info(logMsg);
+    }
+
+    static bool RefreshSearchlightSplash(LFPG_Searchlight sl, float aimYaw, float aimPitch, bool forceRefresh)
+    {
+        if (!sl)
+            return false;
+
+        bool cadenceDue = sl.LFPG_ShouldRefreshSplash(g_Game.GetTime());
+        if (!forceRefresh && !cadenceDue)
+            return false;
+
+        // Splash raycast -- beam direction in world space; aimYaw is local to the searchlight.
+        vector beamStart = sl.ModelToWorld(sl.GetMemoryPointPos("light_main"));
+        float worldYaw = sl.LFPG_GetBaseYaw() + aimYaw;
+        float yawRad = worldYaw * Math.DEG2RAD;
+        float pitchRad = aimPitch * Math.DEG2RAD;
+        float cosPitch = Math.Cos(pitchRad);
+        float dirX = Math.Sin(yawRad) * cosPitch;
+        float dirY = Math.Sin(pitchRad);
+        float dirZ = Math.Cos(yawRad) * cosPitch;
+
+        float rayToX = beamStart[0] + dirX * LFPG_SEARCHLIGHT_SPLASH_RANGE_M;
+        float rayToY = beamStart[1] + dirY * LFPG_SEARCHLIGHT_SPLASH_RANGE_M;
+        float rayToZ = beamStart[2] + dirZ * LFPG_SEARCHLIGHT_SPLASH_RANGE_M;
+        vector rayTo = Vector(rayToX, rayToY, rayToZ);
+
+        vector hitPos;
+        vector hitNormal;
+        int hitComp;
+        set<Object> hitResults = null;
+        Object hitWith = null;
+        bool sorted = false;
+        bool groundOnly = false;
+        float radius = 0.0;
+
+        bool hit = DayZPhysics.RaycastRV(beamStart, rayTo, hitPos, hitNormal, hitComp, hitResults, hitWith, sl, sorted, groundOnly, ObjIntersectFire, radius);
+        if (hit)
+        {
+            float splashY = hitPos[1] + 0.05;
+            sl.LFPG_SetSplash(true, hitPos[0], splashY, hitPos[2]);
+        }
+        else
+        {
+            sl.LFPG_SetSplash(false, 0.0, 0.0, 0.0);
+        }
+        return true;
     }
 
     static void HandleSearchlightEnter(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
@@ -1192,7 +1342,12 @@ class LFPG_RPCServerHandler
         if (!sender)
             return;
 
-        if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
+        LFPG_NetworkManager manager = LFPG_NetworkManager.Get();
+        LFPG_ControlSessionRegistry sessions = manager.GetControlSessionRegistry();
+        if (!sessions)
+            return;
+
+        if (!manager.AllowPlayerAction(sender))
         {
             PlayerBase.LFPG_SendClientMsg(player, "Too fast! Wait a moment.");
             return;
@@ -1226,14 +1381,7 @@ class LFPG_RPCServerHandler
             return;
         }
 
-        // Block if already operated by someone else
-        if (sl.LFPG_HasOperator())
-        {
-            PlayerBase.LFPG_SendClientMsg(player, "Searchlight is already being operated.");
-            return;
-        }
-
-        // Server-side distance validation (anti-exploit)
+        // Resolve player and its NetworkID before any operator comparison.
         PlayerBase playerCheck = PlayerBase.Cast(sender.GetPlayer());
         if (!playerCheck)
             return;
@@ -1246,24 +1394,65 @@ class LFPG_RPCServerHandler
             return;
         }
 
-        // Mark operator on the searchlight (using PLAYER's NetworkID)
         int playerNetLow  = 0;
         int playerNetHigh = 0;
         playerCheck.GetNetworkID(playerNetLow, playerNetHigh);
-        sl.LFPG_SetOperator(playerNetLow, playerNetHigh);
+        if (playerNetLow == 0 && playerNetHigh == 0)
+        {
+            LFPG_Util.RateLimitedWarn(sender, "searchlight_invalid_operator_id", "[Searchlight_Enter] Invalid player NetworkID");
+            return;
+        }
 
-        // Send ENTER_CONFIRM with current yaw/pitch
+        LFPG_ControlSessionRecord currentSession = sessions.Get(sender);
+        if (currentSession && !sessions.Matches(currentSession, LFPG_CONTROL_KIND_SEARCHLIGHT, netLow, netHigh))
+        {
+            PlayerBase.LFPG_SendClientMsg(player, "Another control session is already active.");
+            return;
+        }
+
+        bool hasOperator = sl.LFPG_HasOperator();
+        if (hasOperator)
+        {
+            if (!sl.LFPG_IsOperator(playerNetLow, playerNetHigh))
+            {
+                PlayerBase.LFPG_SendClientMsg(player, "Searchlight is already being operated.");
+                return;
+            }
+
+            if (!currentSession)
+            {
+                float retryYaw = sl.LFPG_GetAimYaw();
+                float retryPitch = sl.LFPG_GetAimPitch();
+                currentSession = sessions.BeginSearchlight(sender, playerCheck, sl, netLow, netHigh, playerNetLow, playerNetHigh, retryYaw, retryPitch);
+                if (!currentSession)
+                    return;
+                sessions.MarkActive(currentSession);
+            }
+
+            sessions.SendSearchlightEnterConfirm(currentSession);
+            LFPG_Util.Info("[Searchlight_Enter] Replayed cached enter confirm");
+            return;
+        }
+
+        // A matching stale record whose lock was already released is terminal.
+        if (currentSession)
+        {
+            sessions.EndSearchlight(sender, netLow, netHigh, false);
+            currentSession = null;
+        }
+
         float curYaw = sl.LFPG_GetAimYaw();
         float curPitch = sl.LFPG_GetAimPitch();
+        LFPG_ControlSessionRecord searchlightSession = sessions.BeginSearchlight(sender, playerCheck, sl, netLow, netHigh, playerNetLow, playerNetHigh, curYaw, curPitch);
+        if (!searchlightSession)
+            return;
 
-        ScriptRPC rpc = new ScriptRPC();
-        int confirmSubId = LFPG_RPC_SubId.SEARCHLIGHT_ENTER_CONFIRM;
-        rpc.Write(confirmSubId);
-        rpc.Write(netLow);
-        rpc.Write(netHigh);
-        rpc.Write(curYaw);
-        rpc.Write(curPitch);
-        rpc.Send(player, LFPG_RPC_CHANNEL, true, sender);
+        sl.LFPG_SetOperator(playerNetLow, playerNetHigh);
+        bool initialSplashRaycasted = RefreshSearchlightSplash(sl, curYaw, curPitch, true);
+        sl.LFPG_FlushSyncVars(initialSplashRaycasted);
+
+        sessions.MarkActive(searchlightSession);
+        sessions.SendSearchlightEnterConfirm(searchlightSession);
 
         string logMsg = "[Searchlight_Enter] Grab confirmed yaw=";
         logMsg = logMsg + curYaw.ToString();
@@ -1274,9 +1463,6 @@ class LFPG_RPCServerHandler
     static void HandleSearchlightAim(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
     {
         if (!sender)
-            return;
-
-        if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
             return;
 
         int netLow = 0;
@@ -1291,6 +1477,23 @@ class LFPG_RPCServerHandler
         if (!ctx.Read(aimYaw))
             return;
         if (!ctx.Read(aimPitch))
+            return;
+
+        // Reject invalid numeric input before object resolution or authorization.
+        if (LFPG_Searchlight.LFPG_IsInvalidAimValue(aimYaw) || LFPG_Searchlight.LFPG_IsInvalidAimValue(aimPitch))
+        {
+            LFPG_Util.RateLimitedWarn(sender, "searchlight_non_finite_aim", "[Searchlight] Rejected non-finite aim input");
+            return;
+        }
+
+        // Normalize and clamp without work proportional to the input magnitude.
+        aimYaw = LFPG_Searchlight.LFPG_NormalizeAimYaw(aimYaw);
+        if (aimPitch < LFPG_SEARCHLIGHT_PITCH_MIN)
+            aimPitch = LFPG_SEARCHLIGHT_PITCH_MIN;
+        if (aimPitch > LFPG_SEARCHLIGHT_PITCH_MAX)
+            aimPitch = LFPG_SEARCHLIGHT_PITCH_MAX;
+
+        if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
             return;
 
         Object slObj = g_Game.GetObjectByNetworkId(netLow, netHigh);
@@ -1311,65 +1514,13 @@ class LFPG_RPCServerHandler
         if (!sl.LFPG_IsOperator(aimPlayerNetLow, aimPlayerNetHigh))
             return;
 
-        // Server-side validation (anti-cheat)
-        // Yaw: normalize to [-180, 180] (no clamp — full 360 rotation)
-        while (aimYaw > 180.0)
-        {
-            aimYaw = aimYaw - 360.0;
-        }
-        while (aimYaw < -180.0)
-        {
-            aimYaw = aimYaw + 360.0;
-        }
-        // Pitch: clamp to allowed range
-        if (aimPitch < LFPG_SEARCHLIGHT_PITCH_MIN)
-            aimPitch = LFPG_SEARCHLIGHT_PITCH_MIN;
-        if (aimPitch > LFPG_SEARCHLIGHT_PITCH_MAX)
-            aimPitch = LFPG_SEARCHLIGHT_PITCH_MAX;
-
         // Write SyncVars
         sl.LFPG_SetAim(aimYaw, aimPitch);
 
-        // Splash raycast — beam direction in WORLD space.
-        // aimYaw is LOCAL to searchlight, must add BASE yaw for world direction.
-        // NOT GetOrientation()[0] which changes with SetOrientation.
-        vector beamStart = sl.ModelToWorld(sl.GetMemoryPointPos("light_main"));
-        float worldYaw = sl.LFPG_GetBaseYaw() + aimYaw;
-        float yawRad = worldYaw * Math.DEG2RAD;
-        float pitchRad = aimPitch * Math.DEG2RAD;
-        float cosPitch = Math.Cos(pitchRad);
-        float dirX = Math.Sin(yawRad) * cosPitch;
-        float dirY = Math.Sin(pitchRad);
-        float dirZ = Math.Cos(yawRad) * cosPitch;
+        bool splashRaycasted = RefreshSearchlightSplash(sl, aimYaw, aimPitch, false);
 
-        float rayToX = beamStart[0] + dirX * LFPG_SEARCHLIGHT_SPLASH_RANGE_M;
-        float rayToY = beamStart[1] + dirY * LFPG_SEARCHLIGHT_SPLASH_RANGE_M;
-        float rayToZ = beamStart[2] + dirZ * LFPG_SEARCHLIGHT_SPLASH_RANGE_M;
-        vector rayTo = Vector(rayToX, rayToY, rayToZ);
-
-        vector hitPos;
-        vector hitNormal;
-        int hitComp;
-        set<Object> hitResults = null;
-        Object hitWith = null;
-        bool sorted = false;
-        bool groundOnly = false;
-        float radius = 0.0;
-
-        bool hit = DayZPhysics.RaycastRV(beamStart, rayTo, hitPos, hitNormal, hitComp, hitResults, hitWith, sl, sorted, groundOnly, ObjIntersectFire, radius);
-
-        if (hit)
-        {
-            float splashY = hitPos[1] + 0.05;
-            sl.LFPG_SetSplash(true, hitPos[0], splashY, hitPos[2]);
-        }
-        else
-        {
-            sl.LFPG_SetSplash(false, 0.0, 0.0, 0.0);
-        }
-
-        // Single SetSynchDirty for aim + splash (batched)
-        sl.LFPG_FlushSyncVars();
+        // Single SetSynchDirty for aim plus the latest splash state.
+        sl.LFPG_FlushSyncVars(splashRaycasted);
     }
 
     static void HandleSearchlightExit(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
@@ -1384,38 +1535,99 @@ class LFPG_RPCServerHandler
         if (!ctx.Read(netHigh))
             return;
 
-        Object slObj = g_Game.GetObjectByNetworkId(netLow, netHigh);
-        if (slObj)
-        {
-            LFPG_Searchlight sl = LFPG_Searchlight.Cast(slObj);
-            if (sl)
-            {
-                // Validate sender is the current operator (anti-cheat)
-                PlayerBase exitPlayer = PlayerBase.Cast(sender.GetPlayer());
-                if (exitPlayer)
-                {
-                    int exitNetLow  = 0;
-                    int exitNetHigh = 0;
-                    exitPlayer.GetNetworkID(exitNetLow, exitNetHigh);
-                    if (sl.LFPG_IsOperator(exitNetLow, exitNetHigh))
-                    {
-                        sl.LFPG_ClearOperator();
-                    }
-                }
-            }
-        }
+        LFPG_NetworkManager manager = LFPG_NetworkManager.Get();
+        LFPG_ControlSessionRegistry sessions = manager.GetControlSessionRegistry();
+        if (!sessions)
+            return;
 
-        // Send EXIT_CONFIRM to client (in case client-side cleanup hasn't happened)
-        PlayerBase sendPlayer = PlayerBase.Cast(sender.GetPlayer());
-        if (sendPlayer)
-        {
-            ScriptRPC confirmRpc = new ScriptRPC();
-            int confirmSubId = LFPG_RPC_SubId.SEARCHLIGHT_EXIT_CONFIRM;
-            confirmRpc.Write(confirmSubId);
-            confirmRpc.Send(sendPlayer, LFPG_RPC_CHANNEL, true, sender);
-        }
+        sessions.ArmSearchlightExitDeadline(sender, netLow, netHigh);
+        if (!sessions.EndSearchlight(sender, netLow, netHigh, true))
+            return;
 
         string logMsg = "[Searchlight_Exit] Operator released for ";
+        logMsg = logMsg + sender.GetName();
+        LFPG_Util.Info(logMsg);
+    }
+
+    static void HandleSearchlightExitV2(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    {
+        if (!sender)
+            return;
+
+        int netLow = 0;
+        int netHigh = 0;
+        float aimYaw = 0.0;
+        float aimPitch = 0.0;
+        if (!ctx.Read(netLow))
+            return;
+        if (!ctx.Read(netHigh))
+            return;
+        if (!ctx.Read(aimYaw))
+            return;
+        if (!ctx.Read(aimPitch))
+            return;
+
+        LFPG_NetworkManager manager = LFPG_NetworkManager.Get();
+        LFPG_ControlSessionRegistry sessions = manager.GetControlSessionRegistry();
+        if (!sessions)
+            return;
+
+        // Receipt of an exit arms recovery; a healthy session otherwise has no deadline.
+        sessions.ArmSearchlightExitDeadline(sender, netLow, netHigh);
+
+        // Reject invalid numeric input before object resolution or authorization.
+        if (LFPG_Searchlight.LFPG_IsInvalidAimValue(aimYaw) || LFPG_Searchlight.LFPG_IsInvalidAimValue(aimPitch))
+        {
+            LFPG_Util.RateLimitedWarn(sender, "searchlight_non_finite_aim", "[Searchlight] Rejected non-finite aim input");
+            return;
+        }
+
+        // Normalize and clamp without work proportional to the input magnitude.
+        aimYaw = LFPG_Searchlight.LFPG_NormalizeAimYaw(aimYaw);
+        if (aimPitch < LFPG_SEARCHLIGHT_PITCH_MIN)
+            aimPitch = LFPG_SEARCHLIGHT_PITCH_MIN;
+        if (aimPitch > LFPG_SEARCHLIGHT_PITCH_MAX)
+            aimPitch = LFPG_SEARCHLIGHT_PITCH_MAX;
+
+        LFPG_ControlSessionRecord record = sessions.Get(sender);
+        LFPG_Searchlight sl = null;
+        int operatorNetLow = 0;
+        int operatorNetHigh = 0;
+
+        if (sessions.Matches(record, LFPG_CONTROL_KIND_SEARCHLIGHT, netLow, netHigh))
+        {
+            sl = record.m_Searchlight;
+            operatorNetLow = record.m_PlayerNetLow;
+            operatorNetHigh = record.m_PlayerNetHigh;
+        }
+        else
+        {
+            Object searchlightObject = g_Game.GetObjectByNetworkId(netLow, netHigh);
+            sl = LFPG_Searchlight.Cast(searchlightObject);
+            if (!sl)
+                return;
+
+            PlayerBase operatorPlayer = PlayerBase.Cast(sender.GetPlayer());
+            if (!operatorPlayer)
+                return;
+            operatorPlayer.GetNetworkID(operatorNetLow, operatorNetHigh);
+        }
+
+        if (!sl)
+            return;
+        if (operatorNetLow == 0 && operatorNetHigh == 0)
+            return;
+        if (!sl.LFPG_IsOperator(operatorNetLow, operatorNetHigh))
+            return;
+
+        // The global action cooldown remains bypassed for this one-shot final value.
+        sl.LFPG_SetAim(aimYaw, aimPitch);
+        RefreshSearchlightSplash(sl, aimYaw, aimPitch, true);
+
+        if (!sessions.EndSearchlight(sender, netLow, netHigh, true))
+            return;
+
+        string logMsg = "[Searchlight_ExitV2] Final aim applied and operator released for ";
         logMsg = logMsg + sender.GetName();
         LFPG_Util.Info(logMsg);
     }
@@ -1431,7 +1643,7 @@ class LFPG_RPCServerHandler
         }
 
         // v0.7.38 (RC-07): Reject during startup validation window.
-        if (!LFPG_NetworkManager.Get().IsStartupValidationDone())
+        if (!LFPG_NetworkManager.Get().IsStartupValidationDone() || LFPG_NetworkManager.Get().IsValidationActive())
         {
             PlayerBase.LFPG_SendClientMsg(player, "Server starting, please wait...");
             return;
@@ -1480,16 +1692,20 @@ class LFPG_RPCServerHandler
         if (deviceId == "") return;
 
         bool changed = false;
+        LFPG_ServerSettings st = LFPG_Settings.Get();
+        string cutPid = sender.GetPlainId();
+        bool allowOthers = false;
+        if (st)
+            allowOthers = st.AllowCutOthersWires;
 
         if (portDir == LFPG_PortDir.OUT)
         {
             // Remove wire(s) from this device's specific output port
             // Generic: works for Generator, Splitter, or any wire-owning device
-            LFPG_ServerSettings st = LFPG_Settings.Get();
-            string pid = sender.GetPlainId();
-
             if (LFPG_DeviceAPI.HasWireStore(obj))
             {
+                ref array<int> portDeltaOps = new array<int>;
+                ref array<ref LFPG_WireData> portDeltaWires = new array<ref LFPG_WireData>;
                 ref array<ref LFPG_WireData> ownerWires = LFPG_DeviceAPI.GetDeviceWires(obj);
                 if (ownerWires)
                 {
@@ -1500,7 +1716,7 @@ class LFPG_RPCServerHandler
                         if (wd && wd.m_SourcePort == portName)
                         {
                             // Respect AllowCutOthersWires setting
-                            if (st && !st.AllowCutOthersWires && wd.m_CreatorId != "" && wd.m_CreatorId != pid)
+                            if (st && !st.AllowCutOthersWires && wd.m_CreatorId != "" && wd.m_CreatorId != cutPid)
                             {
                                 LFPG_Util.Info("[CutPort] Skipped wire on " + portName + " (not creator)");
                             }
@@ -1510,6 +1726,8 @@ class LFPG_RPCServerHandler
                                 // Incremental reverse index and player count update
                                 LFPG_NetworkManager.Get().ReverseIdxRemove(wd.m_TargetDeviceId, wd.m_TargetPort, deviceId);
                                 LFPG_NetworkManager.Get().PlayerWireCountAdd(wd.m_CreatorId, -1);
+                                portDeltaOps.Insert(LFPG_WireDeltaOp.REMOVE);
+                                portDeltaWires.Insert(wd);
                                 ownerWires.Remove(ow);
                                 changed = true;
                             }
@@ -1519,8 +1737,17 @@ class LFPG_RPCServerHandler
                 }
                 if (changed)
                 {
-                    obj.SetSynchDirty();
-                    LFPG_NetworkManager.Get().BroadcastOwnerWires(obj);
+                    LFPG_WireOwnerBase portWireOwner = LFPG_WireOwnerBase.Cast(obj);
+                    if (portWireOwner)
+                    {
+                        portWireOwner.LFPG_CommitWireMutation();
+                        LFPG_NetworkManager.Get().BroadcastOwnerWireDelta(obj, portDeltaOps, portDeltaWires);
+                    }
+                    else
+                    {
+                        obj.SetSynchDirty();
+                        LFPG_NetworkManager.Get().BroadcastOwnerWires(obj);
+                    }
                 }
             }
             else
@@ -1543,7 +1770,7 @@ class LFPG_RPCServerHandler
                             if (sp == portName)
                             {
                                 // Respect AllowCutOthersWires setting
-                                if (st && !st.AllowCutOthersWires && vwd.m_CreatorId != "" && vwd.m_CreatorId != pid)
+                                if (st && !st.AllowCutOthersWires && vwd.m_CreatorId != "" && vwd.m_CreatorId != cutPid)
                                 {
                                     LFPG_Util.Info("[CutPort] Skipped vanilla wire on " + portName + " (not creator)");
                                 }
@@ -1570,7 +1797,7 @@ class LFPG_RPCServerHandler
         else if (portDir == LFPG_PortDir.IN)
         {
             // Remove all wires targeting this device+port from ANY source
-            int removed = LFPG_NetworkManager.Get().RemoveWiresTargeting(deviceId, portName);
+            int removed = LFPG_NetworkManager.Get().RemoveWiresTargeting(deviceId, portName, cutPid, allowOthers);
             if (removed > 0)
             {
                 changed = true;
@@ -1580,10 +1807,12 @@ class LFPG_RPCServerHandler
 
         if (changed)
         {
-            // PostBulkRebuildAndPropagate: Rebuild → PopulateStates → MarkSourcesDirty.
+            // PostBulkRebuildAndPropagate: Rebuild â†’ PopulateStates â†’ MarkSourcesDirty.
             // For IN port cuts, this also replaces RequestGlobalSelfHeal since it
             // achieves the same result (full rebuild + re-propagation from all sources).
             LFPG_NetworkManager.Get().PostBulkRebuildAndPropagate();
+
+            LFPG_NetworkManager.Get().FlushVanillaIfDirty();
 
             PlayerBase.LFPG_SendClientMsg(player, "Wire cut on " + portName + ".");
         }
@@ -1629,84 +1858,210 @@ class LFPG_RPCServerHandler
         LFPG_Util.Debug(logMsg);
     }
 
+    // B-01: identity comes only from NetworkID. clientDeviceId is unused (read-compat).
+    // out resolvedTarget keeps the same object for B-03 dirty (one resolve).
+    static string ResolveDeviceSyncId(int netLow, int netHigh, string clientDeviceId, out EntityAI resolvedTarget)
+    {
+        resolvedTarget = null;
+        string serverDeviceId = "";
+        if (netLow == 0 && netHigh == 0)
+            return serverDeviceId;
+
+        EntityAI resolvedObj = EntityAI.Cast(g_Game.GetObjectByNetworkId(netLow, netHigh));
+        if (!resolvedObj)
+            return serverDeviceId;
+
+        string resolvedId = LFPG_DeviceAPI.GetDeviceId(resolvedObj);
+        if (resolvedId == "")
+            return serverDeviceId;
+
+        resolvedTarget = resolvedObj;
+        serverDeviceId = resolvedId;
+        return serverDeviceId;
+    }
+
+    // B-02: SYNC uses cull+20. Direct owner check first; wire targets only if that fails
+    // (same interest as BroadcastOwnerWiresDelta via LFPG_DeviceAPI.GetDeviceWires).
+    static bool AuthorizeDeviceSync(PlayerBase player, int netLow, int netHigh, out EntityAI target, out string canonicalDeviceId)
+    {
+        target = null;
+        canonicalDeviceId = "";
+        if (!player)
+            return false;
+
+        EntityAI resolvedTarget;
+        string unusedClientDeviceId = "";
+        string serverDeviceId = ResolveDeviceSyncId(netLow, netHigh, unusedClientDeviceId, resolvedTarget);
+        if (serverDeviceId == "")
+            return false;
+        if (!resolvedTarget)
+            return false;
+        if (resolvedTarget.IsRuined())
+            return false;
+
+        float syncRadius = LFPG_CULL_DISTANCE_M + 20.0;
+        float syncRadiusSq = syncRadius * syncRadius;
+        float distanceSq = LFPG_WorldUtil.DistSq(player.GetPosition(), resolvedTarget.GetPosition());
+        if (distanceSq > syncRadiusSq)
+        {
+            if (!DeviceSyncEndpointInRange(player, resolvedTarget, syncRadiusSq))
+                return false;
+        }
+
+        LFPG_DeviceRegistry.Get().Register(resolvedTarget, serverDeviceId);
+        target = resolvedTarget;
+        canonicalDeviceId = serverDeviceId;
+        return true;
+    }
+
+    // Delta interest fallback: player <-> any GetDeviceWires target of the requested owner.
+    protected static bool DeviceSyncEndpointInRange(PlayerBase player, EntityAI owner, float syncRadiusSq)
+    {
+        if (!player)
+            return false;
+        if (!owner)
+            return false;
+
+        array<ref LFPG_WireData> ownerWires = LFPG_DeviceAPI.GetDeviceWires(owner);
+        if (!ownerWires)
+            return false;
+
+        LFPG_DeviceRegistry reg = LFPG_DeviceRegistry.Get();
+        if (!reg)
+            return false;
+
+        vector playerPos = player.GetPosition();
+        int tw;
+        for (tw = 0; tw < ownerWires.Count(); tw = tw + 1)
+        {
+            LFPG_WireData wire = ownerWires[tw];
+            if (!wire)
+                continue;
+            if (wire.m_TargetDeviceId == "")
+                continue;
+
+            EntityAI endpoint = reg.FindById(wire.m_TargetDeviceId);
+            if (!endpoint)
+                continue;
+            if (LFPG_WorldUtil.DistSq(playerPos, endpoint.GetPosition()) <= syncRadiusSq)
+                return true;
+        }
+        return false;
+    }
+
     static void HandleRequestDeviceSync(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
     {
-        if (!sender) return;
-
+        if (!sender)
+            return;
         if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
             return;
 
-        // v0.7.45 (H7): Read NetworkID first, then clientDeviceId.
-        // Same pattern as InspectDevice (v0.7.43 fix). This ensures
-        // authoritative resolution even during SyncVar lag window.
         int netLow = 0;
-        if (!ctx.Read(netLow))
-        {
-            LFPG_Util.Warn("[SERVER] RequestDeviceSync: read netLow FAIL pid=" + sender.GetPlainId());
-            return;
-        }
         int netHigh = 0;
-        if (!ctx.Read(netHigh))
-        {
-            LFPG_Util.Warn("[SERVER] RequestDeviceSync: read netHigh FAIL pid=" + sender.GetPlainId());
-            return;
-        }
         string clientDeviceId = "";
-        if (!ctx.Read(clientDeviceId))
-        {
-            LFPG_Util.Warn("[SERVER] RequestDeviceSync: read clientDeviceId FAIL pid=" + sender.GetPlainId());
+        if (!ctx.Read(netLow))
             return;
+        if (!ctx.Read(netHigh))
+            return;
+        if (!ctx.Read(clientDeviceId))
+            return;
+
+        EntityAI syncTarget;
+        string serverDeviceId;
+        if (!AuthorizeDeviceSync(player, netLow, netHigh, syncTarget, serverDeviceId))
+            return;
+
+        LFPG_NetworkManager.Get().SendDeviceSyncTo(player, serverDeviceId);
+    }
+
+    static void HandleRequestDeviceSyncBatch(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    {
+        if (!sender)
+            return;
+        if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
+            return;
+
+        int requestCount = 0;
+        if (!ctx.Read(requestCount))
+            return;
+        if (requestCount <= 0 || requestCount > LFPG_DEVICE_SYNC_BATCH_MAX)
+            return;
+
+        ref array<int> lows = new array<int>;
+        ref array<int> highs = new array<int>;
+        int i;
+        for (i = 0; i < requestCount; i = i + 1)
+        {
+            int netLow = 0;
+            int netHigh = 0;
+            string clientDeviceId = "";
+            if (!ctx.Read(netLow))
+                return;
+            if (!ctx.Read(netHigh))
+                return;
+            if (!ctx.Read(clientDeviceId))
+                return;
+            lows.Insert(netLow);
+            highs.Insert(netHigh);
         }
 
-        if (clientDeviceId == "")
-            return;
-
-        // Resolve entity authoritatively via NetworkID (same as InspectDevice)
-        // v0.7.45 review fix: use GetDeviceId (read-only), NOT GetOrCreateDeviceId.
-        // If NetworkID resolves to a non-LFPG entity (edge case: ID reuse post-restart),
-        // GetOrCreateDeviceId would generate a garbage "vp:Type:X:Y:Z" ID and
-        // SendDeviceSyncTo would find 0 wires for that ID. GetDeviceId returns ""
-        // which falls through to clientDeviceId fallback — correct behavior.
-        string serverDeviceId = clientDeviceId;
-        if (netLow != 0 || netHigh != 0)
+        if (LFPG_PERFDIAG_ENABLED)
         {
-            EntityAI resolvedObj = EntityAI.Cast(g_Game.GetObjectByNetworkId(netLow, netHigh));
-            if (resolvedObj)
-            {
-                string resolvedId = LFPG_DeviceAPI.GetDeviceId(resolvedObj);
-                if (resolvedId != "")
-                {
-                    serverDeviceId = resolvedId;
-                    // Re-register to heal stale DeviceRegistry refs.
-                    // Only when we have the confirmed server-side ID.
-                    LFPG_DeviceRegistry.Get().Register(resolvedObj, resolvedId);
+            s_PerfDiagDeviceSyncBatchCount = s_PerfDiagDeviceSyncBatchCount + 1;
+            string perfBatch = "LFPG_PERFDIAG resync_batch_accept count=";
+            perfBatch = perfBatch + s_PerfDiagDeviceSyncBatchCount.ToString();
+            perfBatch = perfBatch + " devices=";
+            perfBatch = perfBatch + requestCount.ToString();
+            perfBatch = perfBatch + " pid=";
+            perfBatch = perfBatch + sender.GetPlainId();
+            Print(perfBatch);
+        }
 
-                    // v1.1 (JIP Fix): Force SyncVar re-replication.
-                    // When a JIP client enters a device's bubble, the engine
-                    // may deliver default SyncVar values (m_SourceOn=false,
-                    // m_PoweredNet=false). This causes: no CompEM effects
-                    // (smoke/sound) on generators, IDLE cable colors on
-                    // CableRenderer. SetSynchDirty forces the engine to
-                    // re-queue ALL SyncVars on the next network tick.
-                    // Each device in the bubble sends its own RequestDeviceSync,
-                    // so this covers generators, consumers, and passthroughs.
-                    resolvedObj.SetSynchDirty();
-                }
+        ref map<string, bool> sentDeviceIds = new map<string, bool>;
+        ref map<string, bool> sentOwners = new map<string, bool>;
+        int dirtyCount = 0;
+        for (i = 0; i < requestCount; i = i + 1)
+        {
+            EntityAI batchEntity;
+            string serverDeviceId;
+            if (!AuthorizeDeviceSync(player, lows[i], highs[i], batchEntity, serverDeviceId))
+                continue;
+            if (serverDeviceId == "")
+                continue;
+            if (sentDeviceIds.Contains(serverDeviceId))
+                continue;
+            sentDeviceIds[serverDeviceId] = true;
+            LFPG_NetworkManager.Get().SendDeviceSyncToBatched(player, serverDeviceId, sentOwners);
+
+            // AMENDMENT-1 (accept W3-F02 rev): one-shot SyncVar re-push for the JIP
+            // batch. Bubble entry may deliver default SyncVars (v1.1 JIP bug) and T1
+            // removed the periodic dirties that masked it. Bounded by
+            // LFPG_DEVICE_SYNC_BATCH_MAX and deduped per device; the client-side
+            // generation predicate keeps the resync feedback loop from re-forming.
+            // Steady-state resync remains replication-free.
+            // B-03: dirty only the EntityAI already authorized for this entry.
+            if (batchEntity)
+            {
+                batchEntity.SetSynchDirty();
+                dirtyCount = dirtyCount + 1;
             }
         }
 
-        string rdsLog = "[SERVER] RequestDeviceSync serverDeviceId=" + serverDeviceId;
-        rdsLog = rdsLog + " clientDeviceId=" + clientDeviceId;
-        rdsLog = rdsLog + " net=" + netLow.ToString() + ":" + netHigh.ToString();
-        rdsLog = rdsLog + " pid=" + sender.GetPlainId();
-        LFPG_Util.Info(rdsLog);
-
-        
-        LFPG_NetworkManager.Get().SendDeviceSyncTo(player, serverDeviceId);
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            string perfDirty = "LFPG_PERFDIAG resync_batch_dirty count=";
+            perfDirty = perfDirty + dirtyCount.ToString();
+            perfDirty = perfDirty + " pid=";
+            perfDirty = perfDirty + sender.GetPlainId();
+            Print(perfDirty);
+        }
     }
 
     static void HandleDiagClientLog(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
     {
+        if (!LFPG_DIAG_ENABLED)
+            return;
+
         if (!sender)
             return;
 
@@ -1720,19 +2075,35 @@ class LFPG_RPCServerHandler
         if (msg.Length() > 512)
             msg = msg.Substring(0, 512);
 
-        string pid = "unknown";
-        if (sender)
-            pid = sender.GetPlainId();
-
-        LFPG_Util.Info("[CLI-ECHO:" + pid + "] " + msg);
+        string sanitized = SanitizeDiagClientLog(msg);
+        LFPG_Util.Info("[CLI-ECHO] " + sanitized);
     }
 
-    static void HandleInspectDevice(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    // B-23: drop control by range. ToAscii is first-char ASCII (enstring.c). Cap already applied.
+    protected static string SanitizeDiagClientLog(string msg)
     {
-        if (!sender)
-            return;
+        if (msg == "")
+            return "";
 
-        if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
+        string sanitized = "";
+        int msgLen = msg.Length();
+        int ci;
+        for (ci = 0; ci < msgLen; ci = ci + 1)
+        {
+            string ch = msg.Substring(ci, 1);
+            int code = ch.ToAscii();
+            if (code < 32)
+                continue;
+            if (code == 127)
+                continue;
+            sanitized = sanitized + ch;
+        }
+        return sanitized;
+    }
+
+    static void HandleInspectDevice(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx, int policyId)
+    {
+        if (!LFPG_RPCGuard.Admit(policyId, player, sender))
             return;
 
         // v0.7.43: Read NetworkID + client deviceId (correlation)
@@ -1758,23 +2129,13 @@ class LFPG_RPCServerHandler
         if (clientDeviceId == "")
             return;
 
-        // Resolve entity authoritatively via NetworkID
-        string serverDeviceId = clientDeviceId;
-        if (netLow != 0 || netHigh != 0)
-        {
-            EntityAI resolvedObj = EntityAI.Cast(g_Game.GetObjectByNetworkId(netLow, netHigh));
-            if (resolvedObj)
-            {
-                string resolvedId = LFPG_DeviceAPI.GetDeviceId(resolvedObj);
-                if (resolvedId != "")
-                {
-                    serverDeviceId = resolvedId;
-                    // Re-register to heal stale DeviceRegistry refs.
-                    // Only when we have the confirmed server-side ID.
-                    LFPG_DeviceRegistry.Get().Register(resolvedObj, resolvedId);
-                }
-            }
-        }
+        EntityAI resolvedTarget;
+        string serverDeviceId;
+        if (!LFPG_RPCGuard.Authorize(policyId, player, sender, netLow, netHigh, resolvedTarget, serverDeviceId))
+            return;
+
+        // Re-register only after the server-side identity is authorized.
+        LFPG_DeviceRegistry.Get().Register(resolvedTarget, serverDeviceId);
 
         ref array<ref LFPG_InspectWireEntry> entries = new array<ref LFPG_InspectWireEntry>;
         LFPG_InspectWireEntry entry;
@@ -1796,8 +2157,6 @@ class LFPG_RPCServerHandler
                     entry = new LFPG_InspectWireEntry();
                     entry.m_Direction = LFPG_PortDir.OUT;
                     entry.m_LocalPort = oEdge.m_SourcePort;
-                    entry.m_RemoteDeviceId = oEdge.m_TargetNodeId;
-                    entry.m_RemotePort = oEdge.m_TargetPort;
                     entry.m_RemoteTypeName = ResolveTypeName(oEdge.m_TargetNodeId);
 
                     // v1.0: Binary edge state for inspector
@@ -1829,8 +2188,6 @@ class LFPG_RPCServerHandler
                     entry = new LFPG_InspectWireEntry();
                     entry.m_Direction = LFPG_PortDir.IN;
                     entry.m_LocalPort = iEdge.m_TargetPort;
-                    entry.m_RemoteDeviceId = iEdge.m_SourceNodeId;
-                    entry.m_RemotePort = iEdge.m_SourcePort;
                     entry.m_RemoteTypeName = ResolveTypeName(iEdge.m_SourceNodeId);
 
                     // v1.0: Binary edge state for inspector
@@ -1853,6 +2210,7 @@ class LFPG_RPCServerHandler
         // (client uses this to detect stale responses)
         ScriptRPC rpc = new ScriptRPC();
         rpc.Write((int)LFPG_RPC_SubId.INSPECT_RESPONSE);
+        rpc.Write(LFPG_InspectWireEntry.SCHEMA_VERSION);
         rpc.Write(clientDeviceId);
 
         int wireCount = entries.Count();
@@ -1864,8 +2222,6 @@ class LFPG_RPCServerHandler
             LFPG_InspectWireEntry we = entries[wi];
             rpc.Write(we.m_Direction);
             rpc.Write(we.m_LocalPort);
-            rpc.Write(we.m_RemoteDeviceId);
-            rpc.Write(we.m_RemotePort);
             rpc.Write(we.m_RemoteTypeName);
             rpc.Write(we.m_AllocatedPower);
             rpc.Write(we.m_EdgeState);
@@ -1897,7 +2253,7 @@ class LFPG_RPCServerHandler
         return "";
     }
 
-    static void HandleSorterConfigRequest(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    static void HandleSorterConfigRequest(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx, int responseSubId)
     {
         if (!sender)
             return;
@@ -2003,7 +2359,7 @@ class LFPG_RPCServerHandler
                     if (wd.m_SourcePort != portName)
                         continue;
 
-                    // Found wire for this output port — resolve target
+                    // Found wire for this output port â€” resolve target
                     targetEnt = LFPG_DeviceAPI.ResolveByNetworkId(wd.m_TargetNetLow, wd.m_TargetNetHigh);
                     if (!targetEnt)
                     {
@@ -2037,7 +2393,7 @@ class LFPG_RPCServerHandler
 
         // Build and send CONFIG_RESPONSE
         ScriptRPC rpc = new ScriptRPC();
-        rpc.Write((int)LFPG_RPC_SubId.SORTER_CONFIG_RESPONSE);
+        rpc.Write((int)responseSubId);  // Sprint 0: parametrized â€” V3=SORTER_CONFIG_RESPONSE / V4=SORTER_TEST_CONFIG_RESPONSE
         rpc.Write(netLow);
         rpc.Write(netHigh);
         rpc.Write(filterJSON);
@@ -2056,7 +2412,7 @@ class LFPG_RPCServerHandler
         LFPG_Util.Info(logMsg);
     }
 
-    static void HandleSorterConfigSave(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    static void HandleSorterConfigSave(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx, int responseSubId)
     {
         if (!sender)
             return;
@@ -2107,19 +2463,19 @@ class LFPG_RPCServerHandler
             return;
         }
 
-        // Powered check — don't allow config changes on unpowered device
+        // Powered check â€” don't allow config changes on unpowered device
         if (!sorter.LFPG_IsPowered())
         {
             LFPG_Util.Warn("[SorterConfigSave] sorter not powered");
             return;
         }
 
-        // Store config — returns false if JSON is malformed (M3 validation)
+        // Store config â€” returns false if JSON is malformed (M3 validation)
         bool saveOk = sorter.LFPG_SetFilterJSON(filterJSON);
 
         // H4: Send ACK back to client
         ScriptRPC ackRpc = new ScriptRPC();
-        int ackSubId = LFPG_RPC_SubId.SORTER_SAVE_ACK;
+        int ackSubId = responseSubId;  // Sprint 0: parametrized â€” V3=SORTER_SAVE_ACK / V4=SORTER_TEST_SAVE_ACK
         ackRpc.Write(ackSubId);
         ackRpc.Write(saveOk);
         ackRpc.Send(player, LFPG_RPC_CHANNEL, true, sender);
@@ -2135,7 +2491,7 @@ class LFPG_RPCServerHandler
         LFPG_Util.Info(logMsg);
     }
 
-    static void HandleSorterRequestSort(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    static void HandleSorterRequestSort(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx, int responseSubId)
     {
         if (!sender)
             return;
@@ -2188,14 +2544,14 @@ class LFPG_RPCServerHandler
 
         // Send ACK only to requesting player (not broadcast)
         ScriptRPC sortAckRpc = new ScriptRPC();
-        int sortAckSubId = LFPG_RPC_SubId.SORTER_SORT_ACK;
+        int sortAckSubId = responseSubId;  // Sprint 0: parametrized â€” V3=SORTER_SORT_ACK / V4=SORTER_TEST_SORT_ACK
         sortAckRpc.Write(sortAckSubId);
         sortAckRpc.Write(sortOk);
         sortAckRpc.Write(sortMoved);
         sortAckRpc.Send(player, LFPG_RPC_CHANNEL, true, sender);
     }
 
-    static void HandleSorterResync(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    static void HandleSorterResync(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx, int responseSubId)
     {
         if (!sender)
             return;
@@ -2241,33 +2597,47 @@ class LFPG_RPCServerHandler
         if (!sorter.LFPG_IsPowered())
             return;
 
-        // Unlink old container (if any)
-        sorter.LFPG_UnlinkContainer();
-
-        // Re-scan for nearest container
-        sorter.LFPG_LinkNearestContainer(sorter.GetPosition());
-
-        // Resolve new linked container name
+        EntityAI currentLinked = sorter.LFPG_GetLinkedContainer();
+        EntityAI candidate = sorter.LFPG_FindNearestContainerCandidate(LFPG_SORTER_LINK_RADIUS);
+        int ackStatus = LFPG_SORTER_ACK_NONE;
         string containerName = "";
-        EntityAI linkedCont = sorter.LFPG_GetLinkedContainer();
-        if (linkedCont)
+
+        if (!candidate)
         {
-            containerName = linkedCont.GetDisplayName();
+            if (currentLinked)
+            {
+                containerName = currentLinked.GetDisplayName();
+            }
+            ackStatus = LFPG_SORTER_ACK_NONE;
+        }
+        else if (candidate == currentLinked)
+        {
+            containerName = candidate.GetDisplayName();
+            ackStatus = LFPG_SORTER_ACK_KEPT_OLD;
+        }
+        else
+        {
+            sorter.LFPG_UnlinkContainer();
+            sorter.LFPG_LinkContainer(candidate);
+            containerName = candidate.GetDisplayName();
+            ackStatus = LFPG_SORTER_ACK_REPLACED;
         }
 
-        // Send ACK to client
         ScriptRPC ackRpc = new ScriptRPC();
-        int ackSubId = LFPG_RPC_SubId.SORTER_RESYNC_ACK;
+        int ackSubId = responseSubId;  // Sprint 0: parametrized V3/V4 ACK subId
         ackRpc.Write(ackSubId);
+        ackRpc.Write(ackStatus);
         ackRpc.Write(containerName);
         ackRpc.Send(player, LFPG_RPC_CHANNEL, true, sender);
 
-        string logMsg = "[SorterResync] result=";
+        string logMsg = "[SorterResync] status=";
+        logMsg = logMsg + ackStatus.ToString();
+        logMsg = logMsg + " result=";
         logMsg = logMsg + containerName;
         LFPG_Util.Info(logMsg);
     }
 
-    static void HandleSorterPreviewRequest(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx)
+    static void HandleSorterPreviewRequest(PlayerBase player, PlayerIdentity sender, ParamsReadContext ctx, int responseSubId)
     {
         if (!sender)
             return;
@@ -2330,7 +2700,7 @@ class LFPG_RPCServerHandler
         {
             // v4.1: Parse filter config from CLIENT payload (live UI rules)
             // instead of sorter.LFPG_GetFilterJSON() (persisted, requires SAVE).
-            // If parse fails, config stays empty → hasRules=false → 0 items sent.
+            // If parse fails, config stays empty â†’ hasRules=false â†’ 0 items sent.
             LFPG_SortConfig config = new LFPG_SortConfig();
             bool parseOk = config.FromJSON(clientJSON);
             if (!parseOk)
@@ -2428,7 +2798,7 @@ class LFPG_RPCServerHandler
         // Always send response (empty if guards failed)
         sentCount = matchNames.Count();
         ScriptRPC rpc = new ScriptRPC();
-        int respSubId = LFPG_RPC_SubId.SORTER_PREVIEW_RESPONSE;
+        int respSubId = responseSubId;  // Sprint 0: parametrized â€” V3=SORTER_PREVIEW_RESPONSE / V4=SORTER_TEST_PREVIEW_RESPONSE
         rpc.Write(respSubId);
         rpc.Write(selectedOutput);
         rpc.Write(totalMatched);
@@ -2444,6 +2814,25 @@ class LFPG_RPCServerHandler
 
         bool bRpcGuaranteed = true;
         rpc.Send(player, LFPG_RPC_CHANNEL, bRpcGuaranteed, sender);
+
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            s_PerfDiagPreviewResponseCount = s_PerfDiagPreviewResponseCount + 1;
+            string sorterId = "";
+            if (sorter)
+            {
+                sorterId = LFPG_DeviceAPI.GetDeviceId(sorter);
+            }
+            string perfPreview = "LFPG_PERFDIAG preview_response count=";
+            perfPreview = perfPreview + s_PerfDiagPreviewResponseCount.ToString();
+            perfPreview = perfPreview + " deviceId=";
+            perfPreview = perfPreview + sorterId;
+            perfPreview = perfPreview + " matched=";
+            perfPreview = perfPreview + totalMatched.ToString();
+            perfPreview = perfPreview + " sent=";
+            perfPreview = perfPreview + sentCount.ToString();
+            Print(perfPreview);
+        }
 
         string logMsg = "[SorterPreviewRequest] output=";
         logMsg = logMsg + selectedOutput.ToString();

@@ -90,26 +90,37 @@ class LFPG_DeviceLifecycle
 
 		bool wasGround = (oldLoc.GetType() == InventoryLocationType.GROUND);
 		bool nowGround = (newLoc.GetType() == InventoryLocationType.GROUND);
+		vector oldPos = oldLoc.GetPos();
+		vector newPos = newLoc.GetPos();
 
 		if (wasGround && !nowGround)
 		{
 			LFPG_Util.Warn("[DeviceLifecycle] Picked up (GROUND->" + newLoc.GetType().ToString() + ") id=" + deviceId);
-			if (nm) nm.CutAllWiresFromDevice(device);
+			if (nm)
+			{
+				if (oldPos != vector.Zero)
+					nm.CutAllWiresFromMovedDevice(device, oldPos);
+				else
+					nm.CutAllWiresFromDevice(device);
+				nm.RequestGlobalSelfHeal(true);
+			}
 			return true;
 		}
-
-		vector oldPos = oldLoc.GetPos();
-		vector newPos = newLoc.GetPos();
 
 		if (oldPos == vector.Zero)
 			return false;
 
-		float dist = vector.Distance(oldPos, newPos);
-		if (dist < 0.1)
+		float distSq = LFPG_WorldUtil.DistSq(oldPos, newPos);
+		if (distSq <= LFPG_MOVE_DETECT_THRESHOLD_SQ)
 			return false;
 
+		float dist = Math.Sqrt(distSq);
 		LFPG_Util.Warn("[DeviceLifecycle] Moved " + dist.ToString() + "m id=" + deviceId);
-		if (nm) nm.CutAllWiresFromDevice(device);
+		if (nm)
+		{
+			nm.CutAllWiresFromMovedDevice(device, oldPos);
+			nm.RequestGlobalSelfHeal(true);
+		}
 		return true;
 		#else
 		return false;

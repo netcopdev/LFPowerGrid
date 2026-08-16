@@ -17,7 +17,7 @@ static const float  LFPG_PAD_RADIUS_SQ      = 0.16;
 static const float  LFPG_PAD_Y_MIN          = -0.1;
 static const float  LFPG_PAD_Y_MAX          = 0.3;
 static const float  LFPG_PAD_CONSUMPTION    = 5.0;
-static const float  LFPG_PAD_CAPACITY       = 20.0;
+static const float  LFPG_PAD_CAPACITY       = 100.0;
 static const string LFPG_PAD_PRESS_SOUNDSET  = "LFPG_PressurePad_Press_SoundSet";
 
 class LFPG_PressurePad_Kit : LFPG_KitBase

@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - Cable HUD (2D line overlay) (v0.7.38)
 //
@@ -23,6 +25,7 @@ class LFPG_CableHUD
     protected bool m_InitAttempted = false;
 
     protected int m_FrameNum = 0;
+    protected bool m_HadActiveProducers = false;
 
     // Track canvas dimensions for resize detection (int for SetSize)
     protected int m_CanvasW = 0;
@@ -62,6 +65,11 @@ class LFPG_CableHUD
     // with a stale pointer in the next session.
     void ~LFPG_CableHUD()
     {
+        CleanupInstance();
+    }
+
+    protected void CleanupInstance()
+    {
         if (m_Canvas)
         {
             m_Canvas.Unlink();
@@ -79,8 +87,7 @@ class LFPG_CableHUD
     {
         if (s_Instance)
         {
-            // destructor handles canvas cleanup
-            delete s_Instance;
+            s_Instance.CleanupInstance();
             s_Instance = null;
         }
     }
@@ -176,8 +183,19 @@ class LFPG_CableHUD
 
     // ---- Per-frame API ----
 
-    void BeginFrame()
+    void BeginFrame(bool hasProducers)
     {
+        if (!hasProducers)
+        {
+            if (m_HadActiveProducers && m_Ready && m_Canvas)
+            {
+                m_Canvas.Clear();
+            }
+            m_HadActiveProducers = false;
+            return;
+        }
+
+        m_HadActiveProducers = true;
         if (!m_Ready)
         {
             TryInit();
@@ -251,6 +269,7 @@ class LFPG_CableHUD
             return;
 
         m_Canvas.Clear();
+        m_HadActiveProducers = false;
     }
 
     // v0.7.8: Draw a small diamond at a world position (joint marker).
@@ -359,3 +378,4 @@ class LFPG_CableHUD
     }
 
 };
+#endif

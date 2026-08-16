@@ -10,10 +10,11 @@
 //   - T1 has Nail in slot LFPG_SolarNails with qty >= 20
 //
 // On completion:
-//   1. Consume materials (excess returned to ground)
-//   2. DeviceLifecycle.OnDeviceKilled (cuts wires, cleans graph)
-//   3. Delete T1
-//   4. Create T2 at same position/orientation
+//   1. Capture transform
+//   2. Create and validate T2 at same position/orientation
+//   3. Consume materials (excess returned to ground)
+//   4. DeviceLifecycle.OnDeviceKilled (cuts wires, cleans graph)
+//   5. Delete T1
 //
 // ENFORCE SCRIPT NOTES:
 //   - No ternary operators
@@ -98,133 +99,146 @@ class LFPG_ActionUpgradeSolarPanel : ActionContinuousBase
     override void OnFinishProgressServer(ActionData action_data)
     {
         super.OnFinishProgressServer(action_data);
-
+    
         if (!action_data || !action_data.m_Target)
             return;
-
+    
         Object targetObj = action_data.m_Target.GetObject();
         if (!targetObj)
             return;
-
+    
         LFPG_SolarPanel panel = LFPG_SolarPanel.Cast(targetObj);
         if (!panel)
             return;
-
-        // Re-validate T2 check (anti-exploit: action could be started on T1 then swapped)
+    
+        // Revalidate the target and material references before claiming the operation.
         if (panel.IsKindOf("LFPG_SolarPanel_T2"))
         {
             LFPG_Util.Warn("[UpgradeSolar] Target is already T2, aborting.");
             return;
         }
-
-        // ---- Re-validate materials (server authority) ----
+    
         EntityAI plate = panel.FindAttachmentBySlotName("LFPG_SolarPlate");
         if (!plate)
         {
             LFPG_Util.Warn("[UpgradeSolar] No MetalPlate found, aborting.");
             return;
         }
-
+    
         int plateQty = plate.GetQuantity();
         if (plateQty < LFPG_SOLAR_PLATE_REQUIRED)
         {
             LFPG_Util.Warn("[UpgradeSolar] Insufficient MetalPlate qty=" + plateQty.ToString());
             return;
         }
-
+    
         EntityAI nails = panel.FindAttachmentBySlotName("LFPG_SolarNails");
         if (!nails)
         {
             LFPG_Util.Warn("[UpgradeSolar] No Nails found, aborting.");
             return;
         }
-
+    
         int nailsQty = nails.GetQuantity();
         if (nailsQty < LFPG_SOLAR_NAILS_REQUIRED)
         {
             LFPG_Util.Warn("[UpgradeSolar] Insufficient Nails qty=" + nailsQty.ToString());
             return;
         }
-
-        // ---- Capture transform before deletion ----
+    
+        if (!panel.LFPG_TryBeginExclusiveOp())
+        {
+            LFPG_Util.Warn("[UpgradeSolar] Another destructive operation already owns the target.");
+            return;
+        }
+    
         vector pos = panel.GetPosition();
         vector ori = panel.GetOrientation();
-
-        // ---- Apply 180° yaw offset ----
-        // T2 model is rotated 180° relative to T1 in its p3d.
-        // Compensate so the spawned T2 faces the same direction as the T1 it replaces.
+        string deviceId = panel.LFPG_GetDeviceId();
+    
+        // The T2 model is rotated 180 degrees relative to T1.
         float correctedYaw = ori[0] + 180.0;
         if (correctedYaw >= 360.0)
-        {
             correctedYaw = correctedYaw - 360.0;
-        }
         ori = Vector(correctedYaw, ori[1], ori[2]);
-
-        // ---- Consume / detach materials BEFORE panel deletion ----
-        // ObjectDelete(panel) cascade-deletes all attachments.
-        // Excess materials must be detached to ground first.
-        ConsumeMaterial(panel, plate, plateQty, LFPG_SOLAR_PLATE_REQUIRED, pos);
-        ConsumeMaterial(panel, nails, nailsQty, LFPG_SOLAR_NAILS_REQUIRED, pos);
-
-        // ---- Kill T1 device (cuts wires, cleans graph, unregisters) ----
-        string deviceId = panel.LFPG_GetDeviceId();
-        LFPG_DeviceLifecycle.OnDeviceKilled(panel, deviceId);
-
-        // ---- Delete T1 ----
-        g_Game.ObjectDelete(panel);
-
-        // ---- Spawn T2 at same position ----
+    
         EntityAI t2 = EntityAI.Cast(g_Game.CreateObjectEx("LFPG_SolarPanel_T2", pos, ECE_CREATEPHYSICS));
-        if (t2)
+        if (!t2)
         {
-            t2.SetPosition(pos);
-            t2.SetOrientation(ori);
-            t2.Update();
-            LFPG_Util.Info("[UpgradeSolar] T2 created at " + pos.ToString() + " ori=" + ori.ToString());
+            panel.LFPG_EndExclusiveOp();
+            LFPG_Util.Error("[UpgradeSolar] Failed to create LFPG_SolarPanel_T2 - aborting upgrade, T1 + materials preserved");
+            return;
         }
-        else
+    
+        t2.SetPosition(pos);
+        t2.SetOrientation(ori);
+        t2.Update();
+    
+        array<EntityAI> stagedOutputs = new array<EntityAI>();
+        stagedOutputs.Insert(t2);
+        if (!StageMaterialSurplus(plate, plateQty, LFPG_SOLAR_PLATE_REQUIRED, pos, stagedOutputs))
         {
-            LFPG_Util.Error("[UpgradeSolar] Failed to create LFPG_SolarPanel_T2!");
+            AbortStagedUpgradeOutputs(stagedOutputs);
+            panel.LFPG_EndExclusiveOp();
+            LFPG_Util.Error("[UpgradeSolar] Failed to stage MetalPlate surplus - T1 + materials preserved");
+            return;
         }
+        if (!StageMaterialSurplus(nails, nailsQty, LFPG_SOLAR_NAILS_REQUIRED, pos, stagedOutputs))
+        {
+            AbortStagedUpgradeOutputs(stagedOutputs);
+            panel.LFPG_EndExclusiveOp();
+            LFPG_Util.Error("[UpgradeSolar] Failed to stage Nail surplus - T1 + materials preserved");
+            return;
+        }
+    
+        // Commit sources only after T2 and every surplus output exist.
+        g_Game.ObjectDelete(plate);
+        g_Game.ObjectDelete(nails);
+        LFPG_DeviceLifecycle.OnDeviceKilled(panel, deviceId);
+        g_Game.ObjectDelete(panel);
+    
+        // The exclusive flag intentionally remains set until EEDelete completes.
+        LFPG_Util.Info("[UpgradeSolar] T2 created at " + pos.ToString() + " ori=" + ori.ToString());
     }
 
-    // ---- Helper: consume exact amount, drop excess to ground ----
-    // If qty <= required: delete item entirely (consumed in full).
-    // If qty > required: spawn NEW item with excess on ground, then delete original.
-    //   The original attachment is cascade-deleted with the panel.
-    //   Spawning a new item avoids inventory slot complications
-    //   (PlaceOnSurface/DropEntity on attached items is unreliable).
-    protected void ConsumeMaterial(EntityAI parent, EntityAI item, int currentQty, int required, vector dropPos)
+    // ---- Helpers: stage excess without consuming sources; abort staged outputs ----
+    protected bool StageMaterialSurplus(EntityAI item, int currentQty, int required, vector dropPos, array<EntityAI> stagedOutputs)
     {
-        if (!item)
-            return;
-
+        if (!item || !stagedOutputs)
+            return false;
         if (currentQty <= required)
+            return true;
+    
+        int excessQty = currentQty - required;
+        string itemType = item.GetType();
+        vector spawnPos = dropPos;
+        spawnPos[1] = spawnPos[1] + 0.1;
+    
+        EntityAI excess = EntityAI.Cast(g_Game.CreateObject(itemType, spawnPos, false));
+        if (!excess)
+            return false;
+    
+        stagedOutputs.Insert(excess);
+        ItemBase excessItem = ItemBase.Cast(excess);
+        if (!excessItem)
+            return false;
+    
+        excessItem.SetQuantity(excessQty);
+        return true;
+    }
+    
+    protected void AbortStagedUpgradeOutputs(array<EntityAI> stagedOutputs)
+    {
+        if (!stagedOutputs)
+            return;
+    
+        int i = 0;
+        for (i = 0; i < stagedOutputs.Count(); i = i + 1)
         {
-            // Consume all — delete the item
-            g_Game.ObjectDelete(item);
+            EntityAI output = stagedOutputs[i];
+            if (output)
+                g_Game.ObjectDelete(output);
         }
-        else
-        {
-            // Spawn excess as new item on ground
-            int excessQty = currentQty - required;
-            string itemType = item.GetType();
-
-            vector spawnPos = dropPos;
-            spawnPos[1] = spawnPos[1] + 0.1;
-
-            EntityAI excess = EntityAI.Cast(g_Game.CreateObject(itemType, spawnPos, false));
-            if (excess)
-            {
-                ItemBase excessItem = ItemBase.Cast(excess);
-                if (excessItem)
-                {
-                    excessItem.SetQuantity(excessQty);
-                }
-            }
-
-            // Delete original (consumed). Also handles cascade from panel delete.
-            g_Game.ObjectDelete(item);
-        }
+        stagedOutputs.Clear();
     }
 };

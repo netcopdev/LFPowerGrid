@@ -75,14 +75,18 @@ class LFPG_ActionWatchMonitor : ActionInteractBase
         if (!monitor.LFPG_IsPowered())
             return false;
 
+#ifndef SERVER
         LFPG_CameraViewport vp = LFPG_CameraViewport.Get();
         if (vp && vp.IsActive())
             return false;
+#endif
 
         // v1.4.0: block if searchlight spectator is active
+#ifndef SERVER
         LFPG_SearchlightController slCtrl = LFPG_SearchlightController.Get();
         if (slCtrl && slCtrl.IsActive())
             return false;
+#endif
 
         return true;
     }

@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — Sorter Preview Row (Dabs MVC prefab, v2.6)
 //
@@ -130,3 +132,4 @@ class LFPG_SorterPreviewRow extends ScriptView
         return "X";
     }
 };
+#endif

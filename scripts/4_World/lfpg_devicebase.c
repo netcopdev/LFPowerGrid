@@ -39,6 +39,7 @@ class LFPG_DeviceBase : Inventory_Base
     // ---- Local derived state ----
     protected string m_DeviceId      = "";
     protected bool   m_LFPG_Deleting = false;
+    protected int    m_PerfDiagSyncReceiveCount = 0;
 
     // ---- Port system ----
     protected ref array<ref LFPG_PortDef> m_Ports;
@@ -59,6 +60,14 @@ class LFPG_DeviceBase : Inventory_Base
     {
         s_LFPG_SkipHologramInit = false;
     }
+
+    // ---- Persistence version range accepted by OnStoreLoad ----
+    // Bump the value returned by LFPG_GetDevicePersistVersion() when
+    // changing the format of LFPG_OnStoreSaveExtra. Old saves whose
+    // deviceVer falls outside [MIN, MAX_ACCEPTED] are discarded cleanly
+    // to avoid engine "String CORRUPTED" noise from legacy formats.
+    static const int LFPG_DEVICE_PERSIST_VER_MIN = 1;
+    static const int LFPG_DEVICE_PERSIST_VER_MAX_ACCEPTED = 999;
 
     // ============================================
     // Constructor
@@ -172,6 +181,22 @@ class LFPG_DeviceBase : Inventory_Base
     protected void LFPG_UpdateDeviceIdString()
     {
         m_DeviceId = LFPG_Util.MakeDeviceKey(m_DeviceIdLow, m_DeviceIdHigh);
+    }
+
+    // Claims the existing delete flag for one synchronous destructive operation.
+    bool LFPG_TryBeginExclusiveOp()
+    {
+        if (m_LFPG_Deleting)
+            return false;
+
+        m_LFPG_Deleting = true;
+        return true;
+    }
+
+    // Releases a destructive operation that aborted before object deletion.
+    void LFPG_EndExclusiveOp()
+    {
+        m_LFPG_Deleting = false;
     }
 
     protected void LFPG_TryRegister()
@@ -294,6 +319,18 @@ class LFPG_DeviceBase : Inventory_Base
         #ifndef SERVER
         if (m_DeviceId != "")
         {
+            if (LFPG_PERFDIAG_ENABLED)
+            {
+                m_PerfDiagSyncReceiveCount = m_PerfDiagSyncReceiveCount + 1;
+                string perfSync = "LFPG_PERFDIAG t=";
+                perfSync = perfSync + g_Game.GetTickTime().ToString();
+                perfSync = perfSync + " deviceId=";
+                perfSync = perfSync + m_DeviceId;
+                perfSync = perfSync + " entity_sync_receive=";
+                perfSync = perfSync + m_PerfDiagSyncReceiveCount.ToString();
+                Print(perfSync);
+            }
+
             LFPG_CableRenderer r = LFPG_CableRenderer.Get();
             if (r)
             {
@@ -346,6 +383,18 @@ class LFPG_DeviceBase : Inventory_Base
         {
             string errVer = "[LFPG_DeviceBase] OnStoreLoad failed: deviceVer on " + GetType();
             LFPG_Util.Error(errVer);
+            return false;
+        }
+
+        bool verOutOfRange = (deviceVer < LFPG_DEVICE_PERSIST_VER_MIN) || (deviceVer > LFPG_DEVICE_PERSIST_VER_MAX_ACCEPTED);
+        if (verOutOfRange)
+        {
+            string errBadVer = "[LFPG_DeviceBase] OnStoreLoad: unknown deviceVer=";
+            errBadVer = errBadVer + deviceVer.ToString();
+            errBadVer = errBadVer + " on ";
+            errBadVer = errBadVer + GetType();
+            errBadVer = errBadVer + " (likely pre-v4.0 legacy save) - discarding entity";
+            LFPG_Util.Warn(errBadVer);
             return false;
         }
 
@@ -507,7 +556,7 @@ class LFPG_DeviceBase : Inventory_Base
     void LFPG_OnWiresCut() {}
     void LFPG_OnStoreSaveExtra(ParamsWriteContext ctx) {}
     bool LFPG_OnStoreLoadExtra(ParamsReadContext ctx, int ver) { return true; }
-    int  LFPG_GetDevicePersistVersion() { return 1; }
+    int  LFPG_GetDevicePersistVersion() { return 2; }
 
     // ============================================
     // Dismantle support (v4.5)

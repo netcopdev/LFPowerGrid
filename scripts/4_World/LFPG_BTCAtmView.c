@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — BTC ATM View (Sprint BTC-5: 6 Buttons)
 //
@@ -680,6 +682,16 @@ class LFPG_BTCAtmView extends ScriptView
 
     // =========================================================
     // Hover color cache (O(1) per-widget via SetUserData)
+    //
+    // WARNING (2026-04-26): do NOT add m_ColorDataRefs.Clear() in
+    // ApplyColors or anywhere else without first nulling SetUserData on
+    // every widget that received it. The engine stores SetUserData as a
+    // raw pointer (not a Managed soft link); clearing the strong refs
+    // while widgets still point at the data leaves dangling pointers,
+    // and the next GetUserData/Cast(rawData) below will read freed
+    // memory → heap corruption (SEH 0xc0000374). See LFPG_SorterView.c
+    // F1-B for the tracked-widgets fix pattern. This view is currently
+    // safe ONLY because ColorData persists across Opens (no Clear).
     // =========================================================
     protected void CacheColorLocal(Widget w, int color)
     {
@@ -1310,3 +1322,4 @@ class LFPG_BTCAtmView extends ScriptView
         LFPG_Util.Info(closeMsg);
     }
 };
+#endif

@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — Sorter Controller (Dabs MVC, v3.3)
 //
@@ -62,6 +64,18 @@ class LFPG_SorterController extends ViewController
     protected bool m_ResetConfirmActive;
     protected float m_ResetTimer;
     protected float m_FeedbackTimer;
+
+    // ── B2 (2026-04-26): in-flight throttling for Save/Sort RPCs ──
+    // Prevents user from spamming the button and flooding the server with
+    // redundant requests. Reset on the corresponding Ack handler.
+    protected bool m_SaveInFlight;
+    protected bool m_SortInFlight;
+    protected bool m_PreviewInFlight;
+    protected float m_PreviewInFlightSince;
+    protected bool m_PreviewPending;
+    protected float m_PreviewDebounce;
+    protected int m_PerfDiagPreviewSentCount;
+    protected int m_PerfDiagPreviewResponseCount;
 
     // ── Pairing state (Bug #5/#6) ──
     protected bool m_IsPaired;
@@ -186,6 +200,8 @@ class LFPG_SorterController extends ViewController
         m_ResetConfirmActive = false;
         m_ResetTimer = 0.0;
         m_FeedbackTimer = 0.0;
+        m_SaveInFlight = false;
+        m_SortInFlight = false;
         m_SorterNetLow = 0;
         m_SorterNetHigh = 0;
         m_IsPaired = false;
@@ -500,6 +516,14 @@ class LFPG_SorterController extends ViewController
         m_ShowRules = true;
         m_ResetConfirmActive = false;
         m_FeedbackTimer = 0.0;
+        // B2 (2026-04-26): fresh open clears any in-flight throttle that
+        // may have been left set by a previous session that closed mid-RPC.
+        m_SaveInFlight = false;
+        m_SortInFlight = false;
+        m_PreviewInFlight = false;
+        m_PreviewInFlightSince = 0.0;
+        m_PreviewPending = false;
+        m_PreviewDebounce = 0.0;
         // F3-B: Fresh open — no preview data yet
         m_LastMatchedItems = -1;
         m_Dests.Set(0, d0); m_Dests.Set(1, d1); m_Dests.Set(2, d2);
@@ -772,6 +796,8 @@ class LFPG_SorterController extends ViewController
 
     void HandleSaveAck(bool success)
     {
+        // B2: clear in-flight throttle on either outcome.
+        m_SaveInFlight = false;
         if (success)
         {
             string stSaved = "SAVED";
@@ -779,7 +805,13 @@ class LFPG_SorterController extends ViewController
         }
         else
         {
-            string stErr = "ERROR";
+            // B1 (2026-04-26): server rejected the save. The most common
+            // cause is the linked container being destroyed/unpaired
+            // server-side while the panel was open. Tell the user to reopen
+            // (which re-runs InitFromRPC with the correct pairing state).
+            // TODO: full fix is a server-push RPC on container unlink so the
+            // unpaired overlay shows immediately without an action attempt.
+            string stErr = "FAILED - REOPEN";
             SetStatus(stErr);
         }
         m_FeedbackTimer = 2.5;
@@ -788,6 +820,8 @@ class LFPG_SorterController extends ViewController
     // v3.2: Server sort result feedback
     void HandleSortAck(bool success, int movedCount)
     {
+        // B2: clear in-flight throttle on either outcome.
+        m_SortInFlight = false;
         if (success)
         {
             string stSorted = "SORTED: ";
@@ -796,7 +830,9 @@ class LFPG_SorterController extends ViewController
         }
         else
         {
-            string stFail = "SORT FAILED";
+            // B1 (2026-04-26): see HandleSaveAck note. Most common reason
+            // for sort failure is container unlinked server-side.
+            string stFail = "FAILED - REOPEN";
             SetStatus(stFail);
         }
         m_FeedbackTimer = 3.0;
@@ -839,6 +875,26 @@ class LFPG_SorterController extends ViewController
                 string resetLabel = "Reset All";
                 if (BtnResetAllText) { BtnResetAllText.SetText(resetLabel); }
                 TintBg(BtnResetAllBg, LFPG_SorterView.COL_RED_BTN);
+            }
+        }
+
+        if (m_PreviewInFlight && g_Game)
+        {
+            float previewNow = g_Game.GetTickTime();
+            if ((previewNow - m_PreviewInFlightSince) > LFPG_SORTER_PREVIEW_INFLIGHT_TIMEOUT_S)
+            {
+                m_PreviewInFlight = false;
+                m_PreviewInFlightSince = 0.0;
+            }
+        }
+
+        if (m_PreviewPending && !m_PreviewInFlight)
+        {
+            m_PreviewDebounce = m_PreviewDebounce - dt;
+            if (m_PreviewDebounce <= 0.0)
+            {
+                m_PreviewDebounce = 0.0;
+                SendPreviewNow();
             }
         }
     }
@@ -1031,6 +1087,11 @@ class LFPG_SorterController extends ViewController
         // S8 fix: guard unpaired — all other action buttons check this
         if (!m_IsPaired)
             return;
+        // B2 (2026-04-26): drop click if a previous Save is still pending.
+        // HandleSaveAck (success or failure) clears the flag.
+        if (m_SaveInFlight)
+            return;
+        m_SaveInFlight = true;
 
         string json = m_Config.ToJSON();
         string saveMsg = "[SorterCtrl] SAVE: ";
@@ -1078,6 +1139,12 @@ class LFPG_SorterController extends ViewController
     protected void DoSort(string logLabel)
     {
         if (!m_IsPaired) return;
+        // B2 (2026-04-26): drop click if a previous Sort is still pending.
+        // HandleSortAck (success or failure) clears the flag.
+        if (m_SortInFlight)
+            return;
+        m_SortInFlight = true;
+
         LFPG_Util.Info(logLabel);
         string stSorting = "SORTING...";
         SetStatus(stSorting);
@@ -1713,7 +1780,6 @@ class LFPG_SorterController extends ViewController
     {
         if (!m_IsPaired)
         {
-            // Show "not linked" empty state immediately
             PreviewItems.Clear();
             string noLink = "No container linked";
             if (PreviewEmpty) { PreviewEmpty.SetText(noLink); PreviewEmpty.Show(true); }
@@ -1726,30 +1792,83 @@ class LFPG_SorterController extends ViewController
             return;
         }
         #ifndef SERVER
+        m_PreviewPending = true;
+        m_PreviewDebounce = LFPG_SORTER_PREVIEW_DEBOUNCE_S;
+        #endif
+    }
+
+    protected void SendPreviewNow()
+    {
         if (!g_Game)
             return;
         PlayerBase player = PlayerBase.Cast(g_Game.GetPlayer());
-        if (player)
+        if (!player)
+            return;
+
+        ScriptRPC rpc = new ScriptRPC();
+        int subId = LFPG_RPC_SubId.SORTER_PREVIEW_REQUEST;
+        rpc.Write(subId);
+        rpc.Write(m_SorterNetLow);
+        rpc.Write(m_SorterNetHigh);
+        rpc.Write(m_SelectedOutput);
+        // v4.1: Send current UI config so preview evaluates live rules
+        // (not the persisted m_FilterJSON which requires SAVE first)
+        string previewJSON = m_Config.ToJSON();
+        rpc.Write(previewJSON);
+
+        m_PreviewPending = false;
+        m_PreviewInFlight = true;
+        m_PreviewInFlightSince = g_Game.GetTickTime();
+        rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
+
+        if (LFPG_PERFDIAG_ENABLED)
         {
-            ScriptRPC rpc = new ScriptRPC();
-            int subId = LFPG_RPC_SubId.SORTER_PREVIEW_REQUEST;
-            rpc.Write(subId);
-            rpc.Write(m_SorterNetLow);
-            rpc.Write(m_SorterNetHigh);
-            rpc.Write(m_SelectedOutput);
-            // v4.1: Send current UI config so preview evaluates live rules
-            // (not the persisted m_FilterJSON which requires SAVE first)
-            string previewJSON = m_Config.ToJSON();
-            rpc.Write(previewJSON);
-            rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
+            m_PerfDiagPreviewSentCount = m_PerfDiagPreviewSentCount + 1;
+            string sorterId = "";
+            EntityAI sorterEntity = EntityAI.Cast(g_Game.GetObjectByNetworkId(m_SorterNetLow, m_SorterNetHigh));
+            if (sorterEntity)
+            {
+                sorterId = LFPG_DeviceAPI.GetDeviceId(sorterEntity);
+            }
+            string perfPreview = "LFPG_PERFDIAG t=";
+            perfPreview = perfPreview + g_Game.GetTickTime().ToString();
+            perfPreview = perfPreview + " deviceId=";
+            perfPreview = perfPreview + sorterId;
+            perfPreview = perfPreview + " preview_send=";
+            perfPreview = perfPreview + m_PerfDiagPreviewSentCount.ToString();
+            perfPreview = perfPreview + " jsonLen=";
+            perfPreview = perfPreview + previewJSON.Length().ToString();
+            Print(perfPreview);
         }
-        #endif
     }
 
     // Called from View.OnPreviewData (static delegate from PlayerRPC)
     // v4.3: slots changed from array<int> to array<string> (formatted "WxH" / "WxH xQ")
     void PopulatePreview(int outputIdx, int totalMatched, array<string> names, array<string> cats, array<string> infos)
     {
+        m_PreviewInFlight = false;
+        m_PreviewInFlightSince = 0.0;
+
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            m_PerfDiagPreviewResponseCount = m_PerfDiagPreviewResponseCount + 1;
+            string sorterId = "";
+            EntityAI sorterEntity = EntityAI.Cast(g_Game.GetObjectByNetworkId(m_SorterNetLow, m_SorterNetHigh));
+            if (sorterEntity)
+            {
+                sorterId = LFPG_DeviceAPI.GetDeviceId(sorterEntity);
+            }
+            string perfPreview = "LFPG_PERFDIAG t=";
+            perfPreview = perfPreview + g_Game.GetTickTime().ToString();
+            perfPreview = perfPreview + " deviceId=";
+            perfPreview = perfPreview + sorterId;
+            perfPreview = perfPreview + " preview_response=";
+            perfPreview = perfPreview + m_PerfDiagPreviewResponseCount.ToString();
+            perfPreview = perfPreview + " pending=";
+            perfPreview = perfPreview + m_PreviewPending.ToString();
+            Print(perfPreview);
+        }
+
         // Guard: if user switched output tab while RPC was in flight, ignore
         if (outputIdx != m_SelectedOutput)
             return;
@@ -1893,6 +2012,11 @@ class LFPG_SorterController extends ViewController
     // v4.2: m_PreviewPool removed (same Dabs re-parenting fix as tags).
     void ClearCollections()
     {
+        m_PreviewInFlight = false;
+        m_PreviewInFlightSince = 0.0;
+        m_PreviewPending = false;
+        m_PreviewDebounce = 0.0;
+
         if (TagsList)
         {
             TagsList.Clear();
@@ -1903,3 +2027,4 @@ class LFPG_SorterController extends ViewController
         }
     }
 };
+#endif

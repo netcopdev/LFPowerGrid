@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - Searchlight Grab Controller (v1.5.0)
 //
@@ -16,6 +18,10 @@
 //
 // Enforce Script: no ternaries, no ++/--, no foreach, no +=/-=.
 // =========================================================
+
+static const int LFPG_SEARCHLIGHT_ENTER_ACCEPTED = 1;
+static const int LFPG_SEARCHLIGHT_ENTER_ACTIVE_OTHER_TARGET = 2;
+static const int LFPG_SEARCHLIGHT_ENTER_TARGET_UNRESOLVED = 3;
 
 class LFPG_SearchlightController
 {
@@ -37,6 +43,9 @@ class LFPG_SearchlightController
     // ---- RPC throttle ----
     protected float  m_RpcAccum;
     protected bool   m_AimDirty;
+    protected float  m_LastSentYaw;
+    protected float  m_LastSentPitch;
+    protected int    m_PerfDiagAimSendCount;
 
     // ============================================
     // Constructor
@@ -51,6 +60,9 @@ class LFPG_SearchlightController
         m_AimPitch      = 0.0;
         m_RpcAccum      = 0.0;
         m_AimDirty      = false;
+        m_LastSentYaw   = 0.0;
+        m_LastSentPitch = 0.0;
+        m_PerfDiagAimSendCount = 0;
     }
 
     // ============================================
@@ -71,7 +83,6 @@ class LFPG_SearchlightController
         if (s_Instance)
         {
             s_Instance.ForceCleanup();
-            delete s_Instance;
             s_Instance = null;
         }
     }
@@ -104,36 +115,41 @@ class LFPG_SearchlightController
     // ============================================
     // Enter -- called from RPC SEARCHLIGHT_ENTER_CONFIRM
     // ============================================
-    void Enter(int netLow, int netHigh, float yaw, float pitch)
+    int Enter(int netLow, int netHigh, float yaw, float pitch)
     {
         if (m_Active)
         {
-            LFPG_Util.Warn("[SearchlightCtrl] Enter: already active, ignoring");
-            return;
+            if (m_TargetNetLow == netLow && m_TargetNetHigh == netHigh)
+                return LFPG_SEARCHLIGHT_ENTER_ACCEPTED;
+
+            LFPG_Util.Warn("[SearchlightCtrl] Enter: another target is already active");
+            return LFPG_SEARCHLIGHT_ENTER_ACTIVE_OTHER_TARGET;
         }
 
-        m_TargetNetLow  = netLow;
-        m_TargetNetHigh = netHigh;
-        m_AimYaw        = yaw;
-        m_AimPitch      = pitch;
-        m_RpcAccum      = 0.0;
-        m_AimDirty      = false;
-
-        // Resolve searchlight entity
+        // Resolve before committing local state so a failed confirm is compensatable.
         Object slObj = g_Game.GetObjectByNetworkId(netLow, netHigh);
         if (!slObj)
         {
             LFPG_Util.Error("[SearchlightCtrl] Cannot resolve NetworkID on Enter");
-            return;
+            return LFPG_SEARCHLIGHT_ENTER_TARGET_UNRESOLVED;
         }
 
-        m_TargetSl = LFPG_Searchlight.Cast(slObj);
-        if (!m_TargetSl)
+        LFPG_Searchlight resolvedSearchlight = LFPG_Searchlight.Cast(slObj);
+        if (!resolvedSearchlight)
         {
             LFPG_Util.Error("[SearchlightCtrl] Object is not LFPG_Searchlight on Enter");
-            return;
+            return LFPG_SEARCHLIGHT_ENTER_TARGET_UNRESOLVED;
         }
 
+        m_TargetNetLow  = netLow;
+        m_TargetNetHigh = netHigh;
+        m_TargetSl      = resolvedSearchlight;
+        m_AimYaw        = yaw;
+        m_AimPitch      = pitch;
+        m_RpcAccum      = 0.0;
+        m_AimDirty      = false;
+        m_LastSentYaw   = yaw;
+        m_LastSentPitch = pitch;
         m_Active = true;
 
         PlayerBase p = PlayerBase.Cast(g_Game.GetPlayer());
@@ -146,6 +162,7 @@ class LFPG_SearchlightController
         logMsg = logMsg + netLow.ToString();
         logMsg = logMsg + ":" + netHigh.ToString();
         LFPG_Util.Info(logMsg);
+        return LFPG_SEARCHLIGHT_ENTER_ACCEPTED;
     }
 
     // ============================================
@@ -160,10 +177,12 @@ class LFPG_SearchlightController
         if (p)
         {
             ScriptRPC rpc = new ScriptRPC();
-            int subId = LFPG_RPC_SubId.SEARCHLIGHT_EXIT_REQUEST;
+            int subId = LFPG_RPC_SubId.SEARCHLIGHT_EXIT_V2;
             rpc.Write(subId);
             rpc.Write(m_TargetNetLow);
             rpc.Write(m_TargetNetHigh);
+            rpc.Write(m_AimYaw);
+            rpc.Write(m_AimPitch);
             rpc.Send(p, LFPG_RPC_CHANNEL, true, null);
         }
 
@@ -181,6 +200,8 @@ class LFPG_SearchlightController
         m_TargetNetHigh = 0;
         m_RpcAccum      = 0.0;
         m_AimDirty      = false;
+        m_LastSentYaw   = 0.0;
+        m_LastSentPitch = 0.0;
 
         LFPG_Util.Info("[SearchlightCtrl] Grab released");
     }
@@ -264,9 +285,25 @@ class LFPG_SearchlightController
         }
 
         // No yaw clamp — full 360 degree rotation.
-        // Always update (no deadzone — smooth tracking)
+        // Local aim always updates; network dirty uses the angular deadzone below.
         m_AimYaw = localYaw;
-        m_AimDirty = true;
+        float yawDelta = m_AimYaw - m_LastSentYaw;
+        while (yawDelta > 180.0)
+        {
+            yawDelta = yawDelta - 360.0;
+        }
+        while (yawDelta < -180.0)
+        {
+            yawDelta = yawDelta + 360.0;
+        }
+        if (yawDelta < 0.0)
+        {
+            yawDelta = -yawDelta;
+        }
+        if (yawDelta >= LFPG_SEARCHLIGHT_AIM_DEADZONE_DEG)
+        {
+            m_AimDirty = true;
+        }
 
         // ---- Read scroll wheel for pitch ----
         // LocalPress gives exactly one event per scroll notch (no cooldown needed).
@@ -298,7 +335,15 @@ class LFPG_SearchlightController
                 if (m_AimPitch > LFPG_SEARCHLIGHT_PITCH_MAX)
                     m_AimPitch = LFPG_SEARCHLIGHT_PITCH_MAX;
 
-                m_AimDirty = true;
+                float pitchDelta = m_AimPitch - m_LastSentPitch;
+                if (pitchDelta < 0.0)
+                {
+                    pitchDelta = -pitchDelta;
+                }
+                if (pitchDelta >= LFPG_SEARCHLIGHT_AIM_DEADZONE_DEG)
+                {
+                    m_AimDirty = true;
+                }
             }
         }
 
@@ -331,6 +376,27 @@ class LFPG_SearchlightController
         rpc.Write(m_AimYaw);
         rpc.Write(m_AimPitch);
         rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
+
+        m_LastSentYaw = m_AimYaw;
+        m_LastSentPitch = m_AimPitch;
+        m_AimDirty = false;
+
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            m_PerfDiagAimSendCount = m_PerfDiagAimSendCount + 1;
+            string deviceId = "";
+            if (m_TargetSl)
+            {
+                deviceId = LFPG_DeviceAPI.GetDeviceId(m_TargetSl);
+            }
+            string perfAim = "LFPG_PERFDIAG t=";
+            perfAim = perfAim + g_Game.GetTickTime().ToString();
+            perfAim = perfAim + " deviceId=";
+            perfAim = perfAim + deviceId;
+            perfAim = perfAim + " aim_send=";
+            perfAim = perfAim + m_PerfDiagAimSendCount.ToString();
+            Print(perfAim);
+        }
     }
 
     // ============================================
@@ -344,5 +410,8 @@ class LFPG_SearchlightController
         m_TargetNetHigh = 0;
         m_RpcAccum      = 0.0;
         m_AimDirty      = false;
+        m_LastSentYaw   = 0.0;
+        m_LastSentPitch = 0.0;
     }
 };
+#endif

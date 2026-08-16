@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - Camera list data (v0.9.2 - Sprint B)
 //
@@ -22,3 +24,22 @@ class LFPG_CameraListEntry
         m_Label = "";
     }
 };
+#endif
+
+#ifdef SERVER
+// Server-side data-surface stub required by LFPG_CameraViewport.EnterFromList.
+// The client data class above remains under its existing compilation boundary.
+class LFPG_CameraListEntry
+{
+    vector m_Pos;
+    vector m_Ori;
+    string m_Label;
+
+    void LFPG_CameraListEntry()
+    {
+        m_Pos = "0 0 0";
+        m_Ori = "0 0 0";
+        m_Label = "";
+    }
+};
+#endif

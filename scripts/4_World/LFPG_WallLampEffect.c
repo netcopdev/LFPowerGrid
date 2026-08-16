@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - WallLamp point light effect
 //
@@ -24,3 +26,4 @@ class LFPG_WallLampEffect : PointLightBase
         SetAmbientColor(1.0, 0.95, 0.75);
     }
 };
+#endif

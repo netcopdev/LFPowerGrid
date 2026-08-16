@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - CeilingLight point light effect (v0.7.47)
 //
@@ -24,3 +26,4 @@ class LFPG_CeilingLightEffect : PointLightBase
         SetAmbientColor(1.0, 0.95, 0.75);
     }
 };
+#endif

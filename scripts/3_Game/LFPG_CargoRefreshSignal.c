@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - Cargo Refresh Signal (v5.0)
 //
@@ -30,3 +32,4 @@ class LFPG_CargoRefreshSignal
         }
     }
 };
+#endif

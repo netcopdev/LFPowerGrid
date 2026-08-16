@@ -50,6 +50,18 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
     // ---- Non-synced ----
     protected ref set<Object> m_RayResults;
 
+    // Server-only: gate hold timer (game-time seconds). Mirrors the motion
+    // sensor anti-flicker pattern; absorbs single-tick detection misses while
+    // a player is standing inside the beam.
+    protected float m_GateHoldUntil = 0.0;
+
+    // T2: stable beam maintenance state. No allocation in the 300ms path.
+    protected static const int LFPG_LASER_MAINTENANCE_MS = 6900;
+    protected bool m_BeamTransformValid = false;
+    protected vector m_LastBeamStart;
+    protected vector m_LastBeamDirection;
+    protected int m_NextBeamMaintenanceMs = 0;
+
     void LFPG_LaserDetector()
     {
         m_RayResults = new set<Object>;
@@ -96,6 +108,7 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
             {
                 m_GateOpen = false;
             }
+            m_GateHoldUntil = 0.0;
             if (m_BeamLength > 0.0)
             {
                 m_BeamLength = 0.0;
@@ -178,11 +191,38 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
     // ============================================
     // Beam raycast (called by NM centralized tick)
     // ============================================
+    bool LFPG_HasBeamTransformChanged()
+    {
+        if (!m_PoweredNet)
+            return false;
+        if (!m_BeamTransformValid)
+            return true;
+
+        vector beamStart = LFPG_GetBeamStart();
+        vector beamDirection = LFPG_GetBeamDirection();
+        if (vector.DistanceSq(beamStart, m_LastBeamStart) > 0.0001)
+            return true;
+        if (vector.DistanceSq(beamDirection, m_LastBeamDirection) > 0.0001)
+            return true;
+        return false;
+    }
+
+    bool LFPG_IsBeamMaintenanceDue(int nowMs)
+    {
+        if (!m_PoweredNet)
+            return false;
+        if (nowMs >= m_NextBeamMaintenanceMs)
+            return true;
+        return false;
+    }
+
     bool LFPG_UpdateBeamRaycast()
     {
         #ifdef SERVER
         if (!m_PoweredNet)
         {
+            m_BeamTransformValid = false;
+            m_NextBeamMaintenanceMs = 0;
             if (m_BeamLength > 0.0)
             {
                 m_BeamLength = 0.0;
@@ -194,6 +234,10 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
 
         vector beamStart = LFPG_GetBeamStart();
         vector beamDir = LFPG_GetBeamDirection();
+        m_LastBeamStart = beamStart;
+        m_LastBeamDirection = beamDir;
+        m_BeamTransformValid = true;
+        m_NextBeamMaintenanceMs = g_Game.GetTime() + LFPG_LASER_MAINTENANCE_MS;
 
         float maxRange = LFPG_LASER_BEAM_RANGE_M;
         float endX = beamStart[0] + beamDir[0] * maxRange;
@@ -254,6 +298,7 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
             if (m_GateOpen)
             {
                 m_GateOpen = false;
+                m_GateHoldUntil = 0.0;
                 SetSynchDirty();
                 return true;
             }
@@ -265,6 +310,7 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
             if (m_GateOpen)
             {
                 m_GateOpen = false;
+                m_GateHoldUntil = 0.0;
                 SetSynchDirty();
                 return true;
             }
@@ -330,8 +376,24 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
             }
         }
 
+        // Gate hold timer: any successful detection extends the gate-open
+        // window by LFPG_LASER_HOLD_SEC. A single-tick miss (player at radius
+        // edge, beam shortened by the periodic raycast, etc.) no longer
+        // collapses the gate and starves downstream consumers.
+        float nowSec = g_Game.GetTickTime();
+        if (detected)
+        {
+            m_GateHoldUntil = nowSec + LFPG_LASER_HOLD_SEC;
+        }
+
+        bool shouldBeOpen = detected;
+        if (!shouldBeOpen && nowSec < m_GateHoldUntil)
+        {
+            shouldBeOpen = true;
+        }
+
         bool oldGate = m_GateOpen;
-        m_GateOpen = detected;
+        m_GateOpen = shouldBeOpen;
 
         if (m_GateOpen != oldGate)
         {
@@ -438,6 +500,7 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
         if (m_PoweredNet) { m_PoweredNet = false; dirty = true; }
         if (m_GateOpen) { m_GateOpen = false; dirty = true; }
         if (m_BeamLength > 0.0) { m_BeamLength = 0.0; dirty = true; }
+        m_GateHoldUntil = 0.0;
         if (dirty) { SetSynchDirty(); }
         #endif
     }
@@ -466,6 +529,7 @@ class LFPG_LaserDetector : LFPG_WireOwnerBase
         if (m_PoweredNet) { m_PoweredNet = false; dirty = true; }
         if (m_GateOpen) { m_GateOpen = false; dirty = true; }
         if (m_BeamLength > 0.0) { m_BeamLength = 0.0; dirty = true; }
+        m_GateHoldUntil = 0.0;
         if (dirty) { SetSynchDirty(); }
         #endif
     }

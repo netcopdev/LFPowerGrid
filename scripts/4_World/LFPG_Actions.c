@@ -69,6 +69,29 @@ class LFPG_ActionRaycast
     protected static bool  s_DeviceCheckResult = false;
     static const float     DEVICE_CHECK_TTL_S = 0.1; // 100ms
 
+    // Proximity fallback cache. Buffers are initialized once from MissionGameplay.OnInit.
+    protected static ref array<Object> s_ProximityNearby;
+    protected static ref array<CargoBase> s_ProximityCargo;
+    protected static EntityAI s_ProximityResult;
+    protected static Object s_ProximityExactHit;
+    protected static vector s_ProximityCamPos;
+    protected static vector s_ProximityCamDir;
+    protected static float s_ProximityCheckTime = -1.0;
+    protected static bool s_ProximityCacheValid = false;
+    static const float PROXIMITY_FALLBACK_TTL_S = 0.1;
+
+    static void InitProximityCache()
+    {
+        if (!s_ProximityNearby)
+        {
+            s_ProximityNearby = new array<Object>;
+        }
+        if (!s_ProximityCargo)
+        {
+            s_ProximityCargo = new array<CargoBase>;
+        }
+    }
+
     // ---- Refresh the shared ray cache if stale ----
     // This is the ONLY place DayZPhysics.RaycastRVProxy is called
     // for cursor queries in the entire mod.
@@ -249,13 +272,46 @@ class LFPG_ActionRaycast
         if (!player)
             return null;
 
-        // First try the exact raycast
+        // First try the exact raycast. The fallback cache never delays an exact hit.
         EntityAI exact = GetCursorTargetDevice(player);
         if (exact)
+        {
+            s_ProximityCacheValid = false;
             return exact;
+        }
 
         // Fallback: search for devices near the aim point
         RefreshRayCache(player);
+        InitProximityCache();
+
+        Object exactHit = null;
+        if (s_RayCacheResults && s_RayCacheResults.Count() > 0)
+        {
+            exactHit = s_RayCacheResults.Get(0).obj;
+        }
+
+        float proximityNow = g_Game.GetTickTime();
+        vector proximityCamPos = g_Game.GetCurrentCameraPosition();
+        vector proximityCamDir = g_Game.GetCurrentCameraDirection();
+        bool proximityInvalid = !s_ProximityCacheValid;
+        if (proximityCamPos[0] != s_ProximityCamPos[0] || proximityCamPos[1] != s_ProximityCamPos[1] || proximityCamPos[2] != s_ProximityCamPos[2])
+        {
+            proximityInvalid = true;
+        }
+        if (proximityCamDir[0] != s_ProximityCamDir[0] || proximityCamDir[1] != s_ProximityCamDir[1] || proximityCamDir[2] != s_ProximityCamDir[2])
+        {
+            proximityInvalid = true;
+        }
+        if (exactHit != s_ProximityExactHit)
+        {
+            proximityInvalid = true;
+        }
+
+        float proximityElapsed = proximityNow - s_ProximityCheckTime;
+        if (!proximityInvalid && proximityElapsed >= 0.0 && proximityElapsed < PROXIMITY_FALLBACK_TTL_S)
+        {
+            return s_ProximityResult;
+        }
 
         // Get the aim intersection point (where the ray hit the world)
         vector aimPos = "0 0 0";
@@ -276,11 +332,11 @@ class LFPG_ActionRaycast
             aimPos = camFrom + camDir * probeDistM;
         }
 
-        // Sphere search around aim point
+        // Sphere search around aim point. Reuse the static buffers across checks.
         float proxyRadius = 1.5;
-        array<Object> nearby = new array<Object>;
-        array<CargoBase> proxyCargo = new array<CargoBase>;
-        g_Game.GetObjectsAtPosition3D(aimPos, proxyRadius, nearby, proxyCargo);
+        s_ProximityNearby.Clear();
+        s_ProximityCargo.Clear();
+        g_Game.GetObjectsAtPosition3D(aimPos, proxyRadius, s_ProximityNearby, s_ProximityCargo);
 
         // Find the closest electrical device IN FRONT of the camera
         vector camCheck = g_Game.GetCurrentCameraPosition();
@@ -290,9 +346,9 @@ class LFPG_ActionRaycast
         EntityAI bestDevice = null;
 
         int pi;
-        for (pi = 0; pi < nearby.Count(); pi = pi + 1)
+        for (pi = 0; pi < s_ProximityNearby.Count(); pi = pi + 1)
         {
-            Object pObj = nearby[pi];
+            Object pObj = s_ProximityNearby[pi];
             if (!pObj)
                 continue;
 
@@ -324,6 +380,12 @@ class LFPG_ActionRaycast
             }
         }
 
+        s_ProximityResult = bestDevice;
+        s_ProximityExactHit = exactHit;
+        s_ProximityCamPos = proximityCamPos;
+        s_ProximityCamDir = proximityCamDir;
+        s_ProximityCheckTime = proximityNow;
+        s_ProximityCacheValid = true;
         return bestDevice;
     }
 
@@ -427,8 +489,10 @@ class ActionLFPG_PortBase : ActionSingleUseBase
         // SetDisabled(true) blocks movement/inventory but NOT
         // CCTCursor actions — they fire every frame on whatever
         // the player's cursor points at behind the UI.
+#ifndef SERVER
         if (LFPG_SorterView.IsOpen())
             return false;
+#endif
 
         if (!target)
             return false;
@@ -462,11 +526,13 @@ class ActionLFPG_PortBase : ActionSingleUseBase
         string connType = "";
         if (!g_Game.IsDedicatedServer())
         {
+#ifndef SERVER
             LFPG_CableRenderer renderer = LFPG_CableRenderer.Get();
             if (renderer)
             {
                 connType = renderer.GetConnectionType(devId, portName, portDir);
             }
+#endif
         }
 
         if (connType != "")
@@ -480,7 +546,9 @@ class ActionLFPG_PortBase : ActionSingleUseBase
             bool sessionActive = false;
             if (!g_Game.IsDedicatedServer())
             {
+#ifndef SERVER
                 sessionActive = LFPG_WiringClient.Get().IsActive();
+#endif
             }
 
             if (sessionActive)
@@ -519,6 +587,7 @@ class ActionLFPG_PortBase : ActionSingleUseBase
         int high = 0;
         e.GetNetworkID(low, high);
 
+#ifndef SERVER
         LFPG_WiringClient wc = LFPG_WiringClient.Get();
         PlayerBase localPlayer = PlayerBase.Cast(g_Game.GetPlayer());
 
@@ -542,6 +611,7 @@ class ActionLFPG_PortBase : ActionSingleUseBase
 
             wc.Finish(devId, low, high, portName, portDir);
         }
+#endif
     }
 };
 
@@ -612,8 +682,10 @@ class ActionLFPG_PlaceWaypoint : ActionSingleUseBase
         if (g_Game.IsDedicatedServer())
             return true;
 
+#ifndef SERVER
         if (!LFPG_WiringClient.Get().IsActive())
             return false;
+#endif
 
         // Hide when looking at electrical device (port actions handle that)
         if (LFPG_ActionRaycast.IsCursorOnDevice(player))
@@ -646,6 +718,7 @@ class ActionLFPG_PlaceWaypoint : ActionSingleUseBase
         if (!player)
             return;
 
+#ifndef SERVER
         LFPG_WiringClient wc = LFPG_WiringClient.Get();
         if (!wc.IsActive())
             return;
@@ -659,6 +732,7 @@ class ActionLFPG_PlaceWaypoint : ActionSingleUseBase
 
         int wpCount = wc.GetWaypointCount();
         player.MessageStatus("[LFPG] Waypoint " + wpCount.ToString());
+#endif
     }
 };
 
@@ -691,8 +765,10 @@ class ActionLFPG_CancelWiring : ActionSingleUseBase
         if (g_Game.IsDedicatedServer())
             return true;
 
+#ifndef SERVER
         if (!LFPG_WiringClient.Get().IsActive())
             return false;
+#endif
 
         // v0.7.23 (Bug 7): Removed IsCursorOnDevice check.
         // Cancel must be available even when looking at a device,
@@ -706,6 +782,7 @@ class ActionLFPG_CancelWiring : ActionSingleUseBase
     {
         super.OnExecuteClient(action_data);
 
+#ifndef SERVER
         LFPG_WiringClient.Get().Cancel();
 
         PlayerBase player = PlayerBase.Cast(g_Game.GetPlayer());
@@ -713,6 +790,7 @@ class ActionLFPG_CancelWiring : ActionSingleUseBase
         {
             player.MessageStatus("[LFPG] Wiring cancelled.");
         }
+#endif
     }
 	
 	override bool AddActionJuncture(ActionData action_data)
@@ -858,11 +936,13 @@ class ActionLFPG_CutPortBase : ActionSingleUseBase
         if (!g_Game.IsDedicatedServer())
         {
             // CLIENT: use cached connection info from CableRenderer
+#ifndef SERVER
             LFPG_CableRenderer renderer = LFPG_CableRenderer.Get();
             if (renderer)
             {
                 connType = renderer.GetConnectionType(devId, portName, portDir);
             }
+#endif
         }
         else
         {
@@ -1304,7 +1384,9 @@ class ActionLFPG_DebugStatus : ActionSingleUseBase
 
         // Per-port connection info
         int portCount = LFPG_DeviceAPI.GetPortCount(dev);
+#ifndef SERVER
         LFPG_CableRenderer renderer = LFPG_CableRenderer.Get();
+#endif
 
         int pi;
         for (pi = 0; pi < portCount; pi = pi + 1)
@@ -1324,6 +1406,7 @@ class ActionLFPG_DebugStatus : ActionSingleUseBase
             }
 
             string connInfo = "Empty";
+#ifndef SERVER
             if (renderer)
             {
                 string ct = renderer.GetConnectionType(devId, pName, pDir);
@@ -1332,13 +1415,16 @@ class ActionLFPG_DebugStatus : ActionSingleUseBase
                     connInfo = ct;
                 }
             }
+#endif
 
             player.MessageStatus("[LFPG] " + pLabel + " [" + dirStr + "] -> " + connInfo);
         }
 
         // Wiring session state
+#ifndef SERVER
         bool wiringActive = LFPG_WiringClient.Get().IsActive();
         player.MessageStatus("[LFPG] Wiring active: " + wiringActive.ToString());
+#endif
     }
 
     override void OnExecuteServer(ActionData action_data)

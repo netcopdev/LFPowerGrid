@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - Client Telemetry (v0.7.13 — Sprint 2.5)
 //
@@ -237,3 +239,4 @@ class LFPG_Telemetry
         s_LastDumpMs = nowMs;
     }
 };
+#endif

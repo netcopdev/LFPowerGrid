@@ -22,20 +22,8 @@
 // ---------------------------------------------------------
 modded class ActionTurnOnPowerGenerator
 {
-    // Diagnostic: one-time log to confirm modded class loaded.
-    // Check server/client .RPT for "[LFPG] modded ActionTurnOnPowerGenerator active".
-    // Remove both lines once confirmed working.
-    protected static bool s_LFPG_TurnOnLogDone = false;
-
     override bool ActionCondition(PlayerBase player, ActionTarget target, ItemBase item)
     {
-        // One-time diagnostic print (does not repeat every frame)
-        if (!s_LFPG_TurnOnLogDone)
-        {
-            s_LFPG_TurnOnLogDone = true;
-            Print("[LFPG] modded ActionTurnOnPowerGenerator active");
-        }
-
         if (!player || !target)
             return false;
 
@@ -80,7 +68,7 @@ modded class ActionTurnOnPowerGenerator
         LFPG_Generator gen = LFPG_Generator.Cast(targetObj);
         if (gen)
         {
-            Print("[LFPG] Vanilla TurnOn intercepted -- redirecting to LFPG_ToggleSource");
+            LFPG_Util.Debug("Vanilla TurnOn intercepted -- redirecting to LFPG_ToggleSource");
 
             // Block if no valid sparkplug (same gate as ActionLFPG_ToggleSource)
             if (!gen.LFPG_GetSwitchState() && !LFPG_DeviceLifecycle.IsSparkPlugValid(gen))
@@ -121,20 +109,8 @@ modded class ActionTurnOnPowerGenerator
 // ---------------------------------------------------------
 modded class ActionTurnOffPowerGenerator
 {
-    // Diagnostic: one-time log to confirm modded class loaded.
-    // Check server/client .RPT for "[LFPG] modded ActionTurnOffPowerGenerator active".
-    // Remove both lines once confirmed working.
-    protected static bool s_LFPG_TurnOffLogDone = false;
-
     override bool ActionCondition(PlayerBase player, ActionTarget target, ItemBase item)
     {
-        // One-time diagnostic print (does not repeat every frame)
-        if (!s_LFPG_TurnOffLogDone)
-        {
-            s_LFPG_TurnOffLogDone = true;
-            Print("[LFPG] modded ActionTurnOffPowerGenerator active");
-        }
-
         if (!player || !target)
             return false;
 
@@ -176,7 +152,7 @@ modded class ActionTurnOffPowerGenerator
         LFPG_Generator gen = LFPG_Generator.Cast(targetObj);
         if (gen)
         {
-            Print("[LFPG] Vanilla TurnOff intercepted -- redirecting to LFPG_ToggleSource");
+            LFPG_Util.Debug("Vanilla TurnOff intercepted -- redirecting to LFPG_ToggleSource");
             gen.LFPG_ToggleSource();
 
             PlayerBase execPlayer = PlayerBase.Cast(action_data.m_Player);

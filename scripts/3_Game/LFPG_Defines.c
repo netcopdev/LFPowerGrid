@@ -14,7 +14,6 @@
 
 // ---- Wire construction limits ----
 static const float LFPG_MAX_WIRE_LEN_M    = 100.0;  // single wire total length
-static const float LFPG_MAX_SEG_LEN_M     = 50.0;   // one segment between waypoints
 static const int   LFPG_MAX_WAYPOINTS     = 10;
 static const int   LFPG_MAX_WIRES_PER_DEVICE = 64;
 
@@ -79,7 +78,9 @@ static const float LFPG_EDGE_FADE_PX = 80.0;
 // ---- Cable state system (v0.7.8) ----
 // Each committed wire has a visual state that determines color,
 // and in the future, pattern (dash, pulse, etc.).
-// States 0-3 are detectable now; 4-9 are future-ready (need server data).
+// Only IDLE / POWERED / CRITICAL_LOAD are ever assigned to cableState today (see
+// LFPG_CableRenderer.GetStateColor and every `cableState =` writer); RESOLVING,
+// DISCONNECTED and ERROR_*/BLOCKED_LOGIC/SELECTED are reserved for future server data.
 enum LFPG_CableState
 {
     IDLE             = 0,   // Connected, no power flowing
@@ -126,7 +127,6 @@ static const float LFPG_LOD_MEDIUM_M = 40.0;
 static const float LFPG_LOD_TRANSITION_M = 2.0;      // fade band width in metres
 static const float LFPG_LOD_FADE_START_M = 13.0;     // LOD_CLOSE_M - TRANSITION_M (precomputed)
 static const float LFPG_LOD_TRANSITION_INV = 0.5;    // 1.0 / TRANSITION_M (avoid per-wire divide)
-static const float LFPG_LOD_FAR_M    = 80.0;
 
 // Line widths per LOD band.
 static const float LFPG_LINE_W_CLOSE  = 3.0;
@@ -137,9 +137,6 @@ static const float LFPG_LINE_W_MIN    = 0.8;
 // Alpha (opacity) by distance (0.0–1.0).
 static const float LFPG_ALPHA_CLOSE   = 1.0;
 static const float LFPG_ALPHA_FAR     = 0.35;
-
-// ---- Device proximity bubble (v0.7.7) ----
-static const float LFPG_BUBBLE_M = 150.0;
 
 // ---- Pre-connect status (v0.7.10) ----
 // Values 0-9 = connectable (OK/warnings), 10+ = not connectable (invalid).
@@ -229,6 +226,8 @@ static const int   LFPG_OCC_HYSTERESIS_HIDE  = 2;      // v0.7.38: fast to hide 
 static const int   LFPG_OCC_HYSTERESIS_SHOW  = 3;      // v0.7.38: cautious to reveal (prevent pop)
 static const float LFPG_OCC_PARTIAL_THRESHOLD = 0.66;  // v0.7.38: blocked ratio above this counts as occluded for hysteresis (2/3 samples)
 static const int   LFPG_OCC_MAX_RAYCASTS     = 20;
+static const int   LFPG_OCC_RAYCASTS_PER_TICK = 4;
+static const float LFPG_OCC_RAYCAST_TICK_MS   = 50.0;
 static const float LFPG_OCC_DIST_SCALE_MAX   = 3.0;    // v0.7.38: max recheck interval multiplier
 static const float LFPG_OCC_SAMPLE_LIFT_M    = 0.03;   // v0.7.38: sample point Y offset above cable
 static const float LFPG_OCC_WALL_PULLBACK_M  = 0.25;   // v0.8.x: camera-aware pullback for wall-mounted devices. Retracts sample 20cm toward camera to escape wall geometry. Tuned for typical wall thickness (15-30cm).
@@ -249,7 +248,10 @@ static const float LFPG_OCC_FORCED_RECHECK_MS = 300.0;  // v0.7.38: 800→300 (l
 // See LFPG_Migrators.c for migration chain and compatibility strategy.
 static const int   LFPG_PERSIST_VER = 3;  // v4.0: DeviceBase refactor, per-device version — WIPE REQUIRED
 static const int   LFPG_VANILLA_PERSIST_VER = 2;
-static const float LFPG_VANILLA_FLUSH_S = 30.0;
+static const float LFPG_VANILLA_FLUSH_S = 5.0;
+static const int   LFPG_FULLSYNC_SENDS_PER_TICK = 4;
+static const int   LFPG_STARTUP_VALIDATE_OWNERS_PER_TICK = 16;
+static const int   LFPG_REMOTE_PAIR_CAP = 32;
 
 // World coordinate bounds for waypoint validation (generous for custom maps up to 20km).
 // v0.7.16: Absolute bounds are a secondary guard. Primary validation is inter-waypoint
@@ -312,7 +314,32 @@ enum LFPG_RPC_SubId
     BTC_WITHDRAW_CASH      = 48,
     BTC_DEPOSIT_CASH       = 49,
     // ---- Server settings sync (v4.5) ----
-    SYNC_SERVER_SETTINGS   = 50   // Server→Client: send config flags on JIP
+    SYNC_SERVER_SETTINGS   = 50,  // Server→Client: send config flags on JIP
+    // ---- V4 TEST sorter (Sprint 0, 2026-04-26) ----
+    // Mirrors V3 SORTER_* SubIds (19-23, 29-34) for the test variant.
+    // V4 entity (LFPG_Sorter_TEST) opens LFPG_SorterView_TEST via these.
+    SORTER_TEST_CONFIG_REQUEST  = 60,
+    SORTER_TEST_CONFIG_RESPONSE = 61,
+    SORTER_TEST_CONFIG_SAVE     = 62,
+    SORTER_TEST_REQUEST_SORT    = 63,
+    SORTER_TEST_SAVE_ACK        = 64,
+    SORTER_TEST_RESYNC          = 65,
+    SORTER_TEST_RESYNC_ACK      = 66,
+    SORTER_TEST_PREVIEW_REQUEST = 67,
+    SORTER_TEST_PREVIEW_RESPONSE= 68,
+    SORTER_TEST_SORT_ACK        = 69,
+    SORTER_TEST_CARGO_REFRESH   = 70,
+    REQUEST_DEVICE_SYNC_BATCH  = 71,  // v1.2.3: client->server coalesced missing/stale cable resync
+    SYNC_OWNER_WIRES_DELTA      = 72,  // v1.2.3: server->client generation-checked wire mutation delta
+    SYNC_OWNER_WIRES_V2         = 73,  // v1.2.3: server->client owner snapshot with explicit generation
+    SEARCHLIGHT_EXIT_V2         = 74   // v1.2.3: client->server final aim plus searchlight exit
+};
+
+enum LFPG_WireDeltaOp
+{
+    ADD = 1,
+    REMOVE = 2,
+    UPDATE = 3
 };
 
 // ---- Sorter tick constants (Sprint S3) ----
@@ -320,7 +347,10 @@ static const int LFPG_SORTER_TICK_MS        = 5000;   // 5s between sorter ticks
 static const int LFPG_SORTER_ITEMS_PER_TICK = 3;      // max items moved per sorter per tick
 static const int LFPG_SORTER_BATCH_SIZE     = 8;      // max sorters processed per tick
 static const int LFPG_SORTER_MAX_EVAL       = 20;     // max rule evaluations per sorter per tick
+static const int LFPG_SORTER_RULECHECK_BUDGET = 512;  // max actual rule checks + config cache misses per scheduler tick
 static const int LFPG_SORTER_PREVIEW_CAP    = 50;     // max items in preview RPC response
+static const float LFPG_SORTER_PREVIEW_DEBOUNCE_S = 0.6; // coalesce rapid live-rule edits beyond the server action cooldown
+static const float LFPG_SORTER_PREVIEW_INFLIGHT_TIMEOUT_S = 3.0; // recover when a rejected request has no response
 
 // ---- Motion Sensor constants (v1.5.0) ----
 // Tick interval removed in v4.1 (absorbed into LFPG_TickPlayerDetection).
@@ -337,11 +367,18 @@ static const float LFPG_SENSOR_TARGET_LOW   = 0.4;    // LOS target height: crou
 
 // ---- Laser Detector constants (v1.9.0) ----
 // Tick intervals removed in v4.1 (absorbed into LFPG_TickPlayerDetection).
+// Cross radius widened 0.35→0.5 to close the vertical dead-zone between
+// playerLow (Y+0.5) and playerHigh (Y+1.4): radius 0.35 left ~0.41m of
+// vertical band where neither check matched, so a stationary player at the
+// wrong height failed detection while a walking player coincidentally caught
+// the radius. With 0.5 the bands overlap at Y+0.9..1.0. Hold timer added to
+// absorb single-tick detection misses (mirrors LFPG_SENSOR_HOLD_SEC pattern).
 static const float LFPG_LASER_BEAM_RANGE_M    = 5.0;    // max beam length (metres)
-static const float LFPG_LASER_CROSS_RADIUS    = 0.35;   // crossing detection radius (metres)
-static const float LFPG_LASER_CROSS_RADIUS_SQ = 0.1225; // 0.35² pre-computed
+static const float LFPG_LASER_CROSS_RADIUS    = 0.5;    // crossing detection radius (metres)
+static const float LFPG_LASER_CROSS_RADIUS_SQ = 0.25;   // 0.5² pre-computed
+static const float LFPG_LASER_HOLD_SEC        = 3.0;    // gate hold time after last detection (seconds)
 static const float LFPG_LASER_CONSUMPTION     = 5.0;    // self-consumption (u/s)
-static const float LFPG_LASER_CAPACITY        = 20.0;   // max throughput (u/s)
+static const float LFPG_LASER_CAPACITY        = 100.0;  // max throughput (u/s)
 
 // ---- Momentary pulse duration (shared by PushButton, SwitchRemote) ----
 static const int LFPG_BUTTON_PULSE_MS = 2000;
@@ -360,6 +397,7 @@ static const int    LFPG_LOG_LEVEL    = 2;
 // When false, ServerEcho calls (~15 in CableRenderer hot path) are no-ops.
 // Controlled at compile-time — no runtime branch cost when false.
 static const bool   LFPG_DIAG_ENABLED = false;
+static const bool   LFPG_PERFDIAG_ENABLED = false;
 
 // ---- Device types (Sprint 4.1) ----
 // Determines node behavior in the electrical graph and future propagation.
@@ -481,7 +519,7 @@ static const int LFPG_MAX_EDGES_PER_NODE  = 12;
 // Only logs when load changes exceed this delta since last log.
 static const float LFPG_LOAD_TELEM_DELTA = 0.05;
 
-static const string LFPG_VERSION_STR = "1.0.0";
+static const string LFPG_VERSION_STR = "1.2.2";
 
 // =========================================================
 // Constants that were previously missing definitions.
@@ -489,7 +527,7 @@ static const string LFPG_VERSION_STR = "1.0.0";
 // =========================================================
 
 // ---- Wire construction (alias for segment limit) ----
-static const float LFPG_MAX_SEGMENT_LEN_M    = 50.0;   // alias for LFPG_MAX_SEG_LEN_M
+static const float LFPG_MAX_SEGMENT_LEN_M    = 50.0;   // max segment length between waypoints
 static const float LFPG_NEAR_LIMIT_RATIO     = 0.80;   // 80% threshold for length warnings
 
 // ---- Per-player quotas ----
@@ -498,6 +536,10 @@ static const int   LFPG_MAX_WIRES_PER_PLAYER = 128;    // global per-player wire
 // ---- RPC rate limiting ----
 static const float LFPG_RPC_COOLDOWN_S       = 0.5;    // seconds between player RPC actions
 static const float LFPG_DEVICE_SYNC_COOLDOWN_S = 30.0;  // v0.7.35 D1: client-side cooldown per device sync request
+static const int   LFPG_DEVICE_SYNC_BATCH_DEBOUNCE_MS = 200;
+static const int   LFPG_DEVICE_SYNC_CHUNK_SPACING_MS = 600;
+static const int   LFPG_DEVICE_SYNC_BATCH_MAX = 64;
+static const int   LFPG_WIRE_DELTA_MAX_ENTRIES = 64;
 
 // ---- Culling and visibility ----
 static const float LFPG_CULL_DISTANCE_M      = 50.0;   // max render distance for cables
@@ -578,6 +620,7 @@ static const float LFPG_ENDCAP_WIDTH         = 2.0;    // endcap stroke width
 static const float LFPG_JOINT_SIZE           = 3.0;    // base joint size (px)
 static const float LFPG_JOINT_SIZE_MIN       = 2.0;    // min joint size at distance
 static const float LFPG_JOINT_SIZE_MAX       = 6.0;    // max joint size up close
+static const int   LFPG_CABLE_DECORATOR_BUDGET = 64;  // endcaps + joints per frame
 
 // ---- Retry system ----
 static const int   LFPG_RETRY_MAX            = 5;      // max retry attempts for deferred wires
@@ -628,11 +671,6 @@ static const float LFPG_INSPECT_REFRESH_MS        = 500.0;   // SyncVar refresh 
 static const float LFPG_INSPECT_RPC_COOLDOWN_MS   = 1000.0;  // min ms between RPCs
 static const float LFPG_INSPECT_POS_LERP          = 0.18;    // position smoothing factor
 static const float LFPG_INSPECT_FLIP_HYSTERESIS   = 20.0;    // px deadband for L/R flip
-
-// ---- Sprint 5: Z-order constants (Bug 2 fix) ----
-// Centralized sort order for UI layers. CableHUD must be below Inspector.
-static const int LFPG_SORT_CABLE_HUD  = 10000;
-static const int LFPG_SORT_INSPECTOR  = 10001;
 
 // ---- Sprint 5: PT-Chain diagnostic flag (Bug 1 investigation) ----
 // When true, enables detailed logging for PASSTHROUGH chain propagation.
@@ -695,8 +733,12 @@ static const float LFPG_SEARCHLIGHT_PITCH_MIN         = -90.0;   // degrees (scr
 static const float LFPG_SEARCHLIGHT_PITCH_MAX         = 90.0;    // degrees (scroll up)
 static const float LFPG_SEARCHLIGHT_SCROLL_STEP       = 1.0;     // degrees per scroll tick
 static const float LFPG_SEARCHLIGHT_RPC_THROTTLE_MS   = 150.0;   // ms between aim RPCs
+static const float LFPG_SEARCHLIGHT_AIM_DEADZONE_DEG  = 0.25;    // client send threshold
+static const float LFPG_SEARCHLIGHT_SPLASH_RAYCAST_MS = 500.0;   // server physics cadence
 static const float LFPG_SEARCHLIGHT_GRAB_RADIUS_M     = 2.5;     // auto-exit distance
 static const float LFPG_SEARCHLIGHT_SPLASH_RANGE_M    = 100.0;   // server raycast range
+static const float LFPG_SEARCHLIGHT_SHADOW_MAX_M      = 60.0;
+static const float LFPG_SEARCHLIGHT_FULL_M            = 120.0;
 
 // =========================================================
 // v2.0: BATTERY constants (energy storage devices)
@@ -740,6 +782,11 @@ static const int   LFPG_INTERCOM_INSTALL_TIME_MS       = 5000;    // ms for mic 
 static const int   LFPG_INTERCOM_FREQ_COUNT            = 7;       // vanilla frequency count
 // LFPG_INTERCOM_TOGGLE_TICK_MS, LFPG_FRIDGE_TICK_MS, LFPG_DC_TICK_MS removed in v4.1
 // (absorbed into LFPG_TickSimpleDevices)
+
+// =========================================================
+// v4.0: DOOR CONTROLLER constants
+// =========================================================
+static const float LFPG_DC_PLAYER_NEAR_RADIUS_M       = 50.0;
 
 // =========================================================
 // v5.0: SPRINKLER constants (CONSUMER, water delivery)

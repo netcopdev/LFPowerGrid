@@ -283,20 +283,24 @@ class LFPG_ElectronicCounter : LFPG_WireOwnerBase
             SetSynchDirty();
         }
 
-        string dbgLog = "[Counter] SetPowered(";
-        dbgLog = dbgLog + powered.ToString();
-        dbgLog = dbgLog + ")";
-        dbgLog = dbgLog + " in0=";
-        dbgLog = dbgLog + newIn0.ToString();
-        dbgLog = dbgLog + " in1=";
-        dbgLog = dbgLog + newIn1.ToString();
-        dbgLog = dbgLog + " val=";
-        dbgLog = dbgLog + m_CounterValue.ToString();
-        dbgLog = dbgLog + " pulse=";
-        dbgLog = dbgLog + m_PulseActive.ToString();
-        dbgLog = dbgLog + " id=";
-        dbgLog = dbgLog + m_DeviceId;
-        LFPG_Util.Debug(dbgLog);
+        // Gated so the multi-part string is not built when logging is below Debug (2).
+        if (LFPG_LOG_LEVEL >= 2)
+        {
+            string dbgLog = "[Counter] SetPowered(";
+            dbgLog = dbgLog + powered.ToString();
+            dbgLog = dbgLog + ")";
+            dbgLog = dbgLog + " in0=";
+            dbgLog = dbgLog + newIn0.ToString();
+            dbgLog = dbgLog + " in1=";
+            dbgLog = dbgLog + newIn1.ToString();
+            dbgLog = dbgLog + " val=";
+            dbgLog = dbgLog + m_CounterValue.ToString();
+            dbgLog = dbgLog + " pulse=";
+            dbgLog = dbgLog + m_PulseActive.ToString();
+            dbgLog = dbgLog + " id=";
+            dbgLog = dbgLog + m_DeviceId;
+            LFPG_Util.Debug(dbgLog);
+        }
         #endif
     }
 

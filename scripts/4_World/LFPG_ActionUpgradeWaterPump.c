@@ -12,10 +12,10 @@
 //
 // On completion:
 //   1. Capture pos/ori and filter state
-//   2. Consume materials (excess dropped to ground)
-//   3. DeviceLifecycle.OnDeviceKilled (cuts wires, cleans graph)
-//   4. Delete T1
-//   5. Create T2 at same pos/ori
+//   2. Create and validate T2 at same pos/ori
+//   3. Consume materials (excess dropped to ground)
+//   4. DeviceLifecycle.OnDeviceKilled (cuts wires, cleans graph)
+//   5. Delete T1
 //   6. Transfer NBC filter (GasMask_Filter, if any) to T2
 //
 // ENFORCE SCRIPT NOTES:
@@ -94,87 +94,68 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
     override void OnFinishProgressServer(ActionData action_data)
     {
         super.OnFinishProgressServer(action_data);
-
+    
         if (!action_data || !action_data.m_Target)
             return;
-
+    
         Object targetObj = action_data.m_Target.GetObject();
         if (!targetObj)
             return;
-
+    
         LFPG_WaterPump pump = LFPG_WaterPump.Cast(targetObj);
         if (!pump)
             return;
-
-        // Re-validate T2 check (anti-exploit)
+    
+        // Revalidate the target and material references before claiming the operation.
         if (pump.IsKindOf("LFPG_WaterPump_T2"))
         {
             LFPG_Util.Warn("[UpgradePump] Target is already T2, aborting.");
             return;
         }
-
-        // ---- Re-validate materials (server authority) ----
+    
         EntityAI plate = pump.FindAttachmentBySlotName("LFPG_PumpPlate");
         if (!plate)
         {
             LFPG_Util.Warn("[UpgradePump] No MetalPlate found, aborting.");
             return;
         }
-
+    
         int plateQty = plate.GetQuantity();
         if (plateQty < LFPG_PUMP_UPGRADE_PLATES)
         {
             LFPG_Util.Warn("[UpgradePump] Insufficient MetalPlate qty=" + plateQty.ToString());
             return;
         }
-
+    
         EntityAI nails = pump.FindAttachmentBySlotName("LFPG_PumpNails");
         if (!nails)
         {
             LFPG_Util.Warn("[UpgradePump] No Nails found, aborting.");
             return;
         }
-
+    
         int nailsQty = nails.GetQuantity();
         if (nailsQty < LFPG_PUMP_UPGRADE_NAILS)
         {
             LFPG_Util.Warn("[UpgradePump] Insufficient Nails qty=" + nailsQty.ToString());
             return;
         }
-
-        // ---- Capture transform ----
+    
         vector pos = pump.GetPosition();
         vector ori = pump.GetOrientation();
-
-        // ---- Capture filter state before deletion ----
+        string deviceId = pump.LFPG_GetDeviceId();
+    
         int filterQty = 0;
         string filterSlot = "GasMaskFilter";
         EntityAI filterItem = pump.FindAttachmentBySlotName(filterSlot);
         if (filterItem)
-        {
             filterQty = filterItem.GetQuantity();
-        }
-
-        // ---- Consume materials BEFORE pump deletion ----
-        ConsumeMaterial(pump, plate, plateQty, LFPG_PUMP_UPGRADE_PLATES, pos);
-        ConsumeMaterial(pump, nails, nailsQty, LFPG_PUMP_UPGRADE_NAILS, pos);
-
-        // ---- Kill T1 device (cuts wires, cleans graph, unregisters) ----
-        string deviceId = pump.LFPG_GetDeviceId();
-        LFPG_DeviceLifecycle.OnDeviceKilled(pump, deviceId);
-
-        // ---- Surface detection BEFORE T1 deletion ----
-        // v1.2.1: Downward raycast to find the actual surface (terrain or
-        // building floor) at T1's XZ position. This avoids T2 sinking below
-        // ground when its P3D model has a different origin height than T1's.
-        // Must run BEFORE ObjectDelete because ObjectDelete is deferred —
-        // T1 still exists in physics world during this frame.
-        // Pass pump as ignore object so the ray skips the T1 model.
+    
+        // Resolve the T2 surface position while T1 is still in the physics world.
         vector rayFrom = pos;
         rayFrom[1] = rayFrom[1] + 0.5;
         vector rayTo = pos;
         rayTo[1] = rayTo[1] - 1.0;
-
         vector spawnPos = pos;
         float groundY = 0.0;
         float surfY = 0.0;
@@ -182,7 +163,7 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
         surfRay.sorted = true;
         array<ref RaycastRVResult> surfResults = new array<ref RaycastRVResult>;
         DayZPhysics.RaycastRVProxy(surfRay, surfResults);
-
+    
         if (surfResults.Count() > 0)
         {
             groundY = surfResults[0].pos[1];
@@ -190,72 +171,115 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
         }
         else
         {
-            // Fallback: use engine surface Y (terrain only, no floors)
             surfY = g_Game.SurfaceY(pos[0], pos[2]);
             spawnPos[1] = surfY;
         }
-
-        // ---- Delete T1 (deferred — object persists in physics until end of frame) ----
-        g_Game.ObjectDelete(pump);
-
+    
+        if (!pump.LFPG_TryBeginExclusiveOp())
+        {
+            LFPG_Util.Warn("[UpgradePump] Another destructive operation already owns the target.");
+            return;
+        }
         EntityAI t2 = EntityAI.Cast(g_Game.CreateObjectEx("LFPG_WaterPump_T2", spawnPos, ECE_CREATEPHYSICS));
-        if (t2)
+        if (!t2)
         {
-            t2.SetPosition(spawnPos);
-            t2.SetOrientation(ori);
-            t2.Update();
-
-            // Transfer NBC filter to T2
-            if (filterQty > 0)
+            pump.LFPG_EndExclusiveOp();
+            LFPG_Util.Error("[UpgradePump] Failed to create LFPG_WaterPump_T2 - aborting upgrade, T1 + materials preserved");
+            return;
+        }
+    
+        t2.SetPosition(spawnPos);
+        t2.SetOrientation(ori);
+        t2.Update();
+    
+        array<EntityAI> stagedOutputs = new array<EntityAI>();
+        stagedOutputs.Insert(t2);
+    
+        // Stage the replacement filter before any T1 attachment can be deleted.
+        if (filterQty > 0)
+        {
+            EntityAI newFilter = t2.GetInventory().CreateAttachment("GasMask_Filter");
+            if (!newFilter)
             {
-                EntityAI newFilter = t2.GetInventory().CreateAttachment("GasMask_Filter");
-                if (newFilter)
-                {
-                    ItemBase newFilterItem = ItemBase.Cast(newFilter);
-                    if (newFilterItem)
-                    {
-                        newFilterItem.SetQuantity(filterQty);
-                    }
-                }
+                g_Game.ObjectDelete(t2);
+                pump.LFPG_EndExclusiveOp();
+                LFPG_Util.Error("[UpgradePump] Failed to create T2 filter - T1 + original filter preserved");
+                return;
             }
-
-            LFPG_Util.Info("[UpgradePump] T2 created at " + spawnPos.ToString() + " ori=" + ori.ToString() + " (T1 was " + pos.ToString() + ")");
+    
+            ItemBase newFilterItem = ItemBase.Cast(newFilter);
+            if (!newFilterItem)
+            {
+                g_Game.ObjectDelete(t2);
+                pump.LFPG_EndExclusiveOp();
+                LFPG_Util.Error("[UpgradePump] Invalid T2 filter type - T1 + original filter preserved");
+                return;
+            }
+            newFilterItem.SetQuantity(filterQty);
         }
-        else
+    
+        if (!StageMaterialSurplus(plate, plateQty, LFPG_PUMP_UPGRADE_PLATES, pos, stagedOutputs))
         {
-            LFPG_Util.Error("[UpgradePump] Failed to create LFPG_WaterPump_T2!");
+            AbortStagedUpgradeOutputs(stagedOutputs);
+            pump.LFPG_EndExclusiveOp();
+            LFPG_Util.Error("[UpgradePump] Failed to stage MetalPlate surplus - T1 + materials preserved");
+            return;
         }
+        if (!StageMaterialSurplus(nails, nailsQty, LFPG_PUMP_UPGRADE_NAILS, pos, stagedOutputs))
+        {
+            AbortStagedUpgradeOutputs(stagedOutputs);
+            pump.LFPG_EndExclusiveOp();
+            LFPG_Util.Error("[UpgradePump] Failed to stage Nail surplus - T1 + materials preserved");
+            return;
+        }
+        // Commit sources only after T2, its filter, and every surplus output exist.
+        g_Game.ObjectDelete(plate);
+        g_Game.ObjectDelete(nails);
+        LFPG_DeviceLifecycle.OnDeviceKilled(pump, deviceId);
+        g_Game.ObjectDelete(pump);
+    
+        // The exclusive flag intentionally remains set until EEDelete completes.
+        LFPG_Util.Info("[UpgradePump] T2 created at " + spawnPos.ToString() + " ori=" + ori.ToString() + " (T1 was " + pos.ToString() + ")");
     }
 
-    // Helper: consume exact amount, drop excess to ground
-    protected void ConsumeMaterial(EntityAI parent, EntityAI item, int currentQty, int required, vector dropPos)
+    // Helpers stage every excess output before source materials are consumed.
+    protected bool StageMaterialSurplus(EntityAI item, int currentQty, int required, vector dropPos, array<EntityAI> stagedOutputs)
     {
-        if (!item)
-            return;
-
+        if (!item || !stagedOutputs)
+            return false;
         if (currentQty <= required)
+            return true;
+    
+        int excessQty = currentQty - required;
+        string itemType = item.GetType();
+        vector spawnPos = dropPos;
+        spawnPos[1] = spawnPos[1] + 0.1;
+    
+        EntityAI excess = EntityAI.Cast(g_Game.CreateObject(itemType, spawnPos, false));
+        if (!excess)
+            return false;
+    
+        stagedOutputs.Insert(excess);
+        ItemBase excessItem = ItemBase.Cast(excess);
+        if (!excessItem)
+            return false;
+    
+        excessItem.SetQuantity(excessQty);
+        return true;
+    }
+    
+    protected void AbortStagedUpgradeOutputs(array<EntityAI> stagedOutputs)
+    {
+        if (!stagedOutputs)
+            return;
+    
+        int i = 0;
+        for (i = 0; i < stagedOutputs.Count(); i = i + 1)
         {
-            g_Game.ObjectDelete(item);
+            EntityAI output = stagedOutputs[i];
+            if (output)
+                g_Game.ObjectDelete(output);
         }
-        else
-        {
-            int excessQty = currentQty - required;
-            string itemType = item.GetType();
-
-            vector spawnPos = dropPos;
-            spawnPos[1] = spawnPos[1] + 0.1;
-
-            EntityAI excess = EntityAI.Cast(g_Game.CreateObject(itemType, spawnPos, false));
-            if (excess)
-            {
-                ItemBase excessItem = ItemBase.Cast(excess);
-                if (excessItem)
-                {
-                    excessItem.SetQuantity(excessQty);
-                }
-            }
-
-            g_Game.ObjectDelete(item);
-        }
+        stagedOutputs.Clear();
     }
 };

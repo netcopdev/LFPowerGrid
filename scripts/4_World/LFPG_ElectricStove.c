@@ -66,6 +66,10 @@ class LFPG_ElectricStove : LFPG_DeviceBase
     protected ItemBase m_SlotCookware2;  // DirectCookingC
     protected ItemBase m_SlotCookware3;  // DirectCookingD
 
+    // T2: per-burner heat dormancy; cooking and damage still run every phase.
+    protected int m_BurnerHeatSleepMask = 0;
+    protected int m_HeatMaintenanceCounter = 0;
+
     // ============================================
     // Constructor
     // ============================================
@@ -100,6 +104,8 @@ class LFPG_ElectricStove : LFPG_DeviceBase
         if (m_PoweredNet != powered)
         {
             m_PoweredNet = powered;
+            m_BurnerHeatSleepMask = 0;
+            m_HeatMaintenanceCounter = 0;
             SetSynchDirty();
 
             // When power is lost, terminate cooking sounds on all active slots
@@ -182,6 +188,8 @@ class LFPG_ElectricStove : LFPG_DeviceBase
             return;
 
         int bit = 1 << index;
+        int heatWakeMask = ~bit;
+        m_BurnerHeatSleepMask = m_BurnerHeatSleepMask & heatWakeMask;
         int masked = m_BurnerMask & bit;
         if (masked != 0)
         {
@@ -240,64 +248,108 @@ class LFPG_ElectricStove : LFPG_DeviceBase
     // ============================================
     // Cooking tick (called by NetworkManager)
     // ============================================
+    protected void LFPG_WakeBurnerHeat(int index)
+    {
+        if (index < 0)
+            return;
+        if (index >= STOVE_BURNER_COUNT)
+            return;
+
+        int bit = 1 << index;
+        int wakeMask = ~bit;
+        m_BurnerHeatSleepMask = m_BurnerHeatSleepMask & wakeMask;
+    }
+
     void LFPG_TickCooking(float deltaTime)
     {
         #ifdef SERVER
+        int burnerIndex;
+        int burnerBit;
+        int burnerMasked;
+        int heatSleeping;
+        bool maintenanceHeat;
+        bool shouldHeat;
+        ItemBase cookware;
+        float damageAmount;
+
         if (!m_PoweredNet)
             return;
-
         if (m_BurnerMask == 0)
             return;
-
         if (!m_CookingProcess)
             return;
 
         m_CookingProcess.SetCookingUpdateTime(deltaTime);
-
-        int i = 0;
-        while (i < STOVE_BURNER_COUNT)
+        m_HeatMaintenanceCounter = m_HeatMaintenanceCounter + 1;
+        maintenanceHeat = false;
+        if (m_HeatMaintenanceCounter >= 5)
         {
-            int bit = 1 << i;
-            int masked = m_BurnerMask & bit;
-            if (masked != 0)
+            m_HeatMaintenanceCounter = 0;
+            maintenanceHeat = true;
+        }
+
+        burnerIndex = 0;
+        while (burnerIndex < STOVE_BURNER_COUNT)
+        {
+            burnerBit = 1 << burnerIndex;
+            burnerMasked = m_BurnerMask & burnerBit;
+            if (burnerMasked != 0)
             {
-                ItemBase cookware = LFPG_GetSlotCookware(i);
+                cookware = LFPG_GetSlotCookware(burnerIndex);
                 if (cookware)
                 {
-                    // Heat the cookware
-                    LFPG_HeatCookware(cookware, deltaTime);
+                    shouldHeat = true;
+                    heatSleeping = m_BurnerHeatSleepMask & burnerBit;
+                    if (heatSleeping != 0 && !maintenanceHeat)
+                        shouldHeat = false;
+                    if (shouldHeat)
+                        LFPG_HeatCookware(burnerIndex, cookware, deltaTime);
 
-                    // Cook contents
                     m_CookingProcess.CookWithEquipment(cookware, STOVE_COOKING_TIME_COEF);
-
-                    // Damage cookware
-                    float dmg = GameConstants.FIRE_ATTACHMENT_DAMAGE_PER_SECOND * deltaTime;
-                    cookware.DecreaseHealth(dmg, false);
+                    damageAmount = GameConstants.FIRE_ATTACHMENT_DAMAGE_PER_SECOND * deltaTime;
+                    cookware.DecreaseHealth(damageAmount, false);
                 }
             }
-            i = i + 1;
+            burnerIndex = burnerIndex + 1;
         }
         #endif
     }
 
-    protected void LFPG_HeatCookware(ItemBase cookware, float deltaTime)
+    protected void LFPG_HeatCookware(int burnerIndex, ItemBase cookware, float deltaTime)
     {
         #ifdef SERVER
+        int burnerBit;
+        int wakeMask;
+        float currentTemp;
+        float targetTemp;
+        float diff;
+        float heatPermCoef;
+        float heatCoef;
+
         if (!cookware)
             return;
 
+        burnerBit = 1 << burnerIndex;
         if (!cookware.CanHaveTemperature())
-            return;
-
-        float currentTemp = cookware.GetTemperature();
-        float targetTemp = STOVE_COOKING_TARGET_TEMP;
-        float diff = targetTemp - currentTemp;
-
-        if (diff > 0)
         {
-            float heatPermCoef = cookware.GetHeatPermeabilityCoef();
-            float heatCoef = GameConstants.TEMP_COEF_GAS_STOVE * STOVE_HEAT_MULTIPLIER;
+            m_BurnerHeatSleepMask = m_BurnerHeatSleepMask | burnerBit;
+            return;
+        }
+
+        currentTemp = cookware.GetTemperature();
+        targetTemp = STOVE_COOKING_TARGET_TEMP;
+        diff = targetTemp - currentTemp;
+        if (diff > 0.0)
+        {
+            wakeMask = ~burnerBit;
+            m_BurnerHeatSleepMask = m_BurnerHeatSleepMask & wakeMask;
+            heatPermCoef = cookware.GetHeatPermeabilityCoef();
+            heatCoef = GameConstants.TEMP_COEF_GAS_STOVE * STOVE_HEAT_MULTIPLIER;
             cookware.SetTemperatureEx(new TemperatureDataInterpolated(targetTemp, ETemperatureAccessTypes.ACCESS_FIREPLACE, deltaTime, heatCoef, heatPermCoef));
+        }
+        else
+        {
+            m_BurnerHeatSleepMask = m_BurnerHeatSleepMask | burnerBit;
         }
         #endif
     }
@@ -368,6 +420,7 @@ class LFPG_ElectricStove : LFPG_DeviceBase
         {
             ItemBase ib = ItemBase.Cast(item);
             LFPG_SetSlotCookware(slotIdx, ib);
+            LFPG_WakeBurnerHeat(slotIdx);
 
             // Reset cooking time on the cookware (anti-exploit, same as vanilla)
             #ifdef SERVER
@@ -401,6 +454,7 @@ class LFPG_ElectricStove : LFPG_DeviceBase
             }
 
             LFPG_SetSlotCookware(slotIdx, null);
+            LFPG_WakeBurnerHeat(slotIdx);
         }
     }
 
@@ -557,6 +611,8 @@ class LFPG_ElectricStove : LFPG_DeviceBase
         if (m_PoweredNet)
         {
             m_PoweredNet = false;
+            m_BurnerHeatSleepMask = 0;
+            m_HeatMaintenanceCounter = 0;
             SetSynchDirty();
 
             // Same as power loss: terminate cooking sounds

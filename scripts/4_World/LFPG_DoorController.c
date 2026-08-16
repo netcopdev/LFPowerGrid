@@ -71,6 +71,26 @@ class LFPG_DoorController : LFPG_DeviceBase
     protected int m_SavedDoorType  = 0;
     protected int m_SavedDoorIndex = -1;
 
+    // T2: reusable pairing search, cursor budget, and exponential backoff.
+    protected static const int LFPG_DC_SEARCH_OBJECT_BUDGET = 128;
+    protected static const int LFPG_DC_BACKOFF_MIN_MS = 2000;
+    protected static const int LFPG_DC_BACKOFF_MAX_MS = 32000;
+    protected ref array<Object> m_SearchObjects;
+    protected ref array<Man> m_SearchNearbyPlayers;
+    protected int m_SearchCursor = 0;
+    protected bool m_SearchInProgress = false;
+    protected int m_SearchHintType = -1;
+    protected int m_SearchHintIndex = -1;
+    protected Object m_SearchBestDoor = null;
+    protected float m_SearchBestDistSq = 9999.0;
+    protected int m_SearchBestType = LFPG_DOORTYPE_NONE;
+    protected int m_SearchBestIndex = -1;
+    protected int m_NextSearchMs = 0;
+    protected int m_SearchBackoffMs = LFPG_DC_BACKOFF_MIN_MS;
+    protected int m_LastSearchAttemptMs = 0;
+    protected int m_SearchWakeMs = 0;
+    protected int m_SearchAttempts = 0;
+
     void LFPG_DoorController()
     {
         string pIn = "input_1";
@@ -172,6 +192,12 @@ class LFPG_DoorController : LFPG_DeviceBase
     override void LFPG_OnInit()
     {
         #ifdef SERVER
+        if (!m_SearchObjects)
+            m_SearchObjects = new array<Object>;
+        if (!m_SearchNearbyPlayers)
+            m_SearchNearbyPlayers = new array<Man>;
+        m_SearchWakeMs = g_Game.GetTime();
+
         LFPG_NetworkManager nm = LFPG_NetworkManager.Get();
         if (nm) nm.RegisterDoorController(this);
 
@@ -191,6 +217,10 @@ class LFPG_DoorController : LFPG_DeviceBase
         #ifdef SERVER
         LFPG_NetworkManager nm = LFPG_NetworkManager.Get();
         if (nm) nm.UnregisterDoorController(this);
+        g_Game.GetCallQueue(CALL_CATEGORY_SYSTEM).Remove(LFPG_SearchAndPairDoor);
+        m_SearchInProgress = false;
+        m_SearchObjects = null;
+        m_SearchNearbyPlayers = null;
         LFPG_UnpairDoor();
 
         if (m_PoweredNet)
@@ -206,6 +236,10 @@ class LFPG_DoorController : LFPG_DeviceBase
         #ifdef SERVER
         LFPG_NetworkManager nm = LFPG_NetworkManager.Get();
         if (nm) nm.UnregisterDoorController(this);
+        g_Game.GetCallQueue(CALL_CATEGORY_SYSTEM).Remove(LFPG_SearchAndPairDoor);
+        m_SearchInProgress = false;
+        m_SearchObjects = null;
+        m_SearchNearbyPlayers = null;
         LFPG_UnpairDoor();
         #endif
     }
@@ -333,7 +367,54 @@ class LFPG_DoorController : LFPG_DeviceBase
 
         if (!m_PairedDoor)
         {
-            LFPG_SearchAndPairDoor();
+            if (m_SearchInProgress)
+                return;
+
+            int nowMs = g_Game.GetTime();
+            if (nowMs < m_NextSearchMs)
+            {
+                if (m_SearchBackoffMs <= LFPG_DC_BACKOFF_MIN_MS)
+                    return;
+                if (!m_SearchNearbyPlayers)
+                    return;
+
+                // Fence construction requires a physically present player, so a
+                // nearby player is a placement proxy; without one no fence can be placed.
+                m_SearchNearbyPlayers.Clear();
+                g_Game.GetPlayers(m_SearchNearbyPlayers);
+                bool hasNearbyPlayer = false;
+                int nearbyPlayerIndex;
+                Man nearbyPlayer;
+                vector controllerSearchPos = GetPosition();
+                float playerNearRadiusSq = LFPG_DC_PLAYER_NEAR_RADIUS_M * LFPG_DC_PLAYER_NEAR_RADIUS_M;
+                for (nearbyPlayerIndex = 0; nearbyPlayerIndex < m_SearchNearbyPlayers.Count(); nearbyPlayerIndex = nearbyPlayerIndex + 1)
+                {
+                    nearbyPlayer = m_SearchNearbyPlayers[nearbyPlayerIndex];
+                    if (!nearbyPlayer)
+                        continue;
+                    if (vector.DistanceSq(controllerSearchPos, nearbyPlayer.GetPosition()) <= playerNearRadiusSq)
+                    {
+                        hasNearbyPlayer = true;
+                        break;
+                    }
+                }
+                if (!hasNearbyPlayer)
+                    return;
+                if (nowMs < m_LastSearchAttemptMs + LFPG_DC_BACKOFF_MIN_MS)
+                    return;
+            }
+            if (!m_SearchObjects)
+                return;
+
+            m_SearchObjects.Clear();
+            g_Game.GetObjectsAtPosition(GetPosition(), LFPG_DC_SEARCH_RADIUS, m_SearchObjects, null);
+            m_SearchCursor = 0;
+            m_SearchInProgress = true;
+            m_SearchBestDoor = null;
+            m_SearchBestDistSq = 9999.0;
+            m_SearchBestType = LFPG_DOORTYPE_NONE;
+            m_SearchBestIndex = -1;
+            LFPG_DoSearchAndPair(m_SearchHintType, m_SearchHintIndex);
             if (!m_PairedDoor)
                 return;
         }
@@ -378,8 +459,27 @@ class LFPG_DoorController : LFPG_DeviceBase
     protected void LFPG_SearchAndPairDoor()
     {
         #ifdef SERVER
-        LFPG_UnpairDoor();
-        LFPG_DoSearchAndPair(-1, -1);
+        if (!m_SearchInProgress)
+        {
+            LFPG_UnpairDoor();
+            if (!m_SearchObjects)
+                return;
+
+            m_SearchBackoffMs = LFPG_DC_BACKOFF_MIN_MS;
+            m_NextSearchMs = 0;
+            m_SearchWakeMs = g_Game.GetTime();
+            m_SearchObjects.Clear();
+            g_Game.GetObjectsAtPosition(GetPosition(), LFPG_DC_SEARCH_RADIUS, m_SearchObjects, null);
+            m_SearchCursor = 0;
+            m_SearchInProgress = true;
+            m_SearchHintType = -1;
+            m_SearchHintIndex = -1;
+            m_SearchBestDoor = null;
+            m_SearchBestDistSq = 9999.0;
+            m_SearchBestType = LFPG_DOORTYPE_NONE;
+            m_SearchBestIndex = -1;
+        }
+        LFPG_DoSearchAndPair(m_SearchHintType, m_SearchHintIndex);
         #endif
     }
 
@@ -390,73 +490,86 @@ class LFPG_DoorController : LFPG_DeviceBase
     {
         #ifdef SERVER
         LFPG_UnpairDoor();
+        if (!m_SearchObjects)
+            return;
+
+        m_SearchBackoffMs = LFPG_DC_BACKOFF_MIN_MS;
+        m_NextSearchMs = 0;
+        m_SearchWakeMs = g_Game.GetTime();
+        m_SearchObjects.Clear();
+        g_Game.GetObjectsAtPosition(GetPosition(), LFPG_DC_SEARCH_RADIUS, m_SearchObjects, null);
+        m_SearchCursor = 0;
+        m_SearchInProgress = true;
+        m_SearchHintType = hintType;
+        m_SearchHintIndex = hintIndex;
+        m_SearchBestDoor = null;
+        m_SearchBestDistSq = 9999.0;
+        m_SearchBestType = LFPG_DOORTYPE_NONE;
+        m_SearchBestIndex = -1;
         LFPG_DoSearchAndPair(hintType, hintIndex);
         #endif
     }
 
     // ============================================
     // Core search logic (shared between normal and hint paths)
-    //
-    // hintType / hintIndex: if >= 0, prefer a Building door with
-    // that index (from persisted state). Falls back to best match.
     // ============================================
     protected void LFPG_DoSearchAndPair(int hintType, int hintIndex)
     {
         #ifdef SERVER
-        array<Object> objects = new array<Object>;
-        g_Game.GetObjectsAtPosition(GetPosition(), LFPG_DC_SEARCH_RADIUS, objects, null);
-
-        float bestDistSq = 9999.0;
-        Object bestDoor = null;
-        int bestType = LFPG_DOORTYPE_NONE;
-        int bestIndex = -1;
-
-        vector myPos = GetPosition();
-
-        int count = objects.Count();
-        int i = 0;
-
+        int count;
+        int endIndex;
+        int i;
         Object obj;
         float distSq;
         Fence fence;
         bool isFenceValid;
         Building bld;
+        vector myPos;
         vector objPos;
         vector doorSoundPos;
         int doorCount;
-        int di;
+        int doorIndex;
         float doorDistSq;
+        int nowMs;
 
         #ifdef BBP
         BBP_BASE bbpBase;
         bool isBBPType;
         #endif
 
-        for (i = 0; i < count; i = i + 1)
+        if (!m_SearchInProgress)
+            return;
+        if (!m_SearchObjects)
         {
-            obj = objects[i];
+            m_SearchInProgress = false;
+            return;
+        }
+
+        myPos = GetPosition();
+        count = m_SearchObjects.Count();
+        endIndex = m_SearchCursor + LFPG_DC_SEARCH_OBJECT_BUDGET;
+        if (endIndex > count)
+            endIndex = count;
+
+        for (i = m_SearchCursor; i < endIndex; i = i + 1)
+        {
+            obj = m_SearchObjects[i];
             if (!obj)
                 continue;
-
             if (obj == this)
                 continue;
 
-            // ---- FENCE / BBP ----
             fence = Fence.Cast(obj);
             if (fence)
             {
                 objPos = fence.GetPosition();
                 distSq = vector.DistanceSq(myPos, objPos);
-
                 if (distSq > LFPG_DC_PAIR_DIST_SQ_FENCE)
                     continue;
 
                 isFenceValid = false;
-
                 if (fence.HasHinges())
-                {
                     isFenceValid = true;
-                }
 
                 #ifdef BBP
                 if (!isFenceValid)
@@ -466,102 +579,125 @@ class LFPG_DoorController : LFPG_DeviceBase
                     {
                         isBBPType = false;
                         if (bbpBase.isBBPDoor())
-                        {
                             isBBPType = true;
-                        }
                         if (bbpBase.IsBBPGate())
-                        {
                             isBBPType = true;
-                        }
                         if (isBBPType)
                         {
                             if (bbpBase.BBP_HasDoor())
-                            {
                                 isFenceValid = true;
-                            }
                         }
                     }
                 }
                 #endif
 
-                if (isFenceValid && distSq < bestDistSq)
+                if (isFenceValid && distSq < m_SearchBestDistSq)
                 {
-                    bestDistSq = distSq;
-                    bestDoor = obj;
-                    bestType = LFPG_DOORTYPE_FENCE;
-                    bestIndex = -1;
+                    m_SearchBestDistSq = distSq;
+                    m_SearchBestDoor = obj;
+                    m_SearchBestType = LFPG_DOORTYPE_FENCE;
+                    m_SearchBestIndex = -1;
                 }
-
                 continue;
             }
 
-            // ---- BUILDING ----
             bld = Building.Cast(obj);
             if (bld)
             {
                 doorCount = bld.GetDoorCount();
-
-                // If we have a hint for this building, try hinted index first
                 if (hintType == LFPG_DOORTYPE_BUILDING && hintIndex >= 0 && hintIndex < doorCount)
                 {
                     doorSoundPos = bld.GetDoorSoundPos(hintIndex);
                     doorDistSq = vector.DistanceSq(myPos, doorSoundPos);
-
-                    if (doorDistSq <= LFPG_DC_PAIR_DIST_SQ_DOOR && doorDistSq < bestDistSq)
+                    if (doorDistSq <= LFPG_DC_PAIR_DIST_SQ_DOOR && doorDistSq < m_SearchBestDistSq)
                     {
-                        bestDistSq = doorDistSq;
-                        bestDoor = obj;
-                        bestType = LFPG_DOORTYPE_BUILDING;
-                        bestIndex = hintIndex;
-                        // Hinted door found within range — skip other doors
+                        m_SearchBestDistSq = doorDistSq;
+                        m_SearchBestDoor = obj;
+                        m_SearchBestType = LFPG_DOORTYPE_BUILDING;
+                        m_SearchBestIndex = hintIndex;
                         continue;
                     }
                 }
 
-                // Scan all doors for the closest one within range
-                for (di = 0; di < doorCount; di = di + 1)
+                for (doorIndex = 0; doorIndex < doorCount; doorIndex = doorIndex + 1)
                 {
-                    doorSoundPos = bld.GetDoorSoundPos(di);
+                    doorSoundPos = bld.GetDoorSoundPos(doorIndex);
                     doorDistSq = vector.DistanceSq(myPos, doorSoundPos);
-
-                    if (doorDistSq <= LFPG_DC_PAIR_DIST_SQ_DOOR && doorDistSq < bestDistSq)
+                    if (doorDistSq <= LFPG_DC_PAIR_DIST_SQ_DOOR && doorDistSq < m_SearchBestDistSq)
                     {
-                        bestDistSq = doorDistSq;
-                        bestDoor = obj;
-                        bestType = LFPG_DOORTYPE_BUILDING;
-                        bestIndex = di;
+                        m_SearchBestDistSq = doorDistSq;
+                        m_SearchBestDoor = obj;
+                        m_SearchBestType = LFPG_DOORTYPE_BUILDING;
+                        m_SearchBestIndex = doorIndex;
                     }
                 }
-
-                continue;
             }
         }
 
-        if (bestDoor)
+        m_SearchCursor = endIndex;
+        if (m_SearchCursor < count)
         {
-            m_PairedDoor = bestDoor;
-            m_DoorType = bestType;
-            m_DoorIndex = bestIndex;
+            g_Game.GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(LFPG_SearchAndPairDoor, 100, false);
+            return;
+        }
 
-            float bestDist = Math.Sqrt(bestDistSq);
+        m_SearchInProgress = false;
+        m_SearchAttempts = m_SearchAttempts + 1;
+        nowMs = g_Game.GetTime();
+        m_LastSearchAttemptMs = nowMs;
+        if (m_SearchBestDoor)
+        {
+            m_PairedDoor = m_SearchBestDoor;
+            m_DoorType = m_SearchBestType;
+            m_DoorIndex = m_SearchBestIndex;
+            m_NextSearchMs = 0;
+            m_SearchBackoffMs = LFPG_DC_BACKOFF_MIN_MS;
+
+            float bestDist = Math.Sqrt(m_SearchBestDistSq);
             string pairMsg = "[LFPG_DoorController] Paired type=";
-            pairMsg = pairMsg + bestType.ToString();
+            pairMsg = pairMsg + m_DoorType.ToString();
             pairMsg = pairMsg + " idx=";
-            pairMsg = pairMsg + bestIndex.ToString();
+            pairMsg = pairMsg + m_DoorIndex.ToString();
             pairMsg = pairMsg + " dist=";
             pairMsg = pairMsg + bestDist.ToString();
             pairMsg = pairMsg + " id=";
             pairMsg = pairMsg + m_DeviceId;
             LFPG_Util.Info(pairMsg);
 
+            if (LFPG_PERFDIAG_ENABLED)
+            {
+                int pairLatencyMs = nowMs - m_SearchWakeMs;
+                string pairDiag = "LFPG_PERFDIAG door_pair pair_ms=";
+                pairDiag = pairDiag + pairLatencyMs.ToString();
+                pairDiag = pairDiag + " attempts=";
+                pairDiag = pairDiag + m_SearchAttempts.ToString();
+                pairDiag = pairDiag + " objects=";
+                pairDiag = pairDiag + count.ToString();
+                Print(pairDiag);
+            }
+
             LFPG_ApplyDoorState();
         }
         else
         {
-            string noMsg = "[LFPG_DoorController] No door found within range. id=";
-            noMsg = noMsg + m_DeviceId;
-            LFPG_Util.Debug(noMsg);
+            m_NextSearchMs = nowMs + m_SearchBackoffMs;
+            if (LFPG_PERFDIAG_ENABLED)
+            {
+                string retryDiag = "LFPG_PERFDIAG door_pair miss attempts=";
+                retryDiag = retryDiag + m_SearchAttempts.ToString();
+                retryDiag = retryDiag + " backoff_ms=";
+                retryDiag = retryDiag + m_SearchBackoffMs.ToString();
+                retryDiag = retryDiag + " objects=";
+                retryDiag = retryDiag + count.ToString();
+                Print(retryDiag);
+            }
+            m_SearchBackoffMs = m_SearchBackoffMs * 2;
+            if (m_SearchBackoffMs > LFPG_DC_BACKOFF_MAX_MS)
+                m_SearchBackoffMs = LFPG_DC_BACKOFF_MAX_MS;
         }
+
+        m_SearchObjects.Clear();
+        m_SearchBestDoor = null;
         #endif
     }
 

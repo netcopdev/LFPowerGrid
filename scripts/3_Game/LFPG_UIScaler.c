@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — UI Scaler (v3.2)
 //
@@ -415,3 +417,4 @@ class LFPG_UIScaler
         }
     }
 };
+#endif

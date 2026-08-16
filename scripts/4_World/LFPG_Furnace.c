@@ -29,6 +29,7 @@ class LFPG_Furnace_Kit : LFPG_KitBaseDeployable
 // ---------------------------------------------------------
 // EFFECT: Furnace smoke (EffectParticle subclass for SEffectManager)
 // ---------------------------------------------------------
+#ifndef SERVER
 class EffLFPGFurnaceSmoke : EffectParticle
 {
     void EffLFPGFurnaceSmoke()
@@ -36,6 +37,7 @@ class EffLFPGFurnaceSmoke : EffectParticle
         SetParticleID(ParticleList.LFPG_FURNACE_SMOKE);
     }
 };
+#endif
 
 // ---------------------------------------------------------
 // DEVICE — SOURCE : LFPG_WireOwnerBase
@@ -55,8 +57,12 @@ class LFPG_Furnace : LFPG_WireOwnerBase
     protected int m_BurnNextMs = 0;
 
     // ---- Client: sound + particle ----
+#ifndef SERVER
     protected EffectSound m_FurnaceLoopSound;
+#endif
+#ifndef SERVER
     protected ref Effect m_SmokeEffect;
+#endif
 
     // ---- v4.7: Heat emission (UTS) ----
     protected ref UniversalTemperatureSource m_UTSource;
@@ -329,23 +335,19 @@ class LFPG_Furnace : LFPG_WireOwnerBase
         return pos.ToVector();
     }
 
-    protected vector LFPG_GetSmokeOrientation()
-    {
-        string ori = "0 0 0";
-        return ori.ToVector();
-    }
-
     // ============================================
     // Client FX cleanup (sound + smoke)
     // ============================================
     protected void LFPG_CleanupClientFX()
     {
+#ifndef SERVER
         SEffectManager.DestroyEffect(m_SmokeEffect);
         if (m_FurnaceLoopSound)
         {
             m_FurnaceLoopSound.SoundStop();
             m_FurnaceLoopSound = null;
         }
+#endif
     }
 
     // ============================================
@@ -353,7 +355,9 @@ class LFPG_Furnace : LFPG_WireOwnerBase
     // ============================================
     void ~LFPG_Furnace()
     {
+#ifndef SERVER
         SEffectManager.DestroyEffect(m_SmokeEffect);
+#endif
 
         // v4.7: Deactivate UTS before GC
         if (m_UTSource)
@@ -390,7 +394,7 @@ class LFPG_Furnace : LFPG_WireOwnerBase
         {
             m_SmokeEffect = new EffLFPGFurnaceSmoke();
             vector smokePos = LFPG_GetSmokePosition();
-            vector smokeOri = LFPG_GetSmokeOrientation();
+            vector smokeOri = "0 0 0".ToVector();
             SEffectManager.PlayOnObject(m_SmokeEffect, this, smokePos, smokeOri);
         }
 

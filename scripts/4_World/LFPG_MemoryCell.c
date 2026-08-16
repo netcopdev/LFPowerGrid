@@ -17,7 +17,7 @@
 static const string LFPG_MCELL_RVMAT_OFF   = "\LFPowerGrid\data\button\materials\led_off.rvmat";
 static const string LFPG_MCELL_RVMAT_GREEN  = "\LFPowerGrid\data\button\materials\led_green.rvmat";
 static const string LFPG_MCELL_RVMAT_RED    = "\LFPowerGrid\data\button\materials\led_red.rvmat";
-static const float  LFPG_MCELL_CAPACITY     = 20.0;
+static const float  LFPG_MCELL_CAPACITY     = 100.0;
 
 // ---------------------------------------------------------
 // KIT
@@ -185,26 +185,30 @@ class LFPG_MemoryCell : LFPG_WireOwnerBase
             SetSynchDirty();
         }
 
-        // --- Diagnostic log (every call, remove after confirmed working) ---
-        string dLog = "[MemoryCell] SetPowered v3.1: pw=";
-        dLog = dLog + powered.ToString();
-        dLog = dLog + " net=";
-        dLog = dLog + m_PoweredNet.ToString();
-        dLog = dLog + " T=";
-        dLog = dLog + hasToggle.ToString();
-        dLog = dLog + " S=";
-        dLog = dLog + hasSet.ToString();
-        dLog = dLog + " R=";
-        dLog = dLog + hasReset.ToString();
-        dLog = dLog + " latch=";
-        dLog = dLog + m_LatchState.ToString();
-        dLog = dLog + " active=";
-        dLog = dLog + m_CellActive.ToString();
-        dLog = dLog + " chg=";
-        dLog = dLog + stateChanged.ToString();
-        dLog = dLog + " id=";
-        dLog = dLog + m_DeviceId;
-        LFPG_Util.Info(dLog);
+        // Diagnostic log, gated so the multi-part string is not built when logging is
+        // below Info (level 1). Behavior-identical to the prior unconditional call.
+        if (LFPG_LOG_LEVEL >= 1)
+        {
+            string dLog = "[MemoryCell] SetPowered v3.1: pw=";
+            dLog = dLog + powered.ToString();
+            dLog = dLog + " net=";
+            dLog = dLog + m_PoweredNet.ToString();
+            dLog = dLog + " T=";
+            dLog = dLog + hasToggle.ToString();
+            dLog = dLog + " S=";
+            dLog = dLog + hasSet.ToString();
+            dLog = dLog + " R=";
+            dLog = dLog + hasReset.ToString();
+            dLog = dLog + " latch=";
+            dLog = dLog + m_LatchState.ToString();
+            dLog = dLog + " active=";
+            dLog = dLog + m_CellActive.ToString();
+            dLog = dLog + " chg=";
+            dLog = dLog + stateChanged.ToString();
+            dLog = dLog + " id=";
+            dLog = dLog + m_DeviceId;
+            LFPG_Util.Info(dLog);
+        }
         #endif
     }
 

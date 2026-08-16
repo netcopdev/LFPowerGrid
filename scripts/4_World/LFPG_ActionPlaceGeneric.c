@@ -50,4 +50,57 @@ class LFPG_ActionPlaceGeneric : ActionPlaceObject
     {
         return DayZPlayerConstants.STANCEMASK_ERECT | DayZPlayerConstants.STANCEMASK_CROUCH;
     }
+
+    // =========================================================
+    // OnEndServer — Frontier_Fortifications compatibility shim.
+    //
+    // Frontier_Fortifications declares a modded class in the
+    // ActionDeployObject/ActionPlaceObject chain whose OnEndServer
+    // dereferences a NULL pointer when handling non-fortification
+    // kits (Frontier_Fortifications/scripts/4_World/classes/actions/
+    // actiondeploybasefortificationkits.c:5, "NULL pointer to
+    // instance"). Calling super would route through that broken
+    // override on every LFPG kit placement.
+    //
+    // We bypass super and replicate the vanilla cleanup from
+    // ActionDeployObject.OnEndServer + AnimatedActionBase.OnEndServer
+    // (P:\scripts\4_world\classes\useractionscomponent\actions\
+    // continuous\deployactions\actiondeployobject.c:205-238 and
+    // P:\scripts\4_world\classes\useractionscomponent\
+    // animatedactionbase.c:497-501).
+    //
+    // The vanilla IsBasebuildingKit Delete() branch is intentionally
+    // skipped: LFPG kits dispose of themselves via LFPG_DeferredDelete
+    // scheduled in LFPG_KitBase.OnPlacementComplete.
+    //
+    // Revisit if Frontier_Fortifications ships a fix; reverting is
+    // a single deletion of this override.
+    // =========================================================
+    override void OnEndServer(ActionData action_data)
+    {
+        if (action_data.m_Player)
+            action_data.m_Player.SetPerformedActionID(-1);
+
+        PlaceObjectActionData poActionData = PlaceObjectActionData.Cast(action_data);
+        if (!poActionData || !poActionData.m_MainItem)
+            return;
+
+        if (!poActionData.m_AlreadyPlaced)
+        {
+            poActionData.m_MainItem.SetIsBeingPlaced(false);
+
+            if (g_Game.IsMultiplayer())
+            {
+                poActionData.m_Player.PlacingCancelServer();
+            }
+            else
+            {
+                poActionData.m_Player.PlacingCancelLocal();
+                poActionData.m_Player.PlacingCancelServer();
+            }
+        }
+
+        if (poActionData.m_MainItem.GetLoopDeploySoundset() != string.Empty)
+            poActionData.m_MainItem.StopItemSoundServer(SoundConstants.ITEM_DEPLOY_LOOP);
+    }
 };

@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — Custom Particle Registration
 //
@@ -16,3 +18,4 @@ modded class ParticleList
     static const int LFPG_FURNACE_SMOKE = RegisterParticle(
         "LFPowerGrid/data/particles/", "lfpg_furnace_smoke");
 };
+#endif

@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - Tank HUD for Water Pump T2 (v1.1.0 Sprint W3)
 //
@@ -12,8 +14,8 @@ class LFPG_TankHUD
 
     // Widgets
     protected Widget m_Root;
-    protected ImageWidget m_BarBg;
-    protected ImageWidget m_BarFill;
+    protected Widget m_BarBg;
+    protected Widget m_BarFill;
     protected TextWidget m_TankText;
     protected TextWidget m_StatusText;
 
@@ -22,6 +24,19 @@ class LFPG_TankHUD
     protected int m_LastLiquidType = -1;
     protected bool m_LastPowered = false;
     protected bool m_Visible = false;
+
+    // Cheap eligibility gate: a throttled proximity query with reusable buffers.
+    protected ref array<Object> m_NearbyObjects;
+    protected ref array<CargoBase> m_NearbyCargo;
+    protected float m_LastNearPumpCheckMs = -1.0;
+    protected bool m_NearT2Pump = false;
+    static const float NEAR_PUMP_CHECK_MS = 250.0;
+
+    void LFPG_TankHUD()
+    {
+        m_NearbyObjects = new array<Object>;
+        m_NearbyCargo = new array<CargoBase>;
+    }
 
     static void Init()
     {
@@ -52,15 +67,25 @@ class LFPG_TankHUD
         if (m_Root)
             return;
 
-        m_Root = g_Game.GetWorkspace().CreateWidgets("LFPowerGrid/gui/layouts/LFPG_TankHUD.layout");
+        if (!g_Game)
+            return;
+
+        WorkspaceWidget workspace = g_Game.GetWorkspace();
+        if (!workspace)
+        {
+            LFPG_Util.Error("[TankHUD] Workspace unavailable");
+            return;
+        }
+
+        m_Root = workspace.CreateWidgets("LFPowerGrid/gui/layouts/LFPG_TankHUD.layout");
         if (!m_Root)
         {
             LFPG_Util.Error("[TankHUD] Failed to create layout");
             return;
         }
 
-        m_BarBg = ImageWidget.Cast(m_Root.FindAnyWidget("BarBg"));
-        m_BarFill = ImageWidget.Cast(m_Root.FindAnyWidget("BarFill"));
+        m_BarBg = m_Root.FindAnyWidget("BarBg");
+        m_BarFill = m_Root.FindAnyWidget("BarFill");
         m_TankText = TextWidget.Cast(m_Root.FindAnyWidget("TankText"));
         m_StatusText = TextWidget.Cast(m_Root.FindAnyWidget("StatusText"));
 
@@ -93,6 +118,13 @@ class LFPG_TankHUD
             return;
         }
 
+        // Do not wake the shared cursor ray unless a T2 pump is nearby.
+        if (!CanQueryTank(player))
+        {
+            Hide();
+            return;
+        }
+
         // Reuse ActionRaycast cursor target (shared with DeviceInspector)
         EntityAI target = LFPG_ActionRaycast.GetCursorTargetDevice(player);
         if (!target)
@@ -117,6 +149,36 @@ class LFPG_TankHUD
         UpdateBar(level, liquidType, powered);
         Show();
         #endif
+    }
+
+    protected bool CanQueryTank(PlayerBase player)
+    {
+        if (!player || !m_NearbyObjects || !m_NearbyCargo)
+            return false;
+
+        float nowMs = g_Game.GetTime();
+        float elapsed = nowMs - m_LastNearPumpCheckMs;
+        if (m_LastNearPumpCheckMs >= 0.0 && elapsed >= 0.0 && elapsed < NEAR_PUMP_CHECK_MS)
+            return m_NearT2Pump;
+
+        m_LastNearPumpCheckMs = nowMs;
+        m_NearT2Pump = false;
+        m_NearbyObjects.Clear();
+        m_NearbyCargo.Clear();
+        float queryRadius = LFPG_INTERACT_DIST_M + 1.5;
+        g_Game.GetObjectsAtPosition3D(player.GetPosition(), queryRadius, m_NearbyObjects, m_NearbyCargo);
+
+        int i;
+        for (i = 0; i < m_NearbyObjects.Count(); i = i + 1)
+        {
+            LFPG_WaterPump_T2 nearbyPump = LFPG_WaterPump_T2.Cast(m_NearbyObjects[i]);
+            if (nearbyPump)
+            {
+                m_NearT2Pump = true;
+                break;
+            }
+        }
+        return m_NearT2Pump;
     }
 
     protected void UpdateBar(float level, int liquidType, bool powered)
@@ -257,3 +319,4 @@ class LFPG_TankHUD
         #endif
     }
 };
+#endif

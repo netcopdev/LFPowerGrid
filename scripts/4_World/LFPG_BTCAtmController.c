@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — BTC ATM Controller (Sprint BTC-5: 6 Buttons)
 //
@@ -282,9 +284,16 @@ class LFPG_BTCAtmController extends ViewController
             btcVal = 0;
         }
 
+        // Mirror server cost idiom (LFPG_BTCHelper.c HandleBTCBuy): truncate +
+        // bump by 1 when fractional, so the displayed EUR matches exactly what
+        // the server will charge. Math.Floor here would short the user by 1.
         float eurFloat = btcVal * price;
-        float eurFloor = Math.Floor(eurFloat);
-        int eurInt = eurFloor;
+        int eurInt = (int)eurFloat;
+        float eurDiff = eurFloat - eurInt;
+        if (eurDiff > 0.001)
+        {
+            eurInt = eurInt + 1;
+        }
         string eurStr = eurInt.ToString();
 
         m_UpdatingEur = true;
@@ -593,7 +602,7 @@ class LFPG_BTCAtmController extends ViewController
     }
 
     // =========================================================
-    // RPC senders (client → server) — UNCHANGED
+    // RPC senders (client to server) - session-bound mutations
     // =========================================================
     protected void SendBTCRpc(int subId, int netLow, int netHigh, int btcAmount)
     {
@@ -605,11 +614,24 @@ class LFPG_BTCAtmController extends ViewController
         if (!player)
             return;
 
+        int serverSessionLow = 0;
+        int serverSessionHigh = 0;
+        int sequence = 0;
+        if (!LFPG_BTCAtmClientData.BeginMutation(subId, serverSessionLow, serverSessionHigh, sequence))
+        {
+            if (LFPG_BTCAtmClientData.TakeSessionRefreshRequest())
+                RequestBTCSession(player, netLow, netHigh);
+            return;
+        }
+
         ScriptRPC rpc = new ScriptRPC();
         rpc.Write(subId);
         rpc.Write(netLow);
         rpc.Write(netHigh);
         rpc.Write(btcAmount);
+        rpc.Write(serverSessionLow);
+        rpc.Write(serverSessionHigh);
+        rpc.Write(sequence);
         rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
         #endif
     }
@@ -624,12 +646,25 @@ class LFPG_BTCAtmController extends ViewController
         if (!player)
             return;
 
+        int serverSessionLow = 0;
+        int serverSessionHigh = 0;
+        int sequence = 0;
+        if (!LFPG_BTCAtmClientData.BeginMutation(subId, serverSessionLow, serverSessionHigh, sequence))
+        {
+            if (LFPG_BTCAtmClientData.TakeSessionRefreshRequest())
+                RequestBTCSession(player, netLow, netHigh);
+            return;
+        }
+
         ScriptRPC rpc = new ScriptRPC();
         rpc.Write(subId);
         rpc.Write(netLow);
         rpc.Write(netHigh);
         rpc.Write(btcAmount);
         rpc.Write(useAccount);
+        rpc.Write(serverSessionLow);
+        rpc.Write(serverSessionHigh);
+        rpc.Write(sequence);
         rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
         #endif
     }
@@ -644,12 +679,25 @@ class LFPG_BTCAtmController extends ViewController
         if (!player)
             return;
 
+        int serverSessionLow = 0;
+        int serverSessionHigh = 0;
+        int sequence = 0;
+        if (!LFPG_BTCAtmClientData.BeginMutation(subId, serverSessionLow, serverSessionHigh, sequence))
+        {
+            if (LFPG_BTCAtmClientData.TakeSessionRefreshRequest())
+                RequestBTCSession(player, netLow, netHigh);
+            return;
+        }
+
         ScriptRPC rpc = new ScriptRPC();
         rpc.Write(subId);
         rpc.Write(netLow);
         rpc.Write(netHigh);
         rpc.Write(btcAmount);
         rpc.Write(useAccount);
+        rpc.Write(serverSessionLow);
+        rpc.Write(serverSessionHigh);
+        rpc.Write(sequence);
         rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
         #endif
     }
@@ -664,13 +712,38 @@ class LFPG_BTCAtmController extends ViewController
         if (!player)
             return;
 
+        int serverSessionLow = 0;
+        int serverSessionHigh = 0;
+        int sequence = 0;
+        if (!LFPG_BTCAtmClientData.BeginMutation(subId, serverSessionLow, serverSessionHigh, sequence))
+        {
+            if (LFPG_BTCAtmClientData.TakeSessionRefreshRequest())
+                RequestBTCSession(player, netLow, netHigh);
+            return;
+        }
+
         ScriptRPC rpc = new ScriptRPC();
         rpc.Write(subId);
         rpc.Write(netLow);
         rpc.Write(netHigh);
         rpc.Write(eurAmount);
+        rpc.Write(serverSessionLow);
+        rpc.Write(serverSessionHigh);
+        rpc.Write(sequence);
         rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
         #endif
+    }
+
+    protected void RequestBTCSession(PlayerBase player, int netLow, int netHigh)
+    {
+        if (!player)
+            return;
+
+        ScriptRPC rpc = new ScriptRPC();
+        rpc.Write((int)LFPG_RPC_SubId.BTC_OPEN_REQUEST);
+        rpc.Write(netLow);
+        rpc.Write(netHigh);
+        rpc.Send(player, LFPG_RPC_CHANNEL, true, null);
     }
 
     // =========================================================
@@ -899,6 +972,24 @@ class LFPG_BTCAtmController extends ViewController
             string e11 = Widget.TranslateString(e11Key);
             return e11;
         }
+        if (errCode == LFPG_BTC_ERR_REFUNDED)
+        {
+            string e12Key = "#STR_LFPG_BTC_ERR_REFUNDED";
+            string e12 = Widget.TranslateString(e12Key);
+            return e12;
+        }
+        if (errCode == LFPG_BTC_ERR_REFUND_PARTIAL)
+        {
+            string e13Key = "#STR_LFPG_BTC_ERR_REFUND_PARTIAL";
+            string e13 = Widget.TranslateString(e13Key);
+            return e13;
+        }
+        if (errCode == LFPG_BTC_ERR_AMOUNT_TOO_LARGE)
+        {
+            string e14Key = "#STR_LFPG_BTC_ERR_AMOUNT_TOO_LARGE";
+            string e14 = Widget.TranslateString(e14Key);
+            return e14;
+        }
         string e9Key = "#STR_LFPG_BTC_ERR_UNKNOWN";
         string e9 = Widget.TranslateString(e9Key);
         return e9;
@@ -909,8 +1000,16 @@ class LFPG_BTCAtmController extends ViewController
     // =========================================================
     protected string FormatEur(float val)
     {
-        float rounded = Math.Round(val);
-        int roundedInt = rounded;
+        // Ceil-idiom matches server cost rounding (HandleBTCBuy). Using
+        // Math.Round here would print a price 1 EUR below what 1 BTC costs
+        // when the upstream price has decimals (e.g. 67931.50 → "67931 E"
+        // while server charges 67932), confusing players who match amounts.
+        int roundedInt = (int)val;
+        float roundedDiff = val - roundedInt;
+        if (roundedDiff > 0.001)
+        {
+            roundedInt = roundedInt + 1;
+        }
         string result = roundedInt.ToString();
         string suffix = " E";
         result = result + suffix;
@@ -925,3 +1024,4 @@ class LFPG_BTCAtmController extends ViewController
         return result;
     }
 };
+#endif

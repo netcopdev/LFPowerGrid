@@ -14,17 +14,45 @@ modded class MissionServer
     override void OnInit()
     {
         super.OnInit();
+        LFPG_NetworkManager initNm = LFPG_NetworkManager.Get();
+        if (initNm) initNm.StartServerScheduler();
         Print(LFPG_LOG_PREFIX + "MissionServer OnInit (v" + LFPG_VERSION_STR + ")");
+    }
+
+    void LFPG_RunOrphanSweep()
+    {
+        LFPG_BalanceProvider_Native.SweepOrphanClaims();
+    }
+
+    override void OnMissionStart()
+    {
+        super.OnMissionStart();
+        // This one-shot entry point owns no handler state or staged references.
+        // BTC handlers remain synchronous; their IN_FLIGHT assumption is unchanged.
+        GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(LFPG_RunOrphanSweep, LFPG_BalanceProvider_Native.LFPG_BTC_ORPHAN_SWEEP_DELAY_MS, false);
     }
 
     override void OnMissionFinish()
     {
-        LFPG_NetworkManager nm = LFPG_NetworkManager.Get();
-        if (nm) nm.FlushVanillaOnShutdown();
+        LFPG_NetworkManager nm = LFPG_NetworkManager.GetExisting();
+        if (nm)
+        {
+            nm.StopServerScheduler();
+            nm.FlushVanillaOnShutdown();
+        }
+        LFPG_BalanceProvider activeBalance = LFPG_BalanceRegistry.GetActive();
+        if (activeBalance && activeBalance.GetName() == "Native")
+            LFPG_BalanceProvider_Native.FlushBalanceOnShutdown();
+        if (GetGame())
+            GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).Remove(LFPG_RunOrphanSweep);
+        LFPG_BalanceProvider_Native.ResetMissionClaimState();
         super.OnMissionFinish();
     }
+
+    override LFPG_ElecGraph LFPG_CreateElecGraph() { return new LFPG_ElecGraphImpl(); }
 };
 
+#ifndef SERVER
 modded class MissionGameplay
 {
     protected bool m_LFPG_WasActive      = false;
@@ -65,9 +93,12 @@ modded class MissionGameplay
 
         LFPG_CameraViewport.Reset();
         LFPG_SearchlightController.Reset();
+        LFPG_SearchlightLightManager.Reset();
         LFPG_SorterView.Init();
+        // v1.2.3: TEST view is constructed lazily by LFPG_SorterView_TEST.Open().
         LFPG_BTCAtmView.Init();
         LFPG_LaserBeamRenderer.Reset();
+        LFPG_ActionRaycast.InitProximityCache();
         LFPG_TankHUD.Init();
         LFPG_BTCAtmClientData.Reset();
 
@@ -256,6 +287,7 @@ modded class MissionGameplay
         {
             slCtrl.Tick(timeslice);
         }
+        LFPG_SearchlightLightManager.Tick();
 
         // ---- Render cables + preview + CCTV overlay ----
         bool skipCameraOps = false;
@@ -264,36 +296,36 @@ modded class MissionGameplay
             skipCameraOps = viewport.ShouldSkipInspector();
         }
 
-        LFPG_CableHUD hud = LFPG_CableHUD.Get();
-        hud.BeginFrame();
-
         LFPG_CableRenderer renderer = LFPG_CableRenderer.Get();
-        if (renderer && !skipCameraOps)
-        {
-            renderer.DrawFrame();
-        }
+        LFPG_LaserBeamRenderer laserR = LFPG_LaserBeamRenderer.Get();
+        bool cableProducerActive = (renderer && renderer.HasRenderableWires());
+        bool laserProducerActive = (laserR && laserR.HasActiveBeams());
+        bool canvasProducerActive = (!skipCameraOps && (cableProducerActive || laserProducerActive || isActive));
 
-        // v1.9.0: Laser beam rendering (uses same CableHUD pipeline)
-        if (!skipCameraOps)
+        LFPG_CableHUD hud = LFPG_CableHUD.Get();
+        hud.BeginFrame(canvasProducerActive);
+
+        if (canvasProducerActive)
         {
-            LFPG_LaserBeamRenderer laserR = LFPG_LaserBeamRenderer.Get();
-            if (laserR)
+            if (cableProducerActive)
+            {
+                renderer.DrawFrame();
+            }
+            if (laserProducerActive)
             {
                 laserR.DrawFrame();
             }
-        }
-
-        if (isActive && !skipCameraOps)
-        {
-            LFPG_WiringClient.TickPreview();
+            if (isActive)
+            {
+                LFPG_WiringClient.TickPreview();
+            }
+            hud.EndFrame();
         }
 
         if (viewport)
         {
-            viewport.DrawOverlay(hud);
+            viewport.DrawOverlay();
         }
-
-        hud.EndFrame();
 
         // Telemetry tick
         LFPG_Telemetry.Tick(g_Game.GetTime());
@@ -334,11 +366,19 @@ modded class MissionGameplay
 
     override void OnMissionFinish()
     {
+        LFPG_WiringClient.Reset();
+        LFPG_CableRenderer.Reset();
+        LFPG_CableHUD.Reset();
+        LFPG_LaserBeamRenderer.Reset();
+
         LFPG_DeviceInspector.Cleanup();
 
         LFPG_CameraViewport.Reset();
         LFPG_SearchlightController.Reset();
+        LFPG_SearchlightLightManager.Reset();
         LFPG_SorterView.Cleanup();
+        // Sprint 0 (2026-04-26): V4 TEST view cleanup
+        LFPG_SorterView_TEST.Cleanup();
         LFPG_BTCAtmView.Cleanup();
         LFPG_TankHUD.Cleanup();
 
@@ -354,3 +394,4 @@ modded class MissionGameplay
         player.MessageStatus("[LFPG] " + text);
     }
 };
+#endif

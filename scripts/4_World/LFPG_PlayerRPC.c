@@ -22,6 +22,9 @@ modded class MissionBaseWorld
     {
         m_LFPG_SkipResetGUI = skip;
     }
+
+    // Vanilla missionbaseworld.c:3-6 uses a base factory for mission-owned services.
+    LFPG_ElecGraph LFPG_CreateElecGraph() { return null; }
 };
 
 modded class PlayerBase

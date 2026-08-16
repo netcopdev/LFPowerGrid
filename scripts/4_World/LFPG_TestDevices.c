@@ -940,8 +940,10 @@ class LF_TestLamp : Spotlight
 
     // NOTE: Spotlight base class already defines `SpotlightLight m_Light;`
     // so we must not redeclare it here.
+#ifndef SERVER
     // ScriptedLightBase is an engine object (not Managed). Do NOT store as `ref`.
     protected ScriptedLightBase m_LFPG_Light;
+#endif
 
     // v0.7.30: Per-device position polling removed.
     // Movement detection is now centralized in NetworkManager.CheckDeviceMovement()
@@ -1257,6 +1259,7 @@ class LF_TestLamp : Spotlight
     // ============================================
     // Client visuals
     // ============================================
+#ifndef SERVER
     protected void LFPG_CreateLight()
     {
         if (m_LFPG_Light)
@@ -1286,7 +1289,9 @@ class LF_TestLamp : Spotlight
             LFPG_Util.Error(clFailMsg);
         }
     }
+#endif
 
+#ifndef SERVER
     protected void LFPG_DestroyLight()
     {
         if (!m_LFPG_Light)
@@ -1297,6 +1302,7 @@ class LF_TestLamp : Spotlight
         m_LFPG_Light.FadeOut();
         m_LFPG_Light = null;
     }
+#endif
 
     // v0.7.23 (Bug 5): Prevent picking up / moving placed lamps.
     // v0.7.38: Vanilla carry/cargo restored.

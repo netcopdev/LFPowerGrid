@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - client wiring session + preview rendering
 //
@@ -30,6 +32,17 @@
 //   GREY   (0xFF888888) - no valid target under cursor
 //   CYAN   (0xFF00FFFF) - waypoint marker cross
 // =========================================================
+
+class LFPG_PreviewSpanCache
+{
+    ref array<vector> points;
+    float rawDistance;
+
+    void LFPG_PreviewSpanCache()
+    {
+        points = new array<vector>;
+    }
+};
 
 class LFPG_WiringClient
 {
@@ -84,6 +97,17 @@ class LFPG_WiringClient
     // v0.7.36 (M1): Reusable PreConnectParams to avoid per-frame allocation.
     // Fields are overwritten each frame in DrawPreviewFrame.
     protected ref LFPG_PreConnectParams m_PreConnectParams;
+    protected ref LFPG_PreConnectResult m_PreConnectResult;
+
+    // Cached fixed prefix: source -> last waypoint.
+    protected ref array<vector> m_PreviewPrefixPts;
+    protected ref array<ref LFPG_PreviewSpanCache> m_PrefixSpanCaches;
+    protected bool m_PrefixCacheValid;
+    protected vector m_PrefixStartPos;
+    protected int m_PrefixWaypointCount;
+    protected float m_PrefixTotalLen;
+    protected float m_PrefixRenderTotalLen;
+    protected float m_PrefixMaxSegLen;
 
     void LFPG_WiringClient()
     {
@@ -98,6 +122,16 @@ class LFPG_WiringClient
         m_ClipA = "0 0 0";
         m_ClipB = "0 0 0";
         m_PreConnectParams = new LFPG_PreConnectParams();
+        m_PreConnectResult = new LFPG_PreConnectResult();
+        m_PreviewPrefixPts = new array<vector>;
+        m_PrefixSpanCaches = new array<ref LFPG_PreviewSpanCache>;
+        int prefixIndex;
+        for (prefixIndex = 0; prefixIndex < LFPG_MAX_WAYPOINTS; prefixIndex = prefixIndex + 1)
+        {
+            m_PrefixSpanCaches.Insert(new LFPG_PreviewSpanCache());
+        }
+        m_PrefixCacheValid = false;
+        m_PrefixWaypointCount = -1;
     }
 
     static LFPG_WiringClient Get()
@@ -112,9 +146,42 @@ class LFPG_WiringClient
     {
         if (s_Instance)
         {
-            delete s_Instance;
+            s_Instance.CleanupInstance();
             s_Instance = null;
         }
+    }
+
+    protected void CleanupInstance()
+    {
+        m_Active = false;
+        m_SrcDeviceId = "";
+        m_SrcLow = 0;
+        m_SrcHigh = 0;
+        m_SrcPort = "";
+        m_SrcPortDir = 0;
+        if (m_Waypoints)
+            m_Waypoints.Clear();
+        if (m_PreviewPts)
+            m_PreviewPts.Clear();
+        if (m_SagPts)
+            m_SagPts.Clear();
+        if (m_PreviewScreenPts)
+            m_PreviewScreenPts.Clear();
+        m_FrameCounter = 0;
+        m_LastPreConnectStatus = LFPG_PreConnectStatus.NO_TARGET;
+        m_LastPreConnectReason = "";
+        m_SessionStartMs = 0.0;
+        m_LastFinishMs = 0.0;
+        m_ClipA = "0 0 0";
+        m_ClipB = "0 0 0";
+        m_PreConnectParams = null;
+        m_PreConnectResult = null;
+        if (m_PreviewPrefixPts)
+            m_PreviewPrefixPts.Clear();
+        if (m_PrefixSpanCaches)
+            m_PrefixSpanCaches.Clear();
+        m_PrefixCacheValid = false;
+        s_LastSyncRequestMs = -99999.0;
     }
 
     // ---- Public API ----
@@ -172,6 +239,7 @@ class LFPG_WiringClient
         }
 
         m_Waypoints.Insert(pos);
+        m_PrefixCacheValid = false;
         LFPG_Util.Info("[WiringClient] WP #" + m_Waypoints.Count().ToString() + " at " + pos.ToString());
     }
 
@@ -209,6 +277,7 @@ class LFPG_WiringClient
         m_SessionStartMs = g_Game.GetTime();
 
         m_Waypoints.Clear();
+        m_PrefixCacheValid = false;
 
         RequestFullSync();
 
@@ -358,6 +427,7 @@ class LFPG_WiringClient
         m_SrcPort     = "";
         m_SrcPortDir  = -1;
         m_Waypoints.Clear();
+        m_PrefixCacheValid = false;
         m_LastPreConnectStatus = LFPG_PreConnectStatus.NO_TARGET;
         m_LastPreConnectReason = "";
         m_SessionStartMs = 0.0;
@@ -463,6 +533,85 @@ class LFPG_WiringClient
     // v0.7.38 (H1): Cohen-Sutherland moved to LFPG_WorldUtil.ClipSegToScreen
     // (shared with CableRenderer).
 
+    protected void BuildPreviewSag(vector spanA, vector spanB, array<vector> output)
+    {
+        output.Clear();
+        output.Insert(spanA);
+        float rawDist = vector.Distance(spanA, spanB);
+        int subs = LFPG_CableRenderer.GetAdaptiveSubs(rawDist);
+        if (subs > 5)
+        {
+            subs = 5;
+        }
+        if (subs > 0)
+        {
+            float sagAmount = LFPG_CableRenderer.GetSagAmount(rawDist);
+            int sub;
+            for (sub = 1; sub <= subs; sub = sub + 1)
+            {
+                float t = sub / (subs + 1.0);
+                vector lerp = spanA + (spanB - spanA) * t;
+                float sag = sagAmount * 4.0 * t * (1.0 - t);
+                lerp[1] = lerp[1] - sag;
+                lerp = LFPG_WorldUtil.ClampAboveSurface(lerp, LFPG_SURFACE_CLAMP_M);
+                output.Insert(lerp);
+            }
+        }
+        output.Insert(spanB);
+    }
+
+    protected void EnsurePrefixCache(vector startPos)
+    {
+        int waypointCount = m_Waypoints.Count();
+        bool cacheMatches = m_PrefixCacheValid;
+        if (cacheMatches && waypointCount != m_PrefixWaypointCount)
+        {
+            cacheMatches = false;
+        }
+        if (cacheMatches && (startPos[0] != m_PrefixStartPos[0] || startPos[1] != m_PrefixStartPos[1] || startPos[2] != m_PrefixStartPos[2]))
+        {
+            cacheMatches = false;
+        }
+        if (cacheMatches)
+            return;
+
+        m_PreviewPrefixPts.Clear();
+        m_PreviewPrefixPts.Insert(LFPG_WorldUtil.ClampAboveSurface(startPos));
+        m_PrefixTotalLen = 0.0;
+        m_PrefixRenderTotalLen = 0.0;
+        m_PrefixMaxSegLen = 0.0;
+        vector validationPrev = startPos;
+
+        int w;
+        for (w = 0; w < waypointCount; w = w + 1)
+        {
+            vector waypoint = m_Waypoints[w];
+            float validationLen = vector.Distance(validationPrev, waypoint);
+            m_PrefixTotalLen = m_PrefixTotalLen + validationLen;
+            if (validationLen > m_PrefixMaxSegLen)
+            {
+                m_PrefixMaxSegLen = validationLen;
+            }
+            validationPrev = waypoint;
+            m_PreviewPrefixPts.Insert(LFPG_WorldUtil.ClampAboveSurface(waypoint, LFPG_SURFACE_CLAMP_M));
+        }
+
+        int fixedSpanCount = m_PreviewPrefixPts.Count() - 1;
+        for (w = 0; w < fixedSpanCount; w = w + 1)
+        {
+            LFPG_PreviewSpanCache spanCache = m_PrefixSpanCaches[w];
+            vector spanA = m_PreviewPrefixPts[w];
+            vector spanB = m_PreviewPrefixPts[w + 1];
+            spanCache.rawDistance = vector.Distance(spanA, spanB);
+            m_PrefixRenderTotalLen = m_PrefixRenderTotalLen + spanCache.rawDistance;
+            BuildPreviewSag(spanA, spanB, spanCache.points);
+        }
+
+        m_PrefixStartPos = startPos;
+        m_PrefixWaypointCount = waypointCount;
+        m_PrefixCacheValid = true;
+    }
+
     protected void DrawPreviewFrame()
     {
         if (g_Game.IsDedicatedServer())
@@ -476,7 +625,7 @@ class LFPG_WiringClient
             m_FrameCounter = 0;
         }
 
-        bool doLog = (m_FrameCounter % 300 == 1);
+        bool doLog = (LFPG_DIAG_ENABLED && m_FrameCounter % 300 == 1);
 
         if (doLog)
         {
@@ -509,6 +658,7 @@ class LFPG_WiringClient
                 LFPG_Diag.ServerEcho("[Preview] SKIP: startPos NaN");
             return;
         }
+        EnsurePrefixCache(startPos);
 
         // ---------- Cursor hit ----------
         vector cursorPos;
@@ -582,7 +732,7 @@ class LFPG_WiringClient
         m_PreConnectParams.startPos = startPos;
         m_PreConnectParams.endPos = cursorPos;
 
-        LFPG_PreConnectResult preResult = LFPG_ConnectionRules.CanPreConnect(m_PreConnectParams);
+        LFPG_PreConnectResult preResult = LFPG_ConnectionRules.CanPreConnect(m_PreConnectParams, m_PreConnectResult, m_PrefixTotalLen, m_PrefixMaxSegLen);
 
         m_LastPreConnectStatus = preResult.m_Status;
         m_LastPreConnectReason = preResult.m_Reason;
@@ -599,14 +749,13 @@ class LFPG_WiringClient
         // ---------- Build raw point chain ----------
         // v0.7.9: Terrain clamping applied to all points (matches committed cable).
         m_PreviewPts.Clear();
-        m_PreviewPts.Insert(LFPG_WorldUtil.ClampAboveSurface(startPos));
+        int prefixPoint;
+        for (prefixPoint = 0; prefixPoint < m_PreviewPrefixPts.Count(); prefixPoint = prefixPoint + 1)
+        {
+            m_PreviewPts.Insert(m_PreviewPrefixPts[prefixPoint]);
+        }
 
         int wpCount = m_Waypoints.Count();
-        int w;
-        for (w = 0; w < wpCount; w = w + 1)
-        {
-            m_PreviewPts.Insert(LFPG_WorldUtil.ClampAboveSurface(m_Waypoints[w], LFPG_SURFACE_CLAMP_M));
-        }
         m_PreviewPts.Insert(LFPG_WorldUtil.ClampAboveSurface(cursorPos, LFPG_SURFACE_CLAMP_M));
 
         // ---------- Draw with catenaria sag (v0.7.10: screen-space) ----------
@@ -647,11 +796,10 @@ class LFPG_WiringClient
 
         // v0.7.9: compute total wire length for color feedback.
         int rawSegCount = m_PreviewPts.Count() - 1;
-        float totalWireLen = 0.0;
-        int ts;
-        for (ts = 0; ts < rawSegCount; ts = ts + 1)
+        float totalWireLen = m_PrefixRenderTotalLen;
+        if (rawSegCount > 0)
         {
-            totalWireLen = totalWireLen + vector.Distance(m_PreviewPts[ts], m_PreviewPts[ts + 1]);
+            totalWireLen = totalWireLen + vector.Distance(m_PreviewPts[rawSegCount - 1], m_PreviewPts[rawSegCount]);
         }
         bool totalExceedsLimit = (totalWireLen > LFPG_MAX_WIRE_LEN_M);
 
@@ -663,7 +811,18 @@ class LFPG_WiringClient
         {
             vector spanA = m_PreviewPts[s];
             vector spanB = m_PreviewPts[s + 1];
-            float rawDist = vector.Distance(spanA, spanB);
+            bool fixedPrefixSpan = (s < rawSegCount - 1);
+            LFPG_PreviewSpanCache fixedSpanCache = null;
+            float rawDist = 0.0;
+            if (fixedPrefixSpan)
+            {
+                fixedSpanCache = m_PrefixSpanCaches[s];
+                rawDist = fixedSpanCache.rawDistance;
+            }
+            else
+            {
+                rawDist = vector.Distance(spanA, spanB);
+            }
 
             // v0.7.12: Color selection — semáforo global override vs per-segment length
             int color;
@@ -695,39 +854,19 @@ class LFPG_WiringClient
                 }
             }
 
-            // Compute adaptive sag for this span
-            int subs = LFPG_CableRenderer.GetAdaptiveSubs(rawDist);
-
-            // v0.7.10: Cap preview subdivisions to limit per-frame cost.
-            if (subs > 5)
+            // Reuse cached world-space catenary for the fixed prefix.
+            array<vector> spanSagPts = m_SagPts;
+            if (fixedPrefixSpan)
             {
-                subs = 5;
+                spanSagPts = fixedSpanCache.points;
+            }
+            else
+            {
+                BuildPreviewSag(spanA, spanB, m_SagPts);
             }
 
-            // Build point list for this span (either with sag or direct)
-            m_SagPts.Clear();
-            m_SagPts.Insert(spanA);
-
-            if (subs > 0)
-            {
-                float sagAmount = LFPG_CableRenderer.GetSagAmount(rawDist);
-
-                int sub;
-                for (sub = 1; sub <= subs; sub = sub + 1)
-                {
-                    float t = sub / (subs + 1.0);
-                    vector lerp = spanA + (spanB - spanA) * t;
-                    float sag = sagAmount * 4.0 * t * (1.0 - t);
-                    lerp[1] = lerp[1] - sag;
-                    lerp = LFPG_WorldUtil.ClampAboveSurface(lerp, LFPG_SURFACE_CLAMP_M);
-                    m_SagPts.Insert(lerp);
-                }
-            }
-
-            m_SagPts.Insert(spanB);
-
-            // Project all points for this span ONCE
-            int sagCount = m_SagPts.Count();
+            // Projection remains camera-dependent and runs each frame.
+            int sagCount = spanSagPts.Count();
             m_PreviewScreenPts.Clear();
             int pp;
             for (pp = 0; pp < sagCount; pp = pp + 1)
@@ -735,7 +874,7 @@ class LFPG_WiringClient
                 // v0.8.x: Degenerate projection guard (same as CableRenderer Phase 1).
                 // Mark extreme projections by zeroing z so the behindA/behindB
                 // check downstream skips them naturally.
-                vector prvScr = g_Game.GetScreenPos(m_SagPts[pp]);
+                vector prvScr = g_Game.GetScreenPos(spanSagPts[pp]);
                 if (prvScr[2] > LFPG_BEHIND_CAM_Z)
                 {
                     float absPX = prvScr[0];
@@ -954,3 +1093,4 @@ class LFPG_WiringClient
         return true;
     }
 };
+#endif

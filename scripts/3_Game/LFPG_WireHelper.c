@@ -22,6 +22,8 @@
 
 class LFPG_WireHelper
 {
+    // Canonical empty wire payload, generated once by the serializer.
+    protected static string s_EmptyWiresJSON;
     // ===========================
     // Wire validation (v0.7.15, Sprint 3 P2)
     // ===========================
@@ -224,6 +226,16 @@ class LFPG_WireHelper
         return changed;
     }
 
+    // Player-cut policy: unrestricted when enabled; otherwise own + unclaimed.
+    static bool CanCreatorCutWire(LFPG_WireData wire, string creatorId, bool allowOthers)
+    {
+        if (!wire || creatorId == "")
+            return false;
+        if (allowOthers)
+            return true;
+        return wire.m_CreatorId == "" || wire.m_CreatorId == creatorId;
+    }
+
     // Remove wires whose targets are not in the provided set of valid IDs.
     // Caller (4_World) builds validIds from DeviceRegistry, keeping
     // WireHelper independent of 4_World classes.
@@ -260,21 +272,40 @@ class LFPG_WireHelper
         return changed;
     }
 
+    // Initialize once through the same serializer used for non-empty stores so
+    // persistence output remains byte-identical.
+    protected static string GetEmptyWiresJSON()
+    {
+        if (s_EmptyWiresJSON == "")
+        {
+            LFPG_PersistBlob emptyBlob = new LFPG_PersistBlob();
+            string emptyErr;
+            if (!JsonFileLoader<LFPG_PersistBlob>.MakeData(emptyBlob, s_EmptyWiresJSON, emptyErr, false))
+            {
+                s_EmptyWiresJSON = "";
+            }
+        }
+        return s_EmptyWiresJSON;
+    }
+
     // Serialize wire array to JSON string.
     static void SerializeJSON(array<ref LFPG_WireData> wires, out string jsonOut)
     {
         jsonOut = "";
 
+        if (!wires || wires.Count() == 0)
+        {
+            jsonOut = GetEmptyWiresJSON();
+            return;
+        }
+
         LFPG_PersistBlob blob = new LFPG_PersistBlob();
         blob.ver = LFPG_PERSIST_VER;
 
-        if (wires)
+        int i;
+        for (i = 0; i < wires.Count(); i = i + 1)
         {
-            int i;
-            for (i = 0; i < wires.Count(); i = i + 1)
-            {
-                blob.wires.Insert(wires[i]);
-            }
+            blob.wires.Insert(wires[i]);
         }
 
         string err;

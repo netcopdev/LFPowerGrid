@@ -157,6 +157,12 @@ class LFPG_ActionDismantleDevice : ActionContinuousBase
             return;
         }
 
+        if (!device.LFPG_TryBeginExclusiveOp())
+        {
+            player.MessageStatus("[LFPG] Dismantle aborted: target is already being modified.");
+            return;
+        }
+
         string kitClass = device.LFPG_GetKitClassname();
         string deviceType = device.GetType();
         string deviceId = device.LFPG_GetDeviceId();
@@ -175,6 +181,7 @@ class LFPG_ActionDismantleDevice : ActionContinuousBase
             failLog = failLog + " at ";
             failLog = failLog + playerPos.ToString();
             LFPG_Util.Error(failLog);
+            device.LFPG_EndExclusiveOp();
             return;
         }
 

@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - cable segment data (v0.7.11)
 //
@@ -57,3 +59,4 @@ class LFPG_CableParticle
         Destroy();
     }
 };
+#endif

@@ -53,10 +53,29 @@ modded class Hologram
     // Below this, the normal is nearly vertical (edge geometry hit)
     // and Atan2 becomes unstable => fall back to camera direction.
     static const float LFPG_HOLO_MIN_HORIZ_NORMAL = 0.2;
+    static const float LFPG_HOLO_GROUND_CACHE_MOVE_SQ = 0.0025;
+    static const float LFPG_HOLO_GROUND_CACHE_TTL_MS = 100.0;
+    static const int LFPG_HOLO_SURFACE_MISS = 1;
+    static const int LFPG_HOLO_SURFACE_SKY = 2;
+    static const int LFPG_HOLO_SURFACE_CEILING_FALLBACK = 3;
+    static const int LFPG_HOLO_SURFACE_WALL_FALLBACK = 4;
+
+    // Surface classes reported by the placement diagnostics.
+    static const int LFPG_HOLO_CLASS_FLOOR   = 10;
+    static const int LFPG_HOLO_CLASS_WALL    = 11;
+    static const int LFPG_HOLO_CLASS_CEILING = 12;
+
+    // Camera vertical-direction gates. LOOK_UP_SKY mirrors the vanilla
+    // LOOKING_TO_SKY constant: above it the ray flies into the sky and hits
+    // nothing. LOOK_DOWN_WALL_ENTER shared the same 0.75 literal but plays a
+    // different role - it is the wall-enter threshold forced while the camera
+    // points below LOOK_DOWN_GUARD.
+    static const float LFPG_HOLO_LOOK_UP_SKY          = 0.75;
+    static const float LFPG_HOLO_LOOK_DOWN_GUARD      = -0.65;
+    static const float LFPG_HOLO_LOOK_DOWN_WALL_ENTER = 0.75;
 
     // ---- State ----
     protected bool m_LFPG_IsWallMode;
-    protected bool m_LFPG_IsLFPGKit;
 
     // Cached kit reference: set once per frame in UpdateHologram,
     // used by all helpers to avoid redundant Cast calls (~8x/frame).
@@ -70,6 +89,16 @@ modded class Hologram
     // Hysteresis: tracks whether we were in wall mode last frame
     protected bool m_LFPG_WasWallMode;
 
+    // Diagnostics: last surface class written to the log (-1 = none yet).
+    protected int m_LFPG_LastLoggedClass;
+
+    // Secondary vertical-ray cache (per hologram instance).
+    protected bool m_LFPG_GroundCacheValid;
+    protected vector m_LFPG_GroundCacheInput;
+    protected vector m_LFPG_GroundCacheResult;
+    protected int m_LFPG_GroundCacheSurfaceClass;
+    protected float m_LFPG_GroundCacheTimeMs;
+
     // ============================================
     // Constructor: safety-clear hologram flag (v4.4)
     // Base Hologram() runs first (incl. CreateObjectEx at line 114).
@@ -79,6 +108,7 @@ modded class Hologram
     void Hologram(PlayerBase player, vector pos, ItemBase item)
     {
         LFPG_DeviceBase.LFPG_ClearHologramFlag();
+        m_LFPG_LastLoggedClass = -1;
     }
 
     // ============================================
@@ -372,7 +402,6 @@ modded class Hologram
     override void UpdateHologram(float timeslice)
     {
         EntityAI projection = GetProjectionEntity();
-        m_LFPG_IsLFPGKit = false;
         m_LFPG_IsWallMode = false;
         m_LFPG_CachedSameKit = null;
 
@@ -407,8 +436,6 @@ modded class Hologram
         if (!GetUpdatePosition())
             return;
 
-        m_LFPG_IsLFPGKit = true;
-
         // Cache the LFPG_KitBase cast once per frame.
         // All helpers read from this instead of re-casting (~8x/frame).
         // For diff-model kits, projection is the deployed model (not a kit)
@@ -433,10 +460,9 @@ modded class Hologram
         // When looking nearly straight up, camera ray goes into sky and misses
         // everything, causing hologram to jump to max range. Use ground-snap
         // at player position instead.
-        float lookUpThreshold = 0.75;
-        if (camDir[1] > lookUpThreshold)
+        if (camDir[1] > LFPG_HOLO_LOOK_UP_SKY)
         {
-            vector skyFallbackPos = LFPG_GroundSnap(player.GetPosition());
+            vector skyFallbackPos = LFPG_GroundSnap(player.GetPosition(), LFPG_HOLO_SURFACE_SKY);
             vector skyFallbackOri = LFPG_CalcFloorOrientation();
             LFPG_ApplySmoothed(skyFallbackPos, skyFallbackOri, timeslice, projection);
             return;
@@ -466,7 +492,7 @@ modded class Hologram
         {
             // No surface hit - project to max range and ground-snap
             vector noHitPoint = camPos + (camDir * LFPG_HOLO_MAX_RANGE);
-            vector noHitGroundPos = LFPG_GroundSnap(noHitPoint);
+            vector noHitGroundPos = LFPG_GroundSnap(noHitPoint, LFPG_HOLO_SURFACE_MISS);
             vector noHitOri = LFPG_CalcFloorOrientation();
 
             LFPG_ApplySmoothed(noHitGroundPos, noHitOri, timeslice, projection);
@@ -494,22 +520,21 @@ modded class Hologram
             ceilThreshold = LFPG_HOLO_EXIT_WALL_THRESHOLD;
         }
 
-        // FIX: Looking-down guard. When camera points steeply downward
-        // (camDir[1] < -0.65), the ray can clip vertical edges of
-        // floor geometry (curbs, stairs, foundations) whose horizontal
-        // normal falsely triggers wall mode. Raise the wall-enter
-        // threshold so only clearly vertical surfaces activate it.
-        float lookDownLimit = -0.65;
-        if (camDir[1] < lookDownLimit)
+        // Looking-down guard. Raising the threshold makes FLOOR require a more
+        // horizontal normal, so surfaces between the base threshold and this one
+        // are classified WALL instead of FLOOR while the camera points steeply
+        // down. Note this is the opposite of suppressing curb/stair edges: a
+        // vertical edge has normalY ~= 0 and stays WALL at any positive
+        // threshold. Redesign pending on in-game classification data.
+        if (camDir[1] < LFPG_HOLO_LOOK_DOWN_GUARD)
         {
-            float raisedThreshold = 0.75;
-            if (floorThreshold < raisedThreshold)
+            if (floorThreshold < LFPG_HOLO_LOOK_DOWN_WALL_ENTER)
             {
-                floorThreshold = raisedThreshold;
+                floorThreshold = LFPG_HOLO_LOOK_DOWN_WALL_ENTER;
             }
-            if (ceilThreshold < raisedThreshold)
+            if (ceilThreshold < LFPG_HOLO_LOOK_DOWN_WALL_ENTER)
             {
-                ceilThreshold = raisedThreshold;
+                ceilThreshold = LFPG_HOLO_LOOK_DOWN_WALL_ENTER;
             }
         }
 
@@ -519,25 +544,12 @@ modded class Hologram
         if (rawNormalY >= floorThreshold)
         {
             m_LFPG_WasWallMode = false;
+            LFPG_LogSurfaceClass(LFPG_HOLO_CLASS_FLOOR, "FLOOR", rawNormalY, camDir[1], floorThreshold, hitPos);
 
-            // Camera-based floor position.
-            // When normal is nearly vertical (normalY > 0.9), the camera
-            // ray hit a flat floor directly - hitPos Y is already accurate.
-            // Skip the expensive ground-snap raycast in that case.
-            vector floorPos;
-            float flatFloorThreshold = 0.9;
+            // The primary hit already carries the position for both flat floor
+            // and slope, so one expression covers both.
             float kitFloorY = LFPG_GetKitFloorYOffset();
-            if (rawNormalY > flatFloorThreshold)
-            {
-                // Pure flat floor: use hitPos directly with small Y offset
-                floorPos = Vector(hitPos[0], hitPos[1] + kitFloorY, hitPos[2]);
-            }
-            else
-            {
-                // Angled floor (ramp/slope): ground-snap for precision
-                floorPos = LFPG_GroundSnap(hitPos);
-                floorPos = Vector(floorPos[0], floorPos[1] + kitFloorY - LFPG_HOLO_FLOOR_GROUND_SNAP, floorPos[2]);
-            }
+            vector floorPos = Vector(hitPos[0], hitPos[1] + kitFloorY, hitPos[2]);
 
             // Orientation: adapt to terrain normal for floor-hugging kits
             vector floorOri;
@@ -571,7 +583,7 @@ modded class Hologram
             {
                 // Kit doesn't support ceiling: ground-snap below hit point
                 m_LFPG_WasWallMode = false;
-                vector ceilFallPos = LFPG_GroundSnap(hitPos);
+                vector ceilFallPos = LFPG_GroundSnap(hitPos, LFPG_HOLO_SURFACE_CEILING_FALLBACK);
                 vector ceilFallOri = LFPG_CalcFloorOrientation();
                 LFPG_ApplySmoothed(ceilFallPos, ceilFallOri, timeslice, projection);
                 return;
@@ -579,6 +591,7 @@ modded class Hologram
 
             m_LFPG_IsWallMode = true;
             m_LFPG_WasWallMode = true;
+            LFPG_LogSurfaceClass(LFPG_HOLO_CLASS_CEILING, "CEILING", rawNormalY, camDir[1], ceilThreshold, hitPos);
 
             // Position: surface + small offset along normal
             vector ceilPos = hitPos + (hitNormal * LFPG_HOLO_SURFACE_OFFSET);
@@ -605,7 +618,7 @@ modded class Hologram
         if (placementModes < 1)
         {
             m_LFPG_WasWallMode = false;
-            vector wallFallPos = LFPG_GroundSnap(hitPos);
+            vector wallFallPos = LFPG_GroundSnap(hitPos, LFPG_HOLO_SURFACE_WALL_FALLBACK);
             vector wallFallOri = LFPG_CalcFloorOrientation();
 
             if (LFPG_IsDifferentModelKit())
@@ -619,6 +632,7 @@ modded class Hologram
 
         m_LFPG_IsWallMode = true;
         m_LFPG_WasWallMode = true;
+        LFPG_LogSurfaceClass(LFPG_HOLO_CLASS_WALL, "WALL", rawNormalY, camDir[1], floorThreshold, hitPos);
 
         // Position: hit point + per-kit offset along surface normal (away from wall)
         float wallSurfOff = LFPG_GetKitWallSurfaceOffset();
@@ -658,6 +672,33 @@ modded class Hologram
         vector wallOri = Vector(wallYaw, wallPitchOff, wallRollOff);
 
         LFPG_ApplySmoothed(wallPos, wallOri, timeslice, projection);
+    }
+
+    // ============================================
+    // Helper: report the surface classification once per transition.
+    // Placement bug reports need the normalY and camera pitch of the frame
+    // that chose the mode; per-frame logging would flood the RPT.
+    // ============================================
+    protected void LFPG_LogSurfaceClass(int surfClass, string label, float normalY, float camPitch, float threshold, vector hitPos)
+    {
+        #ifndef SERVER
+        if (surfClass == m_LFPG_LastLoggedClass)
+            return;
+
+        m_LFPG_LastLoggedClass = surfClass;
+
+        string diag = "[Holo] class=";
+        diag = diag + label;
+        diag = diag + " normalY=";
+        diag = diag + normalY.ToString();
+        diag = diag + " camPitch=";
+        diag = diag + camPitch.ToString();
+        diag = diag + " threshold=";
+        diag = diag + threshold.ToString();
+        diag = diag + " hit=";
+        diag = diag + hitPos.ToString();
+        LFPG_Util.Debug(diag);
+        #endif
     }
 
     // ============================================
@@ -701,8 +742,20 @@ modded class Hologram
     // Helper: Ground-snap a position
     // Casts a vertical ray down from given point.
     // ============================================
-    protected vector LFPG_GroundSnap(vector pos)
+    protected vector LFPG_GroundSnap(vector pos, int surfaceClass)
     {
+        float cacheDx = pos[0] - m_LFPG_GroundCacheInput[0];
+        float cacheDy = pos[1] - m_LFPG_GroundCacheInput[1];
+        float cacheDz = pos[2] - m_LFPG_GroundCacheInput[2];
+        float cacheMoveSq = cacheDx * cacheDx + cacheDy * cacheDy + cacheDz * cacheDz;
+        float nowMs = g_Game.GetTime();
+        bool cacheFresh = (nowMs - m_LFPG_GroundCacheTimeMs <= LFPG_HOLO_GROUND_CACHE_TTL_MS);
+        if (m_LFPG_GroundCacheValid && cacheFresh && surfaceClass == m_LFPG_GroundCacheSurfaceClass && cacheMoveSq <= LFPG_HOLO_GROUND_CACHE_MOVE_SQ)
+        {
+            vector cachedPose = Vector(pos[0], m_LFPG_GroundCacheResult[1], pos[2]);
+            return cachedPose;
+        }
+
         vector rayFrom = Vector(pos[0], pos[1] + LFPG_HOLO_GROUND_RAY_UP, pos[2]);
         vector rayTo   = Vector(pos[0], pos[1] - LFPG_HOLO_GROUND_RAY_DOWN, pos[2]);
 
@@ -725,12 +778,22 @@ modded class Hologram
         if (groundHit)
         {
             vector snapped = Vector(groundHitPos[0], groundHitPos[1] + LFPG_HOLO_FLOOR_GROUND_SNAP, groundHitPos[2]);
+            m_LFPG_GroundCacheInput = pos;
+            m_LFPG_GroundCacheResult = snapped;
+            m_LFPG_GroundCacheSurfaceClass = surfaceClass;
+            m_LFPG_GroundCacheTimeMs = nowMs;
+            m_LFPG_GroundCacheValid = true;
             return snapped;
         }
 
         // Fallback: use engine surface Y
         float surfaceY = g_Game.SurfaceY(pos[0], pos[2]);
         vector fallback = Vector(pos[0], surfaceY + LFPG_HOLO_FLOOR_GROUND_SNAP, pos[2]);
+        m_LFPG_GroundCacheInput = pos;
+        m_LFPG_GroundCacheResult = fallback;
+        m_LFPG_GroundCacheSurfaceClass = surfaceClass;
+        m_LFPG_GroundCacheTimeMs = nowMs;
+        m_LFPG_GroundCacheValid = true;
         return fallback;
     }
 

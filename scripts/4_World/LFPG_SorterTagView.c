@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — Sorter Tag Chip (Dabs MVC prefab, v2.6)
 //
@@ -133,3 +135,4 @@ class LFPG_SorterTagView extends ScriptView
         }
     }
 };
+#endif

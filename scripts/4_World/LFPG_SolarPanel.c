@@ -98,11 +98,6 @@ class LFPG_SolarPanel : LFPG_WireOwnerBase
     override void LFPG_SetPowered(bool powered) {}
     override bool LFPG_IsPowered() { return m_SourceOn; }
 
-    bool LFPG_GetSwitchState()
-    {
-        return m_SourceOn;
-    }
-
     // ---- Sun state (called by NM centralized timer) ----
     void LFPG_UpdateSunState(bool hasSun)
     {

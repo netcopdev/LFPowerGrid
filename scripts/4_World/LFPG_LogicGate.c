@@ -15,7 +15,7 @@
 static const string LFPG_GATE_RVMAT_OFF   = "\LFPowerGrid\data\button\materials\led_off.rvmat";
 static const string LFPG_GATE_RVMAT_GREEN  = "\LFPowerGrid\data\button\materials\led_green.rvmat";
 static const string LFPG_GATE_RVMAT_RED    = "\LFPowerGrid\data\button\materials\led_red.rvmat";
-static const float  LFPG_GATE_CAPACITY     = 20.0;
+static const float  LFPG_GATE_CAPACITY     = 100.0;
 
 class LFPG_LogicGate_Kit : LFPG_KitBase
 {
@@ -175,19 +175,24 @@ class LFPG_LogicGateBase : LFPG_WireOwnerBase
             nm.RequestPropagate(m_DeviceId);
         }
 
-        string dbgLog = "[LogicGate] SetPowered(";
-        dbgLog = dbgLog + powered.ToString();
-        dbgLog = dbgLog + ") in0=";
-        dbgLog = dbgLog + newIn0.ToString();
-        dbgLog = dbgLog + " in1=";
-        dbgLog = dbgLog + newIn1.ToString();
-        dbgLog = dbgLog + " gate=";
-        dbgLog = dbgLog + m_GateOpen.ToString();
-        dbgLog = dbgLog + " id=";
-        dbgLog = dbgLog + m_DeviceId;
-        dbgLog = dbgLog + " type=";
-        dbgLog = dbgLog + GetType();
-        LFPG_Util.Debug(dbgLog);
+        // Gated so the multi-part string (incl. GetType()) is not built when logging is
+        // below Debug (2). Behavior-identical to the prior unconditional call.
+        if (LFPG_LOG_LEVEL >= 2)
+        {
+            string dbgLog = "[LogicGate] SetPowered(";
+            dbgLog = dbgLog + powered.ToString();
+            dbgLog = dbgLog + ") in0=";
+            dbgLog = dbgLog + newIn0.ToString();
+            dbgLog = dbgLog + " in1=";
+            dbgLog = dbgLog + newIn1.ToString();
+            dbgLog = dbgLog + " gate=";
+            dbgLog = dbgLog + m_GateOpen.ToString();
+            dbgLog = dbgLog + " id=";
+            dbgLog = dbgLog + m_DeviceId;
+            dbgLog = dbgLog + " type=";
+            dbgLog = dbgLog + GetType();
+            LFPG_Util.Debug(dbgLog);
+        }
         #endif
     }
 

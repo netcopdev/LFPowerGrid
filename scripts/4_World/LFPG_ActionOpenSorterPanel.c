@@ -48,8 +48,12 @@ class LFPG_ActionOpenSorterPanel : ActionInteractBase
         if (!targetObj)
             return false;
 
+        // Sprint 0 (2026-04-26): exact-type guard so this V3 action is
+        // invisible on V4 entities (LFPG_Sorter_TEST, subclass of V3).
+        // V4 has its own LFPG_ActionOpenSorterPanel_TEST. Without this,
+        // IsKindOf would match V4 instances and both actions would show.
         string sorterType = "LFPG_Sorter";
-        if (!targetObj.IsKindOf(sorterType))
+        if (targetObj.GetType() != sorterType)
             return false;
 
         LFPG_Sorter sorter = LFPG_Sorter.Cast(targetObj);
@@ -65,8 +69,10 @@ class LFPG_ActionOpenSorterPanel : ActionInteractBase
             return false;
 
         // Don't open if UI is already showing
+#ifndef SERVER
         if (LFPG_SorterView.IsOpen())
             return false;
+#endif
 
         // v2.4 Bug B: Only show if container is linked
         if (!sorter.LFPG_IsLinked())
@@ -88,8 +94,9 @@ class LFPG_ActionOpenSorterPanel : ActionInteractBase
         if (!targetObj)
             return;
 
+        // Sprint 0 (2026-04-26): exact-type guard — see ActionCondition.
         string checkType = "LFPG_Sorter";
-        if (!targetObj.IsKindOf(checkType))
+        if (targetObj.GetType() != checkType)
             return;
 
         int netLow  = 0;

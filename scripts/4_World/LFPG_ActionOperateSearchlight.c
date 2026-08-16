@@ -56,18 +56,22 @@ class LFPG_ActionOperateSearchlight : ActionInteractBase
             return false;
 
         // Block if CCTV viewport is active
+#ifndef SERVER
         LFPG_CameraViewport vp = LFPG_CameraViewport.Get();
         if (vp && vp.IsActive())
             return false;
+#endif
 
         // v4.1: Exit is handled by SearchlightController.Tick() via
         // direct F-key (UAAction) detection. The action system only
         // handles ENTER. If the controller is active (any searchlight),
         // block this action entirely to prevent a race where Tick exits
         // and this action re-enters on the same F press.
+#ifndef SERVER
         LFPG_SearchlightController ctrl = LFPG_SearchlightController.Get();
         if (ctrl && ctrl.IsActive())
             return false;
+#endif
 
         m_Text = "#STR_LFPG_ACTION_OPERATE_SEARCHLIGHT";
 
@@ -90,6 +94,7 @@ class LFPG_ActionOperateSearchlight : ActionInteractBase
             return;
 
         // Toggle: if already operating, release; otherwise request enter
+#ifndef SERVER
         LFPG_SearchlightController ctrl = LFPG_SearchlightController.Get();
         if (ctrl && ctrl.IsOperatingEntity(sl))
         {
@@ -97,6 +102,7 @@ class LFPG_ActionOperateSearchlight : ActionInteractBase
             ctrl.RequestExit();
             return;
         }
+#endif
 
         // Request enter via RPC
         int netLow  = 0;

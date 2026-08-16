@@ -229,11 +229,13 @@ class LFPG_SorterLogic
         string kFence = "Fence";
         string kDoors1 = "Doors1";
 
-        // Barrel_ColorBase: "Doors" animation, phase 0=closed, 1=open
+        // Barrel_ColorBase: use real Openable state (visual animation is "Lid").
         if (container.IsKindOf(kBarrel))
         {
-            phase = container.GetAnimationPhase(kDoors);
-            if (phase < 0.5)
+            Barrel_ColorBase barrel = Barrel_ColorBase.Cast(container);
+            if (!barrel)
+                return true;
+            if (!barrel.IsOpen())
                 return true;
         }
 
@@ -344,6 +346,124 @@ class LFPG_SorterLogic
         return -1;
     }
 
+    // Budgeted variant for the periodic scheduler. The cursor identifies the
+    // next rule that has not yet been checked, so exhaustion defers work.
+    static int EvaluateItemBudgeted(EntityAI item, LFPG_SortConfig config, int hasWireMask, int startOutput, int startRule, int budgetRemaining, out int nextOutput, out int nextRule, out int ruleChecks, out int configMisses, out bool deferred)
+    {
+        int oi;
+        int ri;
+        int ruleCount;
+        int bitCheck;
+        int ruleCost;
+        int configCallCost;
+        int totalSpent;
+        LFPG_SortOutputConfig outputConfig;
+        LFPG_SortFilterRule filterRule;
+        bool dimensionCached;
+
+        nextOutput = 0;
+        nextRule = 0;
+        ruleChecks = 0;
+        configMisses = 0;
+        deferred = false;
+
+        if (!item)
+            return -1;
+        if (!config)
+            return -1;
+        if (budgetRemaining <= 0)
+        {
+            nextOutput = startOutput;
+            nextRule = startRule;
+            deferred = true;
+            return -1;
+        }
+        if (startOutput < 0)
+            startOutput = 0;
+        if (startOutput > 5)
+            startOutput = 5;
+        if (startRule < 0)
+            startRule = 0;
+
+        for (oi = startOutput; oi < 6; oi = oi + 1)
+        {
+            bitCheck = 1 << oi;
+            if ((hasWireMask & bitCheck) == 0)
+                continue;
+
+            outputConfig = config.GetOutput(oi);
+            if (!outputConfig)
+                continue;
+            if (outputConfig.m_IsCatchAll)
+                continue;
+            if (!outputConfig.m_Rules)
+                continue;
+
+            ruleCount = outputConfig.m_Rules.Count();
+            ri = 0;
+            if (oi == startOutput)
+                ri = startRule;
+            if (ri > ruleCount)
+                ri = ruleCount;
+
+            while (ri < ruleCount)
+            {
+                filterRule = outputConfig.m_Rules[ri];
+                if (!filterRule)
+                {
+                    ri = ri + 1;
+                    continue;
+                }
+
+                ruleCost = 1;
+                configCallCost = 0;
+                dimensionCached = true;
+                if (filterRule.m_Type == LFPG_SORT_FILTER_SLOT)
+                {
+                    dimensionCached = IsItemDimensionsCached(item);
+                    if (!dimensionCached)
+                        configCallCost = 3;
+                }
+                if (filterRule.m_Type == LFPG_SORT_FILTER_RARITY)
+                    configCallCost = 1;
+                ruleCost = ruleCost + configCallCost;
+
+                totalSpent = ruleChecks + configMisses + ruleCost;
+                if (totalSpent > budgetRemaining)
+                {
+                    nextOutput = oi;
+                    nextRule = ri;
+                    deferred = true;
+                    return -1;
+                }
+
+                ruleChecks = ruleChecks + 1;
+                configMisses = configMisses + configCallCost;
+
+                if (MatchRule(item, filterRule))
+                    return oi;
+                ri = ri + 1;
+            }
+        }
+
+        bitCheck = 1;
+        for (oi = 0; oi < 6; oi = oi + 1)
+        {
+            if ((hasWireMask & bitCheck) != 0)
+            {
+                outputConfig = config.GetOutput(oi);
+                if (outputConfig)
+                {
+                    if (outputConfig.m_IsCatchAll)
+                        return oi;
+                }
+            }
+            bitCheck = bitCheck * 2;
+        }
+
+        return -1;
+    }
+
     // ---------------------------------------------------------
     // MatchesAnyRule: OR logic — any matching rule returns true.
     // ---------------------------------------------------------
@@ -407,10 +527,13 @@ class LFPG_SorterLogic
 
         if (rule.m_Type == LFPG_SORT_FILTER_PREFIX)
         {
-            typeName = item.GetType();
-            typeName.ToLower();
-            ruleLower = rule.m_Value;
-            ruleLower.ToLower();
+            typeName = GetLowerTypeName(item);
+            ruleLower = rule.m_NormalizedValue;
+            if (ruleLower == "")
+            {
+                ruleLower = rule.m_Value + "";
+                ruleLower.ToLower();
+            }
 
             if (typeName.IndexOf(ruleLower) == 0)
                 return true;
@@ -420,10 +543,13 @@ class LFPG_SorterLogic
 
         if (rule.m_Type == LFPG_SORT_FILTER_CONTAINS)
         {
-            typeName = item.GetType();
-            typeName.ToLower();
-            ruleLower = rule.m_Value;
-            ruleLower.ToLower();
+            typeName = GetLowerTypeName(item);
+            ruleLower = rule.m_NormalizedValue;
+            if (ruleLower == "")
+            {
+                ruleLower = rule.m_Value + "";
+                ruleLower.ToLower();
+            }
 
             if (typeName.IndexOf(ruleLower) >= 0)
                 return true;
@@ -471,9 +597,60 @@ class LFPG_SorterLogic
     }
 
     // ---------------------------------------------------------
-    // Category cache: typeName → category string.
-    // Avoids repeated IsKindOf chains for items of the same type.
+    // Immutable per-type caches. InitCaches is called by NetworkManager
+    // construction so periodic sorter paths never allocate containers.
     protected static ref map<string, string> s_CategoryCache;
+    protected static ref map<string, string> s_LowerTypeCache;
+    protected static ref map<string, int> s_SlotWidthCache;
+    protected static ref map<string, int> s_SlotHeightCache;
+
+    static void InitCaches()
+    {
+        if (!s_CategoryCache)
+            s_CategoryCache = new map<string, string>;
+        if (!s_LowerTypeCache)
+            s_LowerTypeCache = new map<string, string>;
+        if (!s_SlotWidthCache)
+            s_SlotWidthCache = new map<string, int>;
+        if (!s_SlotHeightCache)
+            s_SlotHeightCache = new map<string, int>;
+    }
+
+    protected static string GetLowerTypeName(EntityAI item)
+    {
+        if (!item)
+            return "";
+
+        string typeName = item.GetType();
+        if (s_LowerTypeCache)
+        {
+            if (s_LowerTypeCache.Contains(typeName))
+                return s_LowerTypeCache.Get(typeName);
+        }
+
+        string lowerType = typeName + "";
+        lowerType.ToLower();
+        if (s_LowerTypeCache)
+            s_LowerTypeCache.Set(typeName, lowerType);
+        return lowerType;
+    }
+
+    static bool IsItemDimensionsCached(EntityAI item)
+    {
+        if (!item)
+            return true;
+        if (!s_SlotWidthCache)
+            return false;
+        if (!s_SlotHeightCache)
+            return false;
+
+        string typeName = item.GetType();
+        if (!s_SlotWidthCache.Contains(typeName))
+            return false;
+        if (!s_SlotHeightCache.Contains(typeName))
+            return false;
+        return true;
+    }
 
     // ---------------------------------------------------------
     // ResolveCategory: maps EntityAI to category string via
@@ -485,20 +662,16 @@ class LFPG_SorterLogic
         if (!item)
             return LFPG_SORT_CAT_MISC;
 
-        // Init cache on first call
-        if (!s_CategoryCache)
-        {
-            s_CategoryCache = new map<string, string>;
-        }
-
         string typeName = item.GetType();
-        if (s_CategoryCache.Contains(typeName))
+        if (s_CategoryCache)
         {
-            return s_CategoryCache.Get(typeName);
+            if (s_CategoryCache.Contains(typeName))
+                return s_CategoryCache.Get(typeName);
         }
 
         string result = ResolveCategoryUncached(item);
-        s_CategoryCache.Set(typeName, result);
+        if (s_CategoryCache)
+            s_CategoryCache.Set(typeName, result);
         return result;
     }
 
@@ -733,21 +906,42 @@ class LFPG_SorterLogic
     // ---------------------------------------------------------
     static void GetItemSlotDimensions(EntityAI item, out int outW, out int outH)
     {
+        string typeName;
+        string cfgPrefix;
+        string cfgSuffix;
+        string cfgPath;
+        string pathX;
+        string pathY;
+        string sZero;
+        string sOne;
+
         outW = 1;
         outH = 1;
 
         if (!item)
             return;
 
-        string cfgPrefix = "CfgVehicles ";
-        string cfgSuffix = " itemSize";
-        string cfgPath = cfgPrefix;
-        cfgPath = cfgPath + item.GetType();
+        typeName = item.GetType();
+        if (s_SlotWidthCache)
+        {
+            if (s_SlotHeightCache)
+            {
+                if (s_SlotWidthCache.Contains(typeName) && s_SlotHeightCache.Contains(typeName))
+                {
+                    outW = s_SlotWidthCache.Get(typeName);
+                    outH = s_SlotHeightCache.Get(typeName);
+                    return;
+                }
+            }
+        }
+
+        cfgPrefix = "CfgVehicles ";
+        cfgSuffix = " itemSize";
+        cfgPath = cfgPrefix;
+        cfgPath = cfgPath + typeName;
         cfgPath = cfgPath + cfgSuffix;
-        string pathX;
-        string pathY;
-        string sZero = " 0";
-        string sOne = " 1";
+        sZero = " 0";
+        sOne = " 1";
 
         if (g_Game.ConfigIsExisting(cfgPath))
         {
@@ -759,9 +953,13 @@ class LFPG_SorterLogic
 
         if (outW <= 0)
             outW = 1;
-
         if (outH <= 0)
             outH = 1;
+
+        if (s_SlotWidthCache)
+            s_SlotWidthCache.Set(typeName, outW);
+        if (s_SlotHeightCache)
+            s_SlotHeightCache.Set(typeName, outH);
     }
 
     // ---------------------------------------------------------
@@ -854,6 +1052,34 @@ class LFPG_SorterLogic
         // Server-authoritative move: explicit src → dst
         bool moved = GameInventory.LocationSyncMoveEntity(il_src, il_dst);
         return moved;
+    }
+
+    // Periodic scheduler variant: caller owns both reusable locations.
+    static bool MoveItemToContainerReusable(EntityAI item, EntityAI destContainer, InventoryLocation sourceLocation, InventoryLocation destinationLocation)
+    {
+        if (!item)
+            return false;
+        if (!destContainer)
+            return false;
+        if (!sourceLocation)
+            return false;
+        if (!destinationLocation)
+            return false;
+        if (!CanPutIntoContainer(destContainer, item))
+            return false;
+
+        GameInventory sourceInventory = item.GetInventory();
+        if (!sourceInventory)
+            return false;
+        GameInventory destinationInventory = destContainer.GetInventory();
+        if (!destinationInventory)
+            return false;
+
+        bool fits = destinationInventory.FindFreeLocationFor(item, FindInventoryLocationType.CARGO, destinationLocation);
+        if (!fits)
+            return false;
+        sourceInventory.GetCurrentInventoryLocation(sourceLocation);
+        return GameInventory.LocationSyncMoveEntity(sourceLocation, destinationLocation);
     }
 
     // ---------------------------------------------------------

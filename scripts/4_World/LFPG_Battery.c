@@ -60,6 +60,7 @@ class LFPG_BatteryBase : LFPG_WireOwnerBase
     // int32 by 4 orders of magnitude.
     protected int   m_StoredEnergyX10  = 0;
     protected int   m_ChargeRateX10    = 0;
+    protected int   m_PerfDiagChargeRateDirtyCount = 0;
 
     // ---- Battery state (persisted, not SyncVars) ----
     protected bool m_DischargeEnabled = true;
@@ -442,10 +443,25 @@ class LFPG_BatteryBase : LFPG_WireOwnerBase
     {
         #ifdef SERVER
         // v4.4: Store as int (rate × 10) for reliable SyncVar delivery.
-        // Called only every ~5s from battery timer → always sync.
+        // The quantized rate is synchronized only when its integer value changes.
         int rateX10 = val * 10.0;
+        if (m_ChargeRateX10 == rateX10)
+            return;
+
         m_ChargeRateX10 = rateX10;
         SetSynchDirty();
+
+        if (LFPG_PERFDIAG_ENABLED)
+        {
+            m_PerfDiagChargeRateDirtyCount = m_PerfDiagChargeRateDirtyCount + 1;
+            string perfDiag = "LFPG_PERFDIAG battery_dirty count=";
+            perfDiag = perfDiag + m_PerfDiagChargeRateDirtyCount.ToString();
+            perfDiag = perfDiag + " deviceId=";
+            perfDiag = perfDiag + m_DeviceId;
+            perfDiag = perfDiag + " rateX10=";
+            perfDiag = perfDiag + rateX10.ToString();
+            Print(perfDiag);
+        }
         #endif
     }
 

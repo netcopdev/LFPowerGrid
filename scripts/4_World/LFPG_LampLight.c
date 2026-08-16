@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - tiny client light for demo lamp
 // =========================================================
@@ -15,3 +17,4 @@ class LFPG_LampLight : PointLightBase
         SetAmbientColor(1.0, 0.95, 0.85);
     }
 };
+#endif

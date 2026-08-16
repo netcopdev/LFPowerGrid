@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid - InventoryMenu Mod (v5.0)
 //
@@ -40,3 +42,4 @@ modded class InventoryMenu
         }
     }
 };
+#endif

@@ -115,6 +115,70 @@ class LFPG_VanillaWireStore
     }
 };
 
+// ---- Single player balance entry (JSON-serializable) ----
+// PR-A: moved from 4_World/LFPG_BalanceProvider_Native.c to satisfy
+// 3_Game/4_World module boundary; LFPG_FileUtil (3_Game) needs the
+// type for AtomicSaveBalances + EnsureBalancesFileOrRestore typed recovery.
+class LFPG_BalanceEntry
+{
+    string uid;
+    int balance;
+
+    void LFPG_BalanceEntry()
+    {
+        uid = "";
+        balance = 0;
+    }
+};
+
+// ---- Durable stock mutation claim (JSON-serializable) ----
+class LFPG_BalanceClaim
+{
+    string uid;
+    string deviceId;
+    int sessionLow;
+    int sessionHigh;
+    int sequence;
+    int debit;
+    int stockBefore;
+    int stockTarget;
+    int state;
+    int bootsSinceRefund;
+    int orphanBoots;
+    int ambigBoots;
+
+    void LFPG_BalanceClaim()
+    {
+        uid = "";
+        deviceId = "";
+        sessionLow = 0;
+        sessionHigh = 0;
+        sequence = 0;
+        debit = 0;
+        stockBefore = 0;
+        stockTarget = 0;
+        state = 0;
+        bootsSinceRefund = 0;
+        orphanBoots = 0;
+        ambigBoots = 0;
+    }
+};
+
+// ---- On-disk data container for player balances ----
+class LFPG_BalanceData
+{
+    int ver;
+    ref array<ref LFPG_BalanceEntry> entries;
+    ref array<ref LFPG_BalanceClaim> claims;
+
+    void LFPG_BalanceData()
+    {
+        ver = 2;
+        entries = new array<ref LFPG_BalanceEntry>;
+        claims = new array<ref LFPG_BalanceClaim>;
+    }
+};
+
 // =========================================================
 // Electrical graph data structures
 // =========================================================

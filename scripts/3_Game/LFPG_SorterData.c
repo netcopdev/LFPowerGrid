@@ -44,6 +44,10 @@ static const int LFPG_SORT_MAX_OUTPUTS        = 6;
 static const int LFPG_SORT_MAX_RULES_PER_OUT  = 8;
 static const int LFPG_SORT_MAX_JSON_BYTES     = 2048;
 
+static const int LFPG_SORTER_ACK_NONE         = 0;
+static const int LFPG_SORTER_ACK_KEPT_OLD     = 1;
+static const int LFPG_SORTER_ACK_REPLACED     = 2;
+
 // ---------------------------------------------------------
 // Slot size presets
 // ---------------------------------------------------------
@@ -57,13 +61,15 @@ static const string LFPG_SORT_SLOT_LARGE  = "13-50";  // big items
 // ---------------------------------------------------------
 class LFPG_SortFilterRule
 {
-    int    m_Type;   // LFPG_SORT_FILTER_*
-    string m_Value;  // meaning depends on type
+    int    m_Type;            // LFPG_SORT_FILTER_*
+    string m_Value;           // original sanitized value (persistence/UI)
+    string m_NormalizedValue; // lowercase once for runtime prefix/contains checks
 
     void LFPG_SortFilterRule()
     {
         m_Type = 0;
         m_Value = "";
+        m_NormalizedValue = "";
     }
 
     // Check for duplicate: same type + same value
@@ -172,7 +178,14 @@ class LFPG_SortOutputConfig
         // Sanitize value: strip quotes that would break JSON
         string safeValue = LFPG_SortFilterRule.SanitizeValue(ruleValue);
         if (safeValue == "")
+        {
+            // U2 (2026-04-26): admin sees in RPT why an Add silently failed.
+            string wRaw = "[SortConfig] AddRule rejected: sanitized value is empty (raw='";
+            wRaw = wRaw + ruleValue;
+            wRaw = wRaw + "')";
+            LFPG_Util.Warn(wRaw);
             return false;
+        }
 
         // Check duplicate
         int i;
@@ -185,6 +198,11 @@ class LFPG_SortOutputConfig
         LFPG_SortFilterRule rule = new LFPG_SortFilterRule();
         rule.m_Type = ruleType;
         rule.m_Value = safeValue;
+        rule.m_NormalizedValue = safeValue + "";
+        if (ruleType == LFPG_SORT_FILTER_PREFIX || ruleType == LFPG_SORT_FILTER_CONTAINS)
+        {
+            rule.m_NormalizedValue.ToLower();
+        }
         m_Rules.Insert(rule);
         return true;
     }
@@ -324,6 +342,10 @@ class LFPG_SortConfig
         if (jsonLen < 10)
             return false;
 
+        bool parseOk = true;
+        int parsedOutputs = 0;
+        int rulesParsedTotal = 0;
+
         // JSON needle strings (Enforce: no string literals as function params)
         string kOArr = "\"o\":[";
         string kRArr = "\"r\":[";
@@ -355,49 +377,80 @@ class LFPG_SortConfig
             // Find the rules array "r":[
             int rArrStart = json.IndexOfFrom(objStart, kRArr);
             if (rArrStart < 0)
+            {
+                parseOk = false;
                 break;
+            }
 
             int rPos = rArrStart + 5;  // skip past "r":[
 
             // Parse rules until ]
             while (rPos < jsonLen)
             {
+                int rArrEnd = json.IndexOfFrom(rPos, kCloseBracket);
+
                 // Find next rule object {
                 int ruleStart = json.IndexOfFrom(rPos, kOpenBrace);
                 if (ruleStart < 0)
+                {
+                    if (rArrEnd < 0)
+                    {
+                        parseOk = false;
+                    }
                     break;
+                }
 
                 // Check if we hit ] before { (end of rules array)
-                int rArrEnd = json.IndexOfFrom(rPos, kCloseBracket);
                 if (rArrEnd >= 0 && rArrEnd < ruleStart)
                     break;
 
                 // Parse "t":N (supports multi-digit types)
                 int tStart = json.IndexOfFrom(ruleStart, kTypeKey);
                 if (tStart < 0)
+                {
+                    parseOk = false;
                     break;
+                }
                 int tValStart = tStart + 4;
                 if (tValStart >= jsonLen)
+                {
+                    parseOk = false;
                     break;
+                }
                 int tEnd = json.IndexOfFrom(tValStart, kComma);
                 if (tEnd < 0)
+                {
+                    parseOk = false;
                     break;
+                }
                 int tLen = tEnd - tValStart;
                 if (tLen <= 0)
+                {
+                    parseOk = false;
                     break;
+                }
                 string tStr = json.Substring(tValStart, tLen);
                 int ruleType = tStr.ToInt();
 
                 // Parse "v":"..."
                 int vStart = json.IndexOfFrom(tValStart, kValKey);
                 if (vStart < 0)
+                {
+                    parseOk = false;
                     break;
+                }
                 int vValStart = vStart + 5;
                 if (vValStart >= jsonLen)
+                {
+                    parseOk = false;
                     break;
+                }
                 int vEnd = json.IndexOfFrom(vValStart, kQuote);
                 if (vEnd < 0)
+                {
+                    parseOk = false;
                     break;
+                }
 
                 int vLen = vEnd - vValStart;
                 string ruleValue = "";
@@ -410,13 +463,28 @@ class LFPG_SortConfig
                 LFPG_SortOutputConfig outCfg = GetOutput(outIdx);
                 if (outCfg)
                 {
-                    outCfg.AddRule(ruleType, ruleValue);
+                    bool addOk = outCfg.AddRule(ruleType, ruleValue);
+                    if (addOk)
+                    {
+                        rulesParsedTotal = rulesParsedTotal + 1;
+                    }
+                    else
+                    {
+                        parseOk = false;
+                    }
+                }
+                else
+                {
+                    parseOk = false;
                 }
 
                 // Skip past this rule's closing }
                 int ruleEnd = json.IndexOfFrom(vEnd, kCloseBrace);
                 if (ruleEnd < 0)
+                {
+                    parseOk = false;
                     break;
+                }
                 rPos = ruleEnd + 1;
             }
 
@@ -434,9 +502,22 @@ class LFPG_SortConfig
                         if (caVal == kTrue)
                         {
                             outCfgCa.m_IsCatchAll = true;
+                            rulesParsedTotal = rulesParsedTotal + 1;
                         }
                     }
+                    else
+                    {
+                        parseOk = false;
+                    }
                 }
+                else
+                {
+                    parseOk = false;
+                }
+            }
+            else
+            {
+                parseOk = false;
             }
 
             // Find end of this output object.
@@ -450,12 +531,72 @@ class LFPG_SortConfig
             }
             int objEnd = json.IndexOfFrom(searchFrom, kCloseBrace);
             if (objEnd < 0)
+            {
+                parseOk = false;
                 break;
+            }
 
             pos = objEnd + 1;
             outIdx = outIdx + 1;
+            parsedOutputs = parsedOutputs + 1;
         }
 
+        // PR-E.5 (R21-PR-E-001 FAIL + R21-PR-E-002 WARN): structural tail validation.
+        // After the outputs loop, verify the JSON closes properly:
+        //   1. Outputs array must close with `]`; missing means truncated.
+        //   2. No further `{` may appear before the `]` (catches overflow >MAX outputs
+        //      that the outIdx-bounded loop would otherwise drop silently).
+        //   3. Root object must close with `}` after the `]`; missing means truncated.
+        if (parseOk && parsedOutputs > 0)
+        {
+            int oArrEnd = json.IndexOfFrom(pos, kCloseBracket);
+            if (oArrEnd < 0)
+            {
+                parseOk = false;
+            }
+            else
+            {
+                int nextObjStart = json.IndexOfFrom(pos, kOpenBrace);
+                if (nextObjStart >= 0 && nextObjStart < oArrEnd)
+                {
+                    parseOk = false;
+                }
+                else
+                {
+                    int rootEnd = json.IndexOfFrom(oArrEnd, kCloseBrace);
+                    if (rootEnd < 0)
+                    {
+                        parseOk = false;
+                    }
+                }
+            }
+        }
+
+        if (!parseOk)
+        {
+            string warnIncomplete = "[SorterData.FromJSON] parse incomplete, rejecting";
+            LFPG_Util.Warn(warnIncomplete);
+            return false;
+        }
+        if (parsedOutputs > LFPG_SORT_MAX_OUTPUTS)
+        {
+            string warnOutputs = "[SorterData.FromJSON] too many outputs: ";
+            warnOutputs = warnOutputs + parsedOutputs.ToString();
+            LFPG_Util.Warn(warnOutputs);
+            return false;
+        }
+        if (parsedOutputs == 0)
+        {
+            string warnNoOutputs = "[SorterData.FromJSON] no outputs parsed";
+            LFPG_Util.Warn(warnNoOutputs);
+            return false;
+        }
+        if (rulesParsedTotal == 0)
+        {
+            string warnNoRules = "[SorterData.FromJSON] no rules parsed";
+            LFPG_Util.Warn(warnNoRules);
+            return false;
+        }
         return true;
     }
 

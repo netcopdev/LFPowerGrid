@@ -358,6 +358,113 @@ class LFPG_Sorter : LFPG_WireOwnerBase
     // ============================================
     // Container linking
     // ============================================
+    EntityAI LFPG_FindNearestContainerCandidate(float maxDist)
+    {
+        #ifdef SERVER
+        vector searchPos = GetPosition();
+        float bestDistSq = maxDist * maxDist;
+        EntityAI bestContainer = null;
+
+        array<Object> nearObjects = new array<Object>;
+        g_Game.GetObjectsAtPosition(searchPos, maxDist, nearObjects, null);
+
+        int i;
+        for (i = 0; i < nearObjects.Count(); i = i + 1)
+        {
+            Object obj = nearObjects[i];
+            if (!obj)
+                continue;
+
+            if (obj == this)
+                continue;
+
+            EntityAI candidate = EntityAI.Cast(obj);
+            if (!candidate)
+                continue;
+
+            Man manCheck = Man.Cast(candidate);
+            if (manCheck)
+                continue;
+
+            if (LFPG_DeviceAPI.IsElectricDevice(candidate))
+                continue;
+
+            if (!candidate.GetInventory())
+                continue;
+
+            CargoBase candidateCargo = candidate.GetInventory().GetCargo();
+            int attachCount = candidate.GetInventory().AttachmentCount();
+            if (!candidateCargo && attachCount == 0)
+                continue;
+
+            int candLow = 0;
+            int candHigh = 0;
+            candidate.GetNetworkID(candLow, candHigh);
+            string candKey = candLow.ToString();
+            candKey = candKey + ":";
+            candKey = candKey + candHigh.ToString();
+
+            if (s_ContainerMap.Contains(candKey))
+            {
+                EntityAI claimant = s_ContainerMap.Get(candKey);
+                bool claimantValid = false;
+                if (claimant)
+                {
+                    LFPG_Sorter claimSorter = LFPG_Sorter.Cast(claimant);
+                    if (claimSorter && !claimSorter.IsRuined())
+                    {
+                        claimantValid = true;
+                    }
+                }
+                if (claimantValid && claimant != this)
+                {
+                    continue;
+                }
+            }
+
+            float distSq = LFPG_WorldUtil.DistSq(searchPos, candidate.GetPosition());
+            if (distSq < bestDistSq)
+            {
+                bestDistSq = distSq;
+                bestContainer = candidate;
+            }
+        }
+
+        return bestContainer;
+        #else
+        return null;
+        #endif
+    }
+
+    void LFPG_LinkContainer(EntityAI container)
+    {
+        #ifdef SERVER
+        if (!container)
+            return;
+
+        int linkLow = 0;
+        int linkHigh = 0;
+        container.GetNetworkID(linkLow, linkHigh);
+        m_LinkedContainerLow = linkLow;
+        m_LinkedContainerHigh = linkHigh;
+
+        string key = linkLow.ToString();
+        key = key + ":";
+        key = key + linkHigh.ToString();
+        s_ContainerMap.Set(key, this);
+
+        SetSynchDirty();
+
+        string linkLog = "[LFPG_Sorter] Linked container: ";
+        linkLog = linkLog + container.GetType();
+        linkLog = linkLog + " netId=";
+        linkLog = linkLog + linkLow.ToString();
+        linkLog = linkLog + ":";
+        linkLog = linkLog + linkHigh.ToString();
+        LFPG_Util.Info(linkLog);
+        #endif
+    }
+
     void LFPG_LinkNearestContainer(vector searchPos)
     {
         #ifdef SERVER
@@ -438,26 +545,7 @@ class LFPG_Sorter : LFPG_WireOwnerBase
 
         if (bestContainer)
         {
-            int linkLow = 0;
-            int linkHigh = 0;
-            bestContainer.GetNetworkID(linkLow, linkHigh);
-            m_LinkedContainerLow = linkLow;
-            m_LinkedContainerHigh = linkHigh;
-
-            string key = linkLow.ToString();
-            key = key + ":";
-            key = key + linkHigh.ToString();
-            s_ContainerMap.Set(key, this);
-
-            SetSynchDirty();
-
-            string linkLog = "[LFPG_Sorter] Linked container: ";
-            linkLog = linkLog + bestContainer.GetType();
-            linkLog = linkLog + " netId=";
-            linkLog = linkLog + linkLow.ToString();
-            linkLog = linkLog + ":";
-            linkLog = linkLog + linkHigh.ToString();
-            LFPG_Util.Info(linkLog);
+            LFPG_LinkContainer(bestContainer);
         }
         else
         {
@@ -562,6 +650,7 @@ class LFPG_Sorter : LFPG_WireOwnerBase
 
         m_FilterJSON = json;
         m_FilterConfig = testConfig;
+        SetSynchDirty();
         return true;
         #else
         return false;

@@ -1,3 +1,5 @@
+#ifndef SERVER
+// Client-only compilation boundary
 // =========================================================
 // LF_PowerGrid — Sorter View (Dabs MVC, v3.3)
 //
@@ -66,6 +68,14 @@ class LFPG_SorterView extends ScriptView
     // ── Hover color cache (v2.2, M4: per-widget via SetUserData) ──
     // Strong refs to prevent GC — SetUserData does NOT hold strong ref!
     protected ref array<ref LFPG_ColorData> m_ColorDataRefs;
+    // F1-B (heap corruption fix 2026-04-26): tracks widgets that received
+    // SetUserData(LFPG_ColorData). Before clearing m_ColorDataRefs we MUST
+    // call SetUserData(null) on each — the engine stores SetUserData as a
+    // raw pointer (not a Managed soft link), so freeing the data while the
+    // widget still points to it leaves a dangling read for the next
+    // GetUserData/Cast → heap corruption (0xc0000374). array<Widget> is a
+    // weak ref by design (no `ref`); destroyed widgets nullify on their own.
+    protected ref array<Widget> m_TintedWidgets;
     // Currently hovered bg (null if none)
     protected ImageWidget m_HoveredBg;
     // N3: Tracks whether controls are enabled (unpaired = false).
@@ -176,7 +186,10 @@ class LFPG_SorterView extends ScriptView
     static const int COL_BG_RULES_PANEL  = 0xFF1E2B41;
     static const int COL_RED_BTN_SOFT    = 0x26F87171;
     static const int COL_RED_BTN_BORDER  = 0x40F87171;
-    static const int COL_CATCHALL_BG     = 0x10FBBF24;
+    // U1 (2026-04-26): alpha 0x10 (16/255) is below DayZ visibility
+    // threshold (~0x30). Bumped to 0x26 to match COL_RED_BTN_SOFT/
+    // COL_PAIRING_OK alpha range — catch-all card now actually visible.
+    static const int COL_CATCHALL_BG     = 0x26FBBF24;
     static const int COL_PURPLE          = 0xFFA78BFA;
 
     // ── M2: Button UserID ranges (int dispatch replaces string comparison) ──
@@ -275,6 +288,7 @@ class LFPG_SorterView extends ScriptView
         m_FadeAlpha = 1.0;
         m_FadingIn = false;
         m_ColorDataRefs = new array<ref LFPG_ColorData>();
+        m_TintedWidgets = new array<Widget>();
     }
 
     // S1 fix: destructor releases input lock if destroyed while open
@@ -399,6 +413,14 @@ class LFPG_SorterView extends ScriptView
             }
             BtnCloseXBg = closeXImg;
             BtnCloseXText = closeXTxt;
+            // U3 (2026-04-26): silent-failure diagnostic. If BtnCloseX has no
+            // ImageWidget child the X button stays invisible (Tint() null-checks
+            // and skips). Without this log we'd debug it cold.
+            if (!BtnCloseXBg)
+            {
+                string wWarn = "[SorterView] BtnCloseX child-walk: no ImageWidget child found — X button will be invisible";
+                LFPG_Util.Warn(wWarn);
+            }
         }
 
         wn = "PairingBadgeBg";
@@ -564,6 +586,24 @@ class LFPG_SorterView extends ScriptView
 
     protected void ApplyColors()
     {
+        // F1-B (2026-04-26): null SetUserData on previously tinted widgets
+        // BEFORE freeing the LFPG_ColorData they point at. SetUserData stores
+        // a raw pointer; without this step, the next CacheColorLocal would
+        // GetUserData() a dangling pointer and Cast() it → heap corruption
+        // (verified crash 2026-04-26: SEH 0xc0000374 at CacheColorLocal:723).
+        int twn = m_TintedWidgets.Count();
+        int twi = 0;
+        while (twi < twn)
+        {
+            Widget tw = m_TintedWidgets[twi];
+            if (tw)
+            {
+                tw.SetUserData(null);
+            }
+            twi = twi + 1;
+        }
+        m_TintedWidgets.Clear();
+
         // F1-A: Clear stale strong refs from previous Open cycle.
         // SetUserData does NOT hold strong ref — m_ColorDataRefs keeps
         // objects alive. Without Clear(), each Open accumulates ~130 objects.
@@ -711,9 +751,10 @@ class LFPG_SorterView extends ScriptView
         CacheColorLocal(img, color);
     }
 
-    // M4: Store color on the widget itself via SetUserData (O(1) lookup)
+    // M4: Store color on the widget itself via SetUserData (O(1) lookup).
     // Reuses existing LFPG_ColorData if present (avoids alloc+GC churn on refresh).
-    // FIX: SetUserData does NOT hold strong ref — m_ColorDataRefs keeps objects alive.
+    // F1-B (2026-04-26): track widget in m_TintedWidgets so ApplyColors can
+    // null SetUserData before freeing data — prevents dangling-pointer crash.
     protected void CacheColorLocal(Widget w, int color)
     {
         if (!w)
@@ -729,6 +770,7 @@ class LFPG_SorterView extends ScriptView
         LFPG_ColorData data = new LFPG_ColorData(color);
         w.SetUserData(data);
         m_ColorDataRefs.Insert(data);
+        m_TintedWidgets.Insert(w);
     }
 
     // M4: O(1) color retrieval via GetUserData — replaces O(n) array scan
@@ -1671,3 +1713,4 @@ class LFPG_SorterView extends ScriptView
         return LFPG_SorterController.Cast(GetController());
     }
 };
+#endif
