@@ -180,6 +180,11 @@ class LFPG_BTCAtmBase : LFPG_DeviceBase
     // ============================================
     bool LFPG_IsWithdrawOnly()
     {
+        // Global floor from config. Server-only: Get() lazy-loads and may write defaults.
+        #ifdef SERVER
+        if (LFPG_BTCConfig.GetAtmWithdrawOnlyDefault())
+            return true;
+        #endif
         return m_ATMWithdrawOnly;
     }
 

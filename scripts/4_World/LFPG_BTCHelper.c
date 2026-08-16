@@ -976,6 +976,14 @@ class LFPG_BTCHelper
 
         if (useAccount)
         {
+            // WithdrawOnly: account BUY adds BTC to ATM stock; cash BUY does not.
+            if (atm.LFPG_IsWithdrawOnly())
+            {
+                int errWo = LFPG_BTC_ERR_INVALID;
+                SendBTCTxResult(player, sender, LFPG_BTC_TX_BUY,errWo, atm.LFPG_GetBtcStock(), earlyBal, 0, 0.0, serverSessionLow, serverSessionHigh, sequence);
+                return;
+            }
+
             // Claims are implemented only by Native; piggyback account buys fail closed.
             if (!atmEarly || atmEarly.GetName() != "Native")
             {
@@ -1757,6 +1765,14 @@ class LFPG_BTCHelper
             return;
         }
 
+        // WithdrawOnly: nothing enters the account or the ATM.
+        if (atm.LFPG_IsWithdrawOnly())
+        {
+            int errWo = LFPG_BTC_ERR_INVALID;
+            SendBTCTxResult(player, sender, LFPG_BTC_TX_DEPOSIT,errWo, atm.LFPG_GetBtcStock(), earlyBalD, 0, 0.0, serverSessionLow, serverSessionHigh, sequence);
+            return;
+        }
+
         // Player has items?
         string btcClassname = LFPG_BTCConfig.GetBtcItemClassname();
         int playerBtc = CountPlayerItems(player, btcClassname);
@@ -2204,6 +2220,14 @@ class LFPG_BTCHelper
         {
             int errPow = LFPG_BTC_ERR_NOT_POWERED;
             SendBTCTxResult(player, sender, LFPG_BTC_TX_DEPOSIT_CASH, errPow, atm.LFPG_GetBtcStock(), earlyBal, 0, 0.0, serverSessionLow, serverSessionHigh, sequence);
+            return;
+        }
+
+        // WithdrawOnly: nothing enters the account or the ATM.
+        if (atm.LFPG_IsWithdrawOnly())
+        {
+            int errWo = LFPG_BTC_ERR_INVALID;
+            SendBTCTxResult(player, sender, LFPG_BTC_TX_DEPOSIT_CASH, errWo, atm.LFPG_GetBtcStock(), earlyBal, 0, 0.0, serverSessionLow, serverSessionHigh, sequence);
             return;
         }
 
