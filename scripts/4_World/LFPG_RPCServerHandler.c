@@ -50,8 +50,16 @@ class LFPG_RPCServerHandler
         PlayerBase realPlayer = PlayerBase.Cast(sender.GetPlayer());
         if (!realPlayer)
         {
+            // Replay-only: do not exempt REQUEST_CAMERA_LIST from A1 rebind.
+            // The full handler authorizes by player distance; a client-chosen
+            // player would reopen the PR-C target hole. This path has no PlayerBase.
+            if (subId == LFPG_RPC_SubId.REQUEST_CAMERA_LIST)
+            {
+                HandleCameraListReplayOnly(sender, ctx);
+                return;
+            }
             string nullMsg = "[LFPG_RPC] Dispatch: sender.GetPlayer() null, dropping subId=" + subId.ToString() + " sender=" + sender.GetPlainId();
-            LFPG_Util.Warn(nullMsg);
+            LFPG_Util.RateLimitedWarn(sender, "rpc_null_player", nullMsg);
             return;
         }
         if (player != realPlayer)
@@ -1091,12 +1099,6 @@ class LFPG_RPCServerHandler
         if (!sessions)
             return;
 
-        if (!manager.AllowPlayerAction(sender))
-        {
-            PlayerBase.LFPG_SendClientMsg(player, "Too fast! Wait a moment.");
-            return;
-        }
-
         int monNetLow = 0;
         int monNetHigh = 0;
         if (!ctx.Read(monNetLow))
@@ -1104,18 +1106,30 @@ class LFPG_RPCServerHandler
         if (!ctx.Read(monNetHigh))
             return;
 
+        // Matching CCTV retry is identified before the global bucket.
+        // A retry that already holds the session must not pay rate.
+        // Any other outcome, including the "already active" reject, consumes
+        // rate first so that path cannot be used to amplify traffic.
         LFPG_ControlSessionRecord currentSession = sessions.Get(sender);
+        if (sessions.Matches(currentSession, LFPG_CONTROL_KIND_CCTV, monNetLow, monNetHigh))
+        {
+            if (!sessions.AllowCCTVReplay(currentSession, g_Game.GetTime() * 0.001))
+                return;
+
+            sessions.SendCCTVEnterResponse(currentSession);
+            LFPG_Util.Info("[RequestCameraList] Replayed cached camera response");
+            return;
+        }
+
+        if (!manager.AllowPlayerAction(sender))
+        {
+            PlayerBase.LFPG_SendClientMsg(player, "Too fast! Wait a moment.");
+            return;
+        }
+
         if (currentSession)
         {
-            if (sessions.Matches(currentSession, LFPG_CONTROL_KIND_CCTV, monNetLow, monNetHigh))
-            {
-                sessions.SendCCTVEnterResponse(currentSession);
-                LFPG_Util.Info("[RequestCameraList] Replayed cached camera response");
-            }
-            else
-            {
-                PlayerBase.LFPG_SendClientMsg(player, "Another control session is already active.");
-            }
+            PlayerBase.LFPG_SendClientMsg(player, "Another control session is already active.");
             return;
         }
 
@@ -1270,6 +1284,38 @@ class LFPG_RPCServerHandler
 
         string logMsg = "[RequestCameraList] Sent " + camCount.ToString() + " cameras to player";
         LFPG_Util.Info(logMsg);
+    }
+
+    // Reachable while sender.GetPlayer() is null after SelectPlayer(null).
+    // No PlayerBase parameter: this path must not authorize by a client-chosen body.
+    static void HandleCameraListReplayOnly(PlayerIdentity sender, ParamsReadContext ctx)
+    {
+        if (!sender)
+            return;
+
+        int monNetLow = 0;
+        int monNetHigh = 0;
+        if (!ctx.Read(monNetLow))
+            return;
+        if (!ctx.Read(monNetHigh))
+            return;
+
+        LFPG_NetworkManager manager = LFPG_NetworkManager.Get();
+        LFPG_ControlSessionRegistry sessions = manager.GetControlSessionRegistry();
+        if (!sessions)
+            return;
+
+        LFPG_ControlSessionRecord record = sessions.Get(sender);
+        if (!sessions.Matches(record, LFPG_CONTROL_KIND_CCTV, monNetLow, monNetHigh))
+        {
+            LFPG_Util.RateLimitedWarn(sender, "camera_list_replay_denied", "[RequestCameraList] Replay-only denied: no matching CCTV session");
+            return;
+        }
+
+        if (!sessions.AllowCCTVReplay(record, g_Game.GetTime() * 0.001))
+            return;
+
+        sessions.SendCCTVEnterResponse(record);
     }
 
     static void HandleCCTVExitRequest(PlayerBase player, PlayerIdentity sender)
@@ -1493,28 +1539,55 @@ class LFPG_RPCServerHandler
         if (aimPitch > LFPG_SEARCHLIGHT_PITCH_MAX)
             aimPitch = LFPG_SEARCHLIGHT_PITCH_MAX;
 
-        if (!LFPG_NetworkManager.Get().AllowPlayerAction(sender))
+        LFPG_NetworkManager manager = LFPG_NetworkManager.Get();
+        LFPG_ControlSessionRegistry sessions = manager.GetControlSessionRegistry();
+        if (!sessions)
             return;
 
-        Object slObj = g_Game.GetObjectByNetworkId(netLow, netHigh);
-        if (!slObj)
+        LFPG_ControlSessionRecord record = sessions.Get(sender);
+        if (!sessions.Matches(record, LFPG_CONTROL_KIND_SEARCHLIGHT, netLow, netHigh))
+        {
+            // No session: charge the global attempt budget. B-22 removes the shared
+            // bucket for the operator's aim stream only, not for unsolicited AIM.
+            manager.AllowPlayerAction(sender);
             return;
+        }
 
-        LFPG_Searchlight sl = LFPG_Searchlight.Cast(slObj);
+        LFPG_Searchlight sl = record.m_Searchlight;
         if (!sl)
             return;
 
-        // v1.5.0: Validate sender is the current operator (anti-cheat)
-        PlayerBase aimPlayer = PlayerBase.Cast(sender.GetPlayer());
-        if (!aimPlayer)
+        if (!sl.LFPG_IsPowered())
+        {
+            sessions.EndSearchlight(sender, netLow, netHigh, true);
             return;
-        int aimPlayerNetLow  = 0;
-        int aimPlayerNetHigh = 0;
-        aimPlayer.GetNetworkID(aimPlayerNetLow, aimPlayerNetHigh);
-        if (!sl.LFPG_IsOperator(aimPlayerNetLow, aimPlayerNetHigh))
+        }
+
+        // AIM uses the grab radius (2.5 m) as HORIZONTAL distance, matching the
+        // client auto-exit (dx*dx+dz*dz). Height does not count. Enter stays 3D
+        // at LFPG_INTERACT_DIST_M (5.0 m); that wider check is a different gate.
+        if (!record.m_Player)
             return;
 
-        // Write SyncVars
+        vector aimPlayerPos = record.m_Player.GetPosition();
+        vector aimSlPos = sl.GetPosition();
+        float dxAim = aimPlayerPos[0] - aimSlPos[0];
+        float dzAim = aimPlayerPos[2] - aimSlPos[2];
+        float distSq = dxAim * dxAim + dzAim * dzAim;
+        float maxDistSq = LFPG_SEARCHLIGHT_GRAB_RADIUS_M * LFPG_SEARCHLIGHT_GRAB_RADIUS_M;
+        if (distSq > maxDistSq)
+        {
+            sessions.EndSearchlight(sender, netLow, netHigh, true);
+            return;
+        }
+
+        if (!sl.LFPG_IsOperator(record.m_PlayerNetLow, record.m_PlayerNetHigh))
+            return;
+
+        float nowSeconds = g_Game.GetTime() * 0.001;
+        if (!sessions.AllowSearchlightAim(record, nowSeconds))
+            return;
+
         sl.LFPG_SetAim(aimYaw, aimPitch);
 
         bool splashRaycasted = RefreshSearchlightSplash(sl, aimYaw, aimPitch, false);

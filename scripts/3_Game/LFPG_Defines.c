@@ -736,6 +736,13 @@ static const float LFPG_SEARCHLIGHT_RPC_THROTTLE_MS   = 150.0;   // ms between a
 static const float LFPG_SEARCHLIGHT_AIM_DEADZONE_DEG  = 0.25;    // client send threshold
 static const float LFPG_SEARCHLIGHT_SPLASH_RAYCAST_MS = 500.0;   // server physics cadence
 static const float LFPG_SEARCHLIGHT_GRAB_RADIUS_M     = 2.5;     // auto-exit distance
+// Server AIM limiter. MUST stay below LFPG_SEARCHLIGHT_RPC_THROTTLE_MS (150 ms):
+// two distinct clocks; the client accumulator advances per frame so a legitimate
+// packet can arrive at 149 ms. A 0.150 s cooldown would stutter the beam.
+static const float LFPG_SEARCHLIGHT_AIM_COOLDOWN_S    = 0.120;
+// Caps cached CCTV list re-send. Identification stays free (STOP-SESSION-01);
+// the client does not auto-retry, so 1 s does not block recovery.
+static const float LFPG_CCTV_REPLAY_COOLDOWN_S        = 1.0;
 static const float LFPG_SEARCHLIGHT_SPLASH_RANGE_M    = 100.0;   // server raycast range
 static const float LFPG_SEARCHLIGHT_SHADOW_MAX_M      = 60.0;
 static const float LFPG_SEARCHLIGHT_FULL_M            = 120.0;

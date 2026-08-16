@@ -39,6 +39,11 @@ class LFPG_ControlSessionRecord
 
     float m_SearchlightYaw;
     float m_SearchlightPitch;
+
+    // Per-session AIM limiter. Allocated once in BeginSearchlight; never on the AIM path.
+    ref LFPG_RateLimiter m_AimLimiter;
+    // Per-session CCTV replay limiter. Allocated once in BeginCCTV; never on the replay path.
+    ref LFPG_RateLimiter m_ReplayLimiter;
 };
 
 class LFPG_ControlSessionRegistry
@@ -102,6 +107,7 @@ class LFPG_ControlSessionRegistry
         record.m_CameraPositions = cameraPositions;
         record.m_CameraOrientations = cameraOrientations;
         record.m_CameraLabels = cameraLabels;
+        record.m_ReplayLimiter = new LFPG_RateLimiter();
         m_ByUID.Set(uid, record);
         return record;
     }
@@ -130,8 +136,25 @@ class LFPG_ControlSessionRegistry
         record.m_DeadlineMs = 0;
         record.m_SearchlightYaw = yaw;
         record.m_SearchlightPitch = pitch;
+        record.m_AimLimiter = new LFPG_RateLimiter();
         m_ByUID.Set(uid, record);
         return record;
+    }
+
+    bool AllowSearchlightAim(LFPG_ControlSessionRecord record, float nowSeconds)
+    {
+        if (!record || !record.m_AimLimiter)
+            return false;
+
+        return record.m_AimLimiter.Allow(nowSeconds, LFPG_SEARCHLIGHT_AIM_COOLDOWN_S);
+    }
+
+    bool AllowCCTVReplay(LFPG_ControlSessionRecord record, float nowSeconds)
+    {
+        if (!record || !record.m_ReplayLimiter)
+            return false;
+
+        return record.m_ReplayLimiter.Allow(nowSeconds, LFPG_CCTV_REPLAY_COOLDOWN_S);
     }
 
     void MarkActive(LFPG_ControlSessionRecord record)
