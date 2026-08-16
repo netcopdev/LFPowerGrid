@@ -1371,9 +1371,35 @@ class LFPG_DeviceInspector
 
         int wireCount = m_RespWires.Count();
 
-        if (wireCount == 0)
+        // Declared ports with no matching edge get an explicit empty row.
+        // Count before collapse: a device with no edges still lists free ports.
+        LFPG_DeviceBase inspectDev = null;
+        if (m_CurrentDeviceId != "")
         {
-            // P2-A: Collapse wire section entirely — cleaner look
+            EntityAI inspectEnt = LFPG_DeviceRegistry.Get().FindById(m_CurrentDeviceId);
+            inspectDev = LFPG_DeviceBase.Cast(inspectEnt);
+        }
+
+        int freeCount = 0;
+        int portCount = 0;
+        if (inspectDev)
+        {
+            portCount = inspectDev.LFPG_GetPortCount();
+        }
+        int pi;
+        for (pi = 0; pi < portCount; pi = pi + 1)
+        {
+            string declaredName = inspectDev.LFPG_GetPortName(pi);
+            if (declaredName == "")
+                continue;
+            if (IsLocalPortOccupied(declaredName))
+                continue;
+            freeCount = freeCount + 1;
+        }
+
+        if (wireCount == 0 && freeCount == 0)
+        {
+            // Collapse only when there is nothing to list.
             ShowDirty(m_wWiresHeader, false);
             if (m_wSeparator)
             {
@@ -1385,7 +1411,7 @@ class LFPG_DeviceInspector
             return;
         }
 
-        // Ensure separator + header are visible (may have been hidden by 0-wire collapse)
+        // Ensure separator + header are visible (may have been hidden by collapse)
         if (m_wSeparator)
         {
             ShowDirty(m_wSeparator, true);
@@ -1406,17 +1432,19 @@ class LFPG_DeviceInspector
             }
         }
 
+        int totalRows = wireCount + freeCount;
+
         int maxShow = m_wWireSlots.Count();
-        if (wireCount < maxShow)
+        if (totalRows < maxShow)
         {
-            maxShow = wireCount;
+            maxShow = totalRows;
         }
 
         // Header text with overflow indicator
         string hdrText = Loc("#STR_LFPG_INSPECT_CONNECTIONS");
         hdrText = hdrText + " (";
-        hdrText = hdrText + wireCount.ToString();
-        if (wireCount > maxShow)
+        hdrText = hdrText + totalRows.ToString();
+        if (totalRows > maxShow)
         {
             hdrText = hdrText + " | ";
             hdrText = hdrText + Loc("#STR_LFPG_INSPECT_SHOWING");
@@ -1426,8 +1454,14 @@ class LFPG_DeviceInspector
         hdrText = hdrText + ")";
         SetTextDirty(m_wWiresHeader, hdrText);
 
+        int wireShow = wireCount;
+        if (wireShow > maxShow)
+        {
+            wireShow = maxShow;
+        }
+
         int si;
-        for (si = 0; si < maxShow; si = si + 1)
+        for (si = 0; si < wireShow; si = si + 1)
         {
             LFPG_InspectWireEntry entry = m_RespWires[si];
             TextWidget slot = m_wWireSlots[si];
@@ -1448,7 +1482,7 @@ class LFPG_DeviceInspector
             }
 
             string line = arrow;
-            line = line + FormatPortName(entry.m_LocalPort);
+            line = line + ResolvePortDisplayLabel(inspectDev, entry.m_LocalPort);
             line = line + "  >  ";
             line = line + FormatDeviceName(entry.m_RemoteTypeName);
 
@@ -1475,6 +1509,49 @@ class LFPG_DeviceInspector
             }
             SetColorDirty(slot, wireColor);
             ShowDirty(slot, true);
+        }
+
+        int slotIdx = wireShow;
+        for (pi = 0; pi < portCount; pi = pi + 1)
+        {
+            if (slotIdx >= maxShow)
+                break;
+
+            string freeName = inspectDev.LFPG_GetPortName(pi);
+            if (freeName == "")
+                continue;
+            if (IsLocalPortOccupied(freeName))
+                continue;
+
+            TextWidget freeSlot = m_wWireSlots[slotIdx];
+            if (!freeSlot)
+            {
+                slotIdx = slotIdx + 1;
+                continue;
+            }
+
+            int freeDir = inspectDev.LFPG_GetPortDir(pi);
+            string freeArrow = "";
+            if (freeDir == LFPG_PortDir.OUT)
+            {
+                freeArrow = Loc("#STR_LFPG_INSPECT_DIR_OUT");
+                freeArrow = freeArrow + " ";
+            }
+            else
+            {
+                freeArrow = Loc("#STR_LFPG_INSPECT_DIR_IN");
+                freeArrow = freeArrow + "  ";
+            }
+
+            string freeLine = freeArrow;
+            freeLine = freeLine + ResolvePortDisplayLabel(inspectDev, freeName);
+            freeLine = freeLine + "  >  ";
+            freeLine = freeLine + Loc("#STR_LFPG_INSPECT_PORT_EMPTY");
+
+            SetTextDirty(freeSlot, freeLine);
+            SetColorDirty(freeSlot, COL_GRAY_DIM);
+            ShowDirty(freeSlot, true);
+            slotIdx = slotIdx + 1;
         }
 
         // Hide unused slots
@@ -1780,6 +1857,47 @@ class LFPG_DeviceInspector
     protected static string Loc(string key)
     {
         return Widget.TranslateString(key);
+    }
+
+    // True when an inspect-response edge already names this local port.
+    protected bool IsLocalPortOccupied(string portName)
+    {
+        if (portName == "")
+            return false;
+
+        int i;
+        int n = m_RespWires.Count();
+        for (i = 0; i < n; i = i + 1)
+        {
+            LFPG_InspectWireEntry entry = m_RespWires[i];
+            if (!entry)
+                continue;
+            if (entry.m_LocalPort == portName)
+                return true;
+        }
+        return false;
+    }
+
+    // Declared m_Label wins. FormatPortName only fills a blank label.
+    protected static string ResolvePortDisplayLabel(LFPG_DeviceBase device, string portName)
+    {
+        if (device)
+        {
+            int i;
+            int n = device.LFPG_GetPortCount();
+            for (i = 0; i < n; i = i + 1)
+            {
+                string declaredName = device.LFPG_GetPortName(i);
+                if (declaredName != portName)
+                    continue;
+
+                string declaredLabel = device.LFPG_GetPortLabel(i);
+                if (declaredLabel != "")
+                    return declaredLabel;
+                break;
+            }
+        }
+        return FormatPortName(portName);
     }
 
     // Clean up port internal name for display.

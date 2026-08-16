@@ -453,6 +453,39 @@ class LFPG_ActionRaycast
 };
 
 // =========================================================
+// CLIENT PORT CACHE: empty GetConnectionType is occupancy
+// only when this device owns the outgoing wires.
+//
+// RebuildConnCache keys an OUT port from the looked-at
+// device's owner blob. If that blob is decoded
+// (HasDecodedOwnerData) and the cache still has no entry,
+// the port is vacant — the empty string is evidence, not a
+// miss. An IN port is keyed from the upstream owner's
+// blob, so the looked-at device's blob proves neither
+// occupancy nor vacancy.
+// =========================================================
+class LFPG_ActionPortCache
+{
+    static bool IsEmptyConnEvidentlyFree(int portDir, string deviceId)
+    {
+        if (portDir != LFPG_PortDir.OUT)
+            return false;
+
+#ifndef SERVER
+        LFPG_CableRenderer renderer = LFPG_CableRenderer.Get();
+        if (!renderer)
+            return false;
+
+        if (!renderer.HasDecodedOwnerData(deviceId))
+            return false;
+
+        return true;
+#endif
+        return false;
+    }
+};
+
+// =========================================================
 // PER-PORT ACTION BASE
 //
 // Each subclass (Port0..Port5) sets m_PortIndex.
@@ -542,7 +575,8 @@ class ActionLFPG_PortBase : ActionSingleUseBase
         }
         else
         {
-            // Port empty: text depends on wiring session state
+            // Empty cache is a free port only for an OUT whose owner
+            // blob is decoded. Keep the action usable either way.
             bool sessionActive = false;
             if (!g_Game.IsDedicatedServer())
             {
@@ -557,7 +591,15 @@ class ActionLFPG_PortBase : ActionSingleUseBase
             }
             else
             {
-                m_Text = "Wire from " + portLabel;
+                bool evidentlyFree = LFPG_ActionPortCache.IsEmptyConnEvidentlyFree(portDir, devId);
+                if (evidentlyFree)
+                {
+                    m_Text = "Wire from " + portLabel;
+                }
+                else
+                {
+                    m_Text = "Wire " + portLabel;
+                }
             }
         }
 
@@ -873,7 +915,9 @@ class ActionLFPG_CutWires : ActionSingleUseBase
 // ---------------------------------------------------------
 // CUT PORT - per-port wire cutting with Pliers
 // Base class: determines port index from m_PortIndex.
-// Only shows when port is occupied. Works on both OUT and IN.
+// Server: only when the port is occupied (authoritative wire data).
+// Client: unknown occupancy still offers Cut. Evidently free OUT
+// ports hide Cut. Works on both OUT and IN.
 // ---------------------------------------------------------
 class ActionLFPG_CutPortBase : ActionSingleUseBase
 {
@@ -928,9 +972,10 @@ class ActionLFPG_CutPortBase : ActionSingleUseBase
         string devId     = LFPG_DeviceAPI.GetOrCreateDeviceId(e);
         int portDir      = LFPG_DeviceAPI.GetPortDir(e, m_PortIndex);
 
-        // Check if port is occupied.
-        // Client: uses CableRenderer connection cache (fast O(1) lookup).
-        // Server: checks wire data directly (authoritative).
+        // Occupancy check.
+        // Client: CableRenderer cache (O(1)). Empty is a free OUT
+        // port only when HasDecodedOwnerData is true; otherwise unknown.
+        // Server: wire data directly (authoritative).
         string connType = "";
 
         if (!g_Game.IsDedicatedServer())
@@ -1005,9 +1050,21 @@ class ActionLFPG_CutPortBase : ActionSingleUseBase
             }
         }
 
-        // Only show cut action when port has a connection
+        // Server: empty connType is authoritative — hide Cut.
+        // Client: hide Cut only when the empty cache is evidence of
+        // a free OUT port; keep Cut when occupancy is unknown.
         if (connType == "")
-            return false;
+        {
+            if (g_Game.IsDedicatedServer())
+                return false;
+
+            bool evidentlyFree = LFPG_ActionPortCache.IsEmptyConnEvidentlyFree(portDir, devId);
+            if (evidentlyFree)
+                return false;
+
+            m_Text = "Cut " + portLabel;
+            return true;
+        }
 
         m_Text = "Cut " + portLabel + " (" + connType + ")";
         return true;

@@ -1371,6 +1371,21 @@ class LFPG_CableRenderer
         return false;
     }
 
+    // HasOwnerData is map membership only. The owner entry is created
+    // before DecodeOwner runs, so membership does not imply decoded
+    // topology. True only when that owner's wires array is non-null.
+    bool HasDecodedOwnerData(string ownerDeviceId)
+    {
+        if (ownerDeviceId == "") return false;
+
+        ref LFPG_OwnerWireState st;
+        if (m_ByOwnerId.Find(ownerDeviceId, st) && st && st.wires)
+        {
+            return true;
+        }
+        return false;
+    }
+
     // ==========================================================
     // v0.7.35 D4: Immediate visual state refresh from SyncVars.
     // Called from OnVariablesSynchronized on owner devices
