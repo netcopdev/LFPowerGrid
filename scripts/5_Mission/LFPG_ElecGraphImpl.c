@@ -3719,11 +3719,33 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             overloaded = true;
         }
 
-        // Pass 2: Set allocations + detect changes.
-        // v2.0: When soft demand exists and not overloaded, allocate only
-        // the hard portion per edge. Soft surplus handled in Pass 3.
-        // When totalSoftDemand=0 (99.9% of nodes), newAlloc = edge.m_Demand
-        // (unchanged behavior).
+        // Pass 2: Compute the FINAL allocation for every edge and compare it
+        // with the previous final allocation exactly once.
+        //
+        // Previously this was split into a hard-allocation pass followed by a
+        // soft-surplus pass. A stable soft-demand edge therefore changed from
+        // (hard + soft) -> hard -> (hard + soft) on every evaluation. The
+        // intermediate comparison permanently set m_AllocChanged even though
+        // the final allocation was identical. Battery polling then kept every
+        // upstream Combiner/Splitter dirty forever.
+        //
+        // totalHardDemand is the amount allocated before soft demand. Any
+        // remaining capacity is distributed proportionally to soft demand in
+        // this same pass, so change detection observes only final state.
+        float softSurplus = 0.0;
+        if (!overloaded && totalSoftDemand > LFPG_PROPAGATION_EPSILON)
+        {
+            softSurplus = availableOutput - totalHardDemand;
+            if (softSurplus < 0.0)
+            {
+                softSurplus = 0.0;
+            }
+            if (softSurplus > totalSoftDemand)
+            {
+                softSurplus = totalSoftDemand;
+            }
+        }
+
         float totalAllocated = 0.0;
         int ai;
         for (ai = 0; ai < edgeCount; ai = ai + 1)
@@ -3739,27 +3761,24 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             float newAlloc = 0.0;
             if (!overloaded)
             {
-                if (totalSoftDemand > LFPG_PROPAGATION_EPSILON)
+                ref LFPG_ElecNode allocTarget;
+                float allocTargetRatio = 0.0;
+                if (m_Nodes.Find(allocEdge.m_TargetNodeId, allocTarget) && allocTarget)
                 {
-                    // Has soft demand in this node's edges: allocate hard portion only.
-                    // Soft portion deferred to Pass 3 (surplus distribution).
-                    ref LFPG_ElecNode allocTarget;
-                    float allocTargetRatio = 0.0;
-                    if (m_Nodes.Find(allocEdge.m_TargetNodeId, allocTarget) && allocTarget)
-                    {
-                        allocTargetRatio = allocTarget.m_SoftDemandRatio;
-                    }
-                    float edgeHard = allocEdge.m_Demand * (1.0 - allocTargetRatio);
-                    if (edgeHard < 0.0)
-                    {
-                        edgeHard = 0.0;
-                    }
-                    newAlloc = edgeHard;
+                    allocTargetRatio = allocTarget.m_SoftDemandRatio;
                 }
-                else
+
+                float edgeSoft = allocEdge.m_Demand * allocTargetRatio;
+                float edgeHard = allocEdge.m_Demand - edgeSoft;
+                if (edgeHard < 0.0)
                 {
-                    // No soft demand anywhere → full demand (existing behavior).
-                    newAlloc = allocEdge.m_Demand;
+                    edgeHard = 0.0;
+                }
+
+                newAlloc = edgeHard;
+                if (edgeSoft > LFPG_PROPAGATION_EPSILON && softSurplus > LFPG_PROPAGATION_EPSILON && totalSoftDemand > LFPG_PROPAGATION_EPSILON)
+                {
+                    newAlloc = newAlloc + (softSurplus * edgeSoft / totalSoftDemand);
                 }
             }
             allocEdge.m_AllocatedPower = newAlloc;
@@ -3776,60 +3795,6 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 if (allocDelta > LFPG_PROPAGATION_EPSILON)
                 {
                     m_AllocChanged = true;
-                }
-            }
-        }
-
-        // v2.0 Pass 3: Distribute surplus to soft demand edges proportionally.
-        // Only runs when: not overloaded, totalSoftDemand > 0, and surplus exists.
-        // For non-battery networks this block is skipped entirely (totalSoftDemand=0).
-        if (!overloaded && totalSoftDemand > LFPG_PROPAGATION_EPSILON)
-        {
-            float surplus = availableOutput - totalAllocated;
-            if (surplus > LFPG_PROPAGATION_EPSILON)
-            {
-                // Cap surplus to total soft demand (don't over-allocate).
-                if (surplus > totalSoftDemand)
-                {
-                    surplus = totalSoftDemand;
-                }
-                int si;
-                for (si = 0; si < edgeCount; si = si + 1)
-                {
-                    m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
-                    ref LFPG_ElecEdge softEdge = outEdges[si];
-                    if (!softEdge)
-                        continue;
-                    if ((softEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
-                        continue;
-
-                    ref LFPG_ElecNode softTarget;
-                    if (!m_Nodes.Find(softEdge.m_TargetNodeId, softTarget))
-                        continue;
-                    if (!softTarget)
-                        continue;
-                    if (softTarget.m_SoftDemandRatio < LFPG_PROPAGATION_EPSILON)
-                        continue;
-
-                    // Proportional share: this edge's soft / totalSoft * surplus
-                    float thisEdgeSoft = softEdge.m_Demand * softTarget.m_SoftDemandRatio;
-                    float softBonus = surplus * thisEdgeSoft / totalSoftDemand;
-                    if (softBonus < 0.0)
-                    {
-                        softBonus = 0.0;
-                    }
-
-                    float prevAlloc = softEdge.m_AllocatedPower;
-                    softEdge.m_AllocatedPower = prevAlloc + softBonus;
-                    totalAllocated = totalAllocated + softBonus;
-
-                    if (!m_AllocChanged)
-                    {
-                        if (softBonus > LFPG_PROPAGATION_EPSILON)
-                        {
-                            m_AllocChanged = true;
-                        }
-                    }
                 }
             }
         }
