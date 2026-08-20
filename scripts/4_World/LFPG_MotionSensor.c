@@ -534,12 +534,12 @@ class LFPG_MotionSensor : LFPG_WireOwnerBase
             // 3. LOS dual-ray (standing torso + crouching center)
             targetHigh = playerPos;
             targetHigh[1] = targetHigh[1] + LFPG_SENSOR_TARGET_HIGH;
-            hasLOS = LFPG_CheckLineOfSight(sensorEye, targetHigh);
+            hasLOS = LFPG_CheckLineOfSight(sensorEye, targetHigh, pb);
             if (!hasLOS)
             {
                 targetLow = playerPos;
                 targetLow[1] = targetLow[1] + LFPG_SENSOR_TARGET_LOW;
-                hasLOS = LFPG_CheckLineOfSight(sensorEye, targetLow);
+                hasLOS = LFPG_CheckLineOfSight(sensorEye, targetLow, pb);
             }
             if (!hasLOS)
                 continue;
@@ -620,7 +620,7 @@ class LFPG_MotionSensor : LFPG_WireOwnerBase
     // ============================================
     // LOS raycast check
     // ============================================
-    protected bool LFPG_CheckLineOfSight(vector from, vector to)
+    protected bool LFPG_CheckLineOfSight(vector from, vector to, EntityAI targetEntity)
     {
         #ifdef SERVER
         vector hitPos;
@@ -637,6 +637,29 @@ class LFPG_MotionSensor : LFPG_WireOwnerBase
         if (!hit)
         {
             return true;
+        }
+
+        // A ray that hits the player (or an attached hierarchy entity such as
+        // clothing/equipment) has reached its intended target. The former
+        // distance-only test could classify the player's own collision shell
+        // as an obstruction depending on stance and orientation.
+        if (hitWith && targetEntity)
+        {
+            if (hitWith == targetEntity)
+            {
+                return true;
+            }
+
+            EntityAI hitEntity = EntityAI.Cast(hitWith);
+            if (hitEntity)
+            {
+                EntityAI hitRoot = hitEntity.GetHierarchyRoot();
+                EntityAI targetRoot = targetEntity.GetHierarchyRoot();
+                if (hitRoot && targetRoot && hitRoot == targetRoot)
+                {
+                    return true;
+                }
+            }
         }
 
         // v4.1: Linear margin (fixed 0.3m regardless of distance).

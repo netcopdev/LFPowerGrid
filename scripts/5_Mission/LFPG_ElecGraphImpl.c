@@ -435,22 +435,27 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             return false;
 
         // ==========================================
-        // PASO 1: Global hard-cap O(1)
-        // ==========================================
-        if (m_NodeCount >= LFPG_MAX_NODES_GLOBAL)
-        {
-            string capMsg = "[ElecGraph] OnWireAdded REJECTED: global cap (" + m_NodeCount.ToString() + "/" + LFPG_MAX_NODES_GLOBAL.ToString() + ")";
-            LFPG_Util.Warn(capMsg);
-            return false;
-        }
-
-        // ==========================================
         // PASO 2: Component Watchdog (v0.7.31)
         // ==========================================
         ref LFPG_ElecNode nodeA;
         ref LFPG_ElecNode nodeB;
         bool hasA = m_Nodes.Find(sourceId, nodeA);
         bool hasB = m_Nodes.Find(targetId, nodeB);
+
+        // Global cap applies to nodes introduced by this edge, not to every
+        // edge added after the graph happens to reach the cap. Replacements
+        // between existing nodes must remain possible at full capacity.
+        int newNodeCount = 0;
+        if (!hasA || !nodeA)
+            newNodeCount = newNodeCount + 1;
+        if (!hasB || !nodeB)
+            newNodeCount = newNodeCount + 1;
+        if (m_NodeCount + newNodeCount > LFPG_MAX_NODES_GLOBAL)
+        {
+            string capMsg = "[ElecGraph] OnWireAdded REJECTED: global cap (" + m_NodeCount.ToString() + "+" + newNodeCount.ToString() + "/" + LFPG_MAX_NODES_GLOBAL.ToString() + ")";
+            LFPG_Util.Warn(capMsg);
+            return false;
+        }
 
         // Fast-paths: only when components are clean (already rebuilt)
         int limit = LFPG_MAX_NODES_PER_COMPONENT;
@@ -2068,7 +2073,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             ValidateConsumerStates(edgeBudget);
 
             m_PropagationEdgeAccountingActive = false;
-            return 0;
+            return m_DirtyQueue.Count() - m_DirtyQueueHead;
         }
 
         int startMs = g_Game.GetTime();
@@ -2099,11 +2104,16 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             // Skip if already processed this epoch (dedup)
             if (node.m_LastEpoch == m_CurrentEpoch)
             {
-                // v0.7.40: Clear m_InQueue so future MarkNodeDirty can re-enqueue.
-                // Without this, nodes consumed by epoch-skip retain m_InQueue=true
-                // even though they are no longer in the queue, permanently blocking
-                // re-enqueue and leaving stale dirty state (zombie node).
+                // A same-epoch duplicate cannot be processed safely without an
+                // explicit epoch reset. Preserve it for the next epoch instead
+                // of leaving m_Dirty=true with no queue membership. That orphaned
+                // state made branches remain dormant until an unrelated event
+                // happened to mark the node again.
                 node.m_InQueue = false;
+                if (node.m_Dirty && m_DeferredRequeue.Find(nodeId) < 0)
+                {
+                    m_DeferredRequeue.Insert(nodeId);
+                }
                 continue;  // Sprint 4.3 fix: processed NOT incremented here
             }
 
@@ -2122,7 +2132,10 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 // m_InQueue=false allows future MarkNodeDirty to re-enqueue if
                 // an upstream re-dirty arrives before the deferred sweep runs.
                 node.m_InQueue = false;
-                m_DeferredRequeue.Insert(nodeId);
+                if (m_DeferredRequeue.Find(nodeId) < 0)
+                {
+                    m_DeferredRequeue.Insert(nodeId);
+                }
                 continue;
             }
 
@@ -2333,6 +2346,16 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                         // Preserve last known gate state to avoid phantom
                         // transition (closed→open surge or open→closed blackout).
                         gateIsClosed = node.m_GateClosed;
+                    }
+
+                    // A gate that cannot power its own electronics cannot remain
+                    // electrically open. Capture that close in the graph before
+                    // SyncNodeToEntity invokes device-specific power-loss logic;
+                    // otherwise the entity can close after this pass while the
+                    // cached graph gate remains open until another grid event.
+                    if (!newPowered)
+                    {
+                        gateIsClosed = true;
                     }
                 }
 
@@ -2630,10 +2653,12 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                                 // Only reset if they were actually processed this epoch
                                 // (m_LastEpoch == current); otherwise they haven't run
                                 // yet and don't need the reset.
-                                // v0.7.46: Also reset when m_AllocChanged — per-edge
-                                // allocations changed but outputDelta=0, downstream
-                                // already processed with old allocations this epoch.
-                                if ((forceDownstream || m_AllocChanged) && tgtNode.m_LastEpoch == m_CurrentEpoch)
+                                // Every path entering this block represents a real
+                                // downstream invalidation: outputDelta, topology,
+                                // allocation change, or input change. Reset any
+                                // target already processed this epoch so its queued
+                                // update is not consumed by the epoch-dedup guard.
+                                if (tgtNode.m_LastEpoch == m_CurrentEpoch)
                                 {
                                     int prevEpoch = m_CurrentEpoch - 1;
                                     tgtNode.m_LastEpoch = prevEpoch;
@@ -2740,6 +2765,10 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             // v0.7.32 (Bloque C): Validate consumers in steady-state.
             // Only runs when no pending propagation (queue fully drained).
             ValidateConsumerStates(edgeBudget);
+            // Validation can enqueue PASSTHROUGH nodes for a full graph-driven
+            // repair. Report those nodes to the scheduler instead of claiming
+            // the graph is quiescent for one tick.
+            remaining = m_DirtyQueue.Count() - m_DirtyQueueHead;
         }
         else if (m_DirtyQueueHead >= LFPG_DIRTY_QUEUE_COMPACT_THRESHOLD)
         {
@@ -2905,8 +2934,9 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     //   - Budgeted: checks LFPG_VALIDATE_BATCH_SIZE (32) nodes per call.
     //   - Round-robin via m_ValidateNodeIdx — full sweep of N nodes takes
     //     ceil(N/32) invocations × interval each = predictable spread.
-    //   - When a zombie is found: sets m_Powered=false, syncs to entity,
-    //     and logs for telemetry. Does NOT re-enqueue (avoids cascading).
+    //   - Leaf consumers are repaired directly. PASSTHROUGH mismatches are
+    //     re-enqueued because their output, allocations, gates, and neighbours
+    //     must converge together; changing only m_Powered leaves stale branches.
     //
     // Power source: reads inEdge.m_AllocatedPower directly (NOT via
     //   GetEdgeAllocatedPower). Intentional: the helper's equal-split
@@ -3006,15 +3036,24 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 incomingPower = 0.0;
             }
 
-            // Determine if this consumer should actually be powered
+            // Determine if this consumer should actually be powered. Batteries
+            // and other storage-backed PASSTHROUGH nodes can power themselves
+            // from virtual generation even with no incoming allocation.
             bool shouldBePowered = false;
+            float effectivePower = incomingPower;
+            bool hasUsablePower = hasAnyIncoming;
+            if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH && node.m_VirtualGeneration > LFPG_PROPAGATION_EPSILON)
+            {
+                effectivePower = effectivePower + node.m_VirtualGeneration;
+                hasUsablePower = true;
+            }
 
-            if (hasAnyIncoming)
+            if (hasUsablePower)
             {
                 if (node.m_Consumption > LFPG_PROPAGATION_EPSILON)
                 {
                     // Declared consumption: needs enough power to meet demand
-                    if (incomingPower + LFPG_PROPAGATION_EPSILON >= node.m_Consumption)
+                    if (effectivePower + LFPG_PROPAGATION_EPSILON >= node.m_Consumption)
                     {
                         shouldBePowered = true;
                     }
@@ -3022,11 +3061,37 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 else
                 {
                     // Legacy consumer (consumption=0): any power suffices
-                    if (incomingPower > LFPG_PROPAGATION_EPSILON)
+                    if (effectivePower > LFPG_PROPAGATION_EPSILON)
                     {
                         shouldBePowered = true;
                     }
                 }
+            }
+
+            bool powerMismatch = false;
+            if (node.m_Powered != shouldBePowered)
+            {
+                powerMismatch = true;
+            }
+
+            // PASSTHROUGH state cannot be repaired by changing m_Powered alone:
+            // output power, edge allocations, gate state, and both neighbours may
+            // also need updates. Queue a normal propagation pass so the complete
+            // electrical state converges atomically.
+            if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH && powerMismatch)
+            {
+                MarkNodeDirty(nodeId, LFPG_DIRTY_INPUT);
+
+                fixed = fixed + 1;
+                m_ValidateFixCount = m_ValidateFixCount + 1;
+
+                string ptRepairMsg = "[ElecGraph] Passthrough repair queued: " + nodeId;
+                ptRepairMsg = ptRepairMsg + " powered=" + node.m_Powered.ToString();
+                ptRepairMsg = ptRepairMsg + " shouldBe=" + shouldBePowered.ToString();
+                ptRepairMsg = ptRepairMsg + " incoming=" + incomingPower.ToString();
+                ptRepairMsg = ptRepairMsg + " virtual=" + node.m_VirtualGeneration.ToString();
+                LFPG_Util.Warn(ptRepairMsg);
+                continue;
             }
 
             // v5.0 debug: trace BatteryCharger node state on each visit
