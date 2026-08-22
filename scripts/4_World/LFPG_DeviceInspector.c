@@ -281,6 +281,8 @@ class LFPG_DeviceInspector
         // ---- Force geometry from code (layout pos/size unreliable in FrameWidgetClass) ----
         // Compute max panel height for initial sizing (will be adjusted by ResizePanelHeight)
         float maxH = ComputePanelHeight(LFPG_INSPECT_MAX_WIRES);
+        float contentW = LFPG_INSPECT_PANEL_W - 26.0;
+        float separatorW = LFPG_INSPECT_PANEL_W - 24.0;
         m_CurrentPanelH = maxH;
 
         // Panel container
@@ -327,7 +329,7 @@ class LFPG_DeviceInspector
         if (imgSep)
         {
             imgSep.SetPos(12, 93);
-            imgSep.SetSize(276, 1);
+            imgSep.SetSize(separatorW, 1);
             imgSep.LoadImageFile(0, procTex);
             imgSep.SetColor(COL_SEP);
         }
@@ -336,29 +338,29 @@ class LFPG_DeviceInspector
         if (m_wDeviceName)
         {
             m_wDeviceName.SetPos(14, 7);
-            m_wDeviceName.SetSize(274, 22);
+            m_wDeviceName.SetSize(contentW, 22);
             m_wDeviceName.SetColor(COL_TEXT_WHITE);
         }
         if (m_wDeviceType)
         {
             m_wDeviceType.SetPos(14, 30);
-            m_wDeviceType.SetSize(274, 16);
+            m_wDeviceType.SetSize(contentW, 16);
         }
         if (m_wStatusLine)
         {
             m_wStatusLine.SetPos(14, 54);
-            m_wStatusLine.SetSize(274, 16);
+            m_wStatusLine.SetSize(contentW, 16);
         }
         if (m_wCapLine)
         {
             m_wCapLine.SetPos(14, 74);
-            m_wCapLine.SetSize(274, 16);
+            m_wCapLine.SetSize(contentW, 16);
             m_wCapLine.SetColor(COL_GRAY);
         }
         if (m_wTankLine)
         {
             m_wTankLine.SetPos(14, 94);
-            m_wTankLine.SetSize(274, 16);
+            m_wTankLine.SetSize(contentW, 16);
             m_wTankLine.SetColor(COL_BLUE_BRIGHT);
             m_wTankLine.Show(false);
         }
@@ -367,7 +369,7 @@ class LFPG_DeviceInspector
         if (m_wFuelLine)
         {
             m_wFuelLine.SetPos(14, 94);
-            m_wFuelLine.SetSize(274, 16);
+            m_wFuelLine.SetSize(contentW, 16);
             m_wFuelLine.SetColor(COL_ORANGE);
             m_wFuelLine.Show(false);
         }
@@ -376,7 +378,7 @@ class LFPG_DeviceInspector
         if (m_wReserveLine)
         {
             m_wReserveLine.SetPos(14, 114);
-            m_wReserveLine.SetSize(274, 16);
+            m_wReserveLine.SetSize(contentW, 16);
             m_wReserveLine.SetColor(COL_ORANGE);
             m_wReserveLine.Show(false);
         }
@@ -385,7 +387,7 @@ class LFPG_DeviceInspector
         if (m_wLinkLine)
         {
             m_wLinkLine.SetPos(14, 94);
-            m_wLinkLine.SetSize(274, 16);
+            m_wLinkLine.SetSize(contentW, 16);
             m_wLinkLine.SetColor(COL_EMERALD);
             m_wLinkLine.Show(false);
         }
@@ -394,7 +396,7 @@ class LFPG_DeviceInspector
         if (m_wBatteryLine)
         {
             m_wBatteryLine.SetPos(14, 94);
-            m_wBatteryLine.SetSize(360, 18);
+            m_wBatteryLine.SetSize(contentW, 18);
             m_wBatteryLine.SetColor(COL_YELLOW);
             m_wBatteryLine.Show(false);
         }
@@ -402,7 +404,7 @@ class LFPG_DeviceInspector
         if (m_wWiresHeader)
         {
             m_wWiresHeader.SetPos(14, 99);
-            m_wWiresHeader.SetSize(274, 16);
+            m_wWiresHeader.SetSize(contentW, 16);
             m_wWiresHeader.SetColor(COL_TEXT_LIGHT);
         }
 
@@ -418,7 +420,7 @@ class LFPG_DeviceInspector
             {
                 float wireY = LFPG_INSPECT_PANEL_BASE_H + 2.0 + (wi * LFPG_INSPECT_WIRE_ROW_H);
                 tw.SetPos(14, wireY);
-                tw.SetSize(274, 14);
+                tw.SetSize(contentW, 14);
                 m_wWireSlots.Insert(tw);
             }
             else
@@ -1225,9 +1227,28 @@ class LFPG_DeviceInspector
 
                 if (!batOutEnabled)
                 {
-                    // Output disabled (switch off)
-                    batText = batText + "  [OFF]";
-                    batColor = COL_OLIVE;
+                    // Output switch only gates discharge/passthrough. Continue
+                    // showing the live charge state so OFF is not mistaken for
+                    // a disabled battery charger.
+                    batText = batText + "  [OUT OFF]";
+                    if (batRate > 0.5)
+                    {
+                        int offChgRate = batRate;
+                        batText = batText + "  CHG +";
+                        batText = batText + offChgRate.ToString();
+                        batText = batText + " u/s";
+                        batColor = COL_CYAN;
+                    }
+                    else if (batPct >= 100)
+                    {
+                        batText = batText + "  FULL";
+                        batColor = COL_GREEN_OK;
+                    }
+                    else
+                    {
+                        batText = batText + "  IDLE";
+                        batColor = COL_OLIVE;
+                    }
                 }
                 else if (batRate > 0.5)
                 {
