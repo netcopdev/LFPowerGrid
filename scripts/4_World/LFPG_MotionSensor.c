@@ -1,5 +1,5 @@
 // =========================================================
-// LF_PowerGrid - Motion Sensor (v4.2)
+// LF_PowerGrid - Motion Sensor (v4.3)
 //
 // LFPG_MotionSensor_Kit: Holdable, deployable (same-model pattern).
 // LFPG_MotionSensor:     PASSTHROUGH, 1 IN (input_1) + 1 OUT (output_1).
@@ -21,6 +21,12 @@
 //   - 360° omnidirectional detection (removed 120° FOV cone)
 //   - Walls and objects block LOS via raycast
 //   - Pipeline: Range sphere → Group filter → LOS raycast
+//
+// v4.3:
+//   - Detection state is independent from transient graph power state.
+//   - Power loss no longer silently closes the gate inside LFPG_SetPowered.
+//   - Detection continues while unpowered; the graph still blocks physical
+//     output until the sensor receives its self-consumption power.
 //
 // Behavior:
 //   Centralized tick in NetworkManager scans nearby players.
@@ -209,12 +215,6 @@ class LFPG_MotionSensor : LFPG_WireOwnerBase
             return;
 
         m_PoweredNet = powered;
-
-        if (!powered && m_GateOpen)
-        {
-            m_GateOpen = false;
-            m_GateHoldUntil = 0.0;
-        }
 
         SetSynchDirty();
 
@@ -446,18 +446,6 @@ class LFPG_MotionSensor : LFPG_WireOwnerBase
     bool LFPG_EvaluateDetection(array<Man> players)
     {
         #ifdef SERVER
-        if (!m_PoweredNet)
-        {
-            if (m_GateOpen)
-            {
-                m_GateOpen = false;
-                m_GateHoldUntil = 0.0;
-                SetSynchDirty();
-                return true;
-            }
-            return false;
-        }
-
         vector sensorPos = GetPosition();
 
         // ---- Compute sensorEye (raycast origin in open space) ----
