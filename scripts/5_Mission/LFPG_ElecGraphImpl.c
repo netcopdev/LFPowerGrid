@@ -2628,14 +2628,14 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             if (outputDelta < 0.0)
                 outputDelta = -outputDelta;
 
-            // v2.2 (Fix Bug #1): PASSTHROUGH input change detection.
-            // When a PASSTHROUGH has stable demand signal (outputDelta=0) but
-            // its inputSum changed (e.g. one of N sources cleared overload),
-            // propagation must trigger so upstream sources get re-evaluated.
-            // Without this, the three original conditions (outputDelta,
-            // forceDownstream, m_AllocChanged) all fail simultaneously for
-            // multi-source topologies, causing permanent overload deadlock.
-            // Only applies to PASSTHROUGH — SOURCE/CONSUMER unaffected.
+            // PASSTHROUGH input change detection. A changed input allocation must
+            // be propagated downstream even when the node's advertised demand is
+            // stable. It must NOT, by itself, invalidate upstream: doing that
+            // creates a bidirectional feedback wave (upstream reallocates -> input
+            // changes -> upstream reallocates again) which can alternate binary
+            // allocations until the per-epoch requeue guard is reached.
+            // Upstream is invalidated below only when the advertised demand really
+            // changes. Gate transitions have their own explicit upstream mark.
             bool inputChanged = false;
             if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
             {
@@ -2679,9 +2679,9 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             // total output (outputDelta) is unchanged. Example: SOURCE always
             // outputs 50, but splits 10→20 for a splitter after demand increase.
             // Without this, downstream never re-reads the new allocation.
-            // v2.2: inputChanged — PASSTHROUGH input changed but demand signal
-            // (output) is stable. Triggers upstream re-evaluation for multi-source
-            // convergence (Fix Bug #1).
+            // inputChanged — PASSTHROUGH input changed but demand signal (output)
+            // is stable. This refreshes downstream power state without feeding the
+            // allocation result back into its upstream cause.
             if (outputDelta > LFPG_PROPAGATION_EPSILON || forceDownstream || m_AllocChanged || inputChanged)
             {
                 node.m_OutputPower = newOutput;
@@ -2724,7 +2724,10 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                     }
                 }
 
-                // v0.7.40: Upstream demand propagation for PASSTHROUGH nodes.
+                // Upstream demand propagation for PASSTHROUGH nodes. Only a real
+                // advertised-demand change belongs upstream. m_AllocChanged and
+                // inputChanged are allocation results and flow downstream only;
+                // reflecting either upstream creates a solver feedback loop.
                 // When a PASSTHROUGH output changes, upstream sources must
                 // re-evaluate because they use m_LastStableOutput as demand.
                 // Without this, the source processes first during warmup with
@@ -2737,7 +2740,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 // Safe: bounded by m_RequeueCount (LFPG_MAX_REQUEUE_PER_EPOCH).
                 // Convergence: SOURCE output is fixed (m_MaxOutput), so re-processing
                 // only updates loadRatio/masks — no cascading downstream changes.
-                if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
+                if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH && outputDelta > LFPG_PROPAGATION_EPSILON)
                 {
                     ref array<ref LFPG_ElecEdge> upEdges;
                     if (m_Incoming.Find(nodeId, upEdges) && upEdges)
