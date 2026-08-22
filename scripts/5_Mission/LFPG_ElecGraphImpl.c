@@ -186,7 +186,8 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
 
     // Reconstructs the entire graph from existing wire data.
     // Called once at server startup after all loads complete.
-    // Does NOT modify the wire data — read only.
+    // Does NOT modify the wire data — read only. Invalid persisted cycle-closing
+    // edges are omitted from the runtime graph so propagation remains a DAG.
     override void RebuildFromWires(LFPG_NetworkManager mgr)
     {
         #ifdef SERVER
@@ -259,6 +260,24 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 if (!wd)
                     continue;
 
+                // Runtime wiring rejects directed cycles before persistence, but
+                // old saves and legacy/import paths can contain them. Feeding a
+                // cycle into the demand/allocation solver has no fixed topological
+                // order: overload walks around the loop and clients see the same
+                // branch alternate CRITICAL (orange) and POWERED (green).
+                //
+                // Rebuild is intentionally read-only, so omit only the edge that
+                // closes the cycle. The remaining edges form a deterministic DAG
+                // and keep the maximum useful portion of the persisted network.
+                if (DetectCycleIfAdded(srcId, wd.m_TargetDeviceId))
+                {
+                    string lfCycleMsg = "[ElecGraph] Rebuild omitted cycle-closing LFPG edge ";
+                    lfCycleMsg = lfCycleMsg + srcId + " -> " + wd.m_TargetDeviceId;
+                    lfCycleMsg = lfCycleMsg + " port=" + wd.m_SourcePort + "->" + wd.m_TargetPort;
+                    LFPG_Util.Warn(lfCycleMsg);
+                    continue;
+                }
+
                 AddEdgeInternal(srcId, wd.m_TargetDeviceId, wd.m_SourcePort, wd.m_TargetPort, wd);
             }
         }
@@ -283,6 +302,15 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 string srcPort = vwd.m_SourcePort;
                 if (srcPort == "")
                     srcPort = LFPG_PORT_OUTPUT_1;
+
+                if (DetectCycleIfAdded(vOwnerId, vwd.m_TargetDeviceId))
+                {
+                    string vanCycleMsg = "[ElecGraph] Rebuild omitted cycle-closing vanilla edge ";
+                    vanCycleMsg = vanCycleMsg + vOwnerId + " -> " + vwd.m_TargetDeviceId;
+                    vanCycleMsg = vanCycleMsg + " port=" + srcPort + "->" + vwd.m_TargetPort;
+                    LFPG_Util.Warn(vanCycleMsg);
+                    continue;
+                }
 
                 AddEdgeInternal(vOwnerId, vwd.m_TargetDeviceId, srcPort, vwd.m_TargetPort, vwd);
             }
@@ -433,6 +461,19 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
 
         if (sourceId == targetId)
             return false;
+
+        // Keep the graph invariant at the mutation boundary. RPC wiring already
+        // performs this pre-check for a friendly player-facing error, but other
+        // callers (addons, repair paths, future imports) can invoke OnWireAdded
+        // directly. A directed cycle makes downstream demand feed back into its
+        // own upstream allocation and produces persistent orange/green flicker.
+        if (DetectCycleIfAdded(sourceId, targetId))
+        {
+            string cycleMsg = "[ElecGraph] OnWireAdded REJECTED: directed cycle ";
+            cycleMsg = cycleMsg + sourceId + " -> " + targetId;
+            LFPG_Util.Warn(cycleMsg);
+            return false;
+        }
 
         // ==========================================
         // PASO 2: Component Watchdog (v0.7.31)
@@ -2338,6 +2379,24 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                         if (!gateOpen)
                         {
                             gateIsClosed = true;
+
+                            // Brownout latch: SyncNodeToEntity(false) makes
+                            // sensor/switch entities fail-safe closed. If the
+                            // graph accepted that induced close immediately,
+                            // upstream demand would collapse to the probe value,
+                            // power would return, the live gate would reopen, and
+                            // the full downstream demand would overload upstream
+                            // again. That is the observed orange/green loop on an
+                            // already-wired branch.
+                            //
+                            // A graph gate that was open before losing power must
+                            // therefore keep advertising its open-path demand while
+                            // it is unpowered. An intentional closed gate is already
+                            // represented by m_GateClosed=true and is unaffected.
+                            if (!newPowered && !node.m_GateClosed)
+                            {
+                                gateIsClosed = false;
+                            }
                         }
                     }
                     else
@@ -2348,15 +2407,11 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                         gateIsClosed = node.m_GateClosed;
                     }
 
-                    // A gate that cannot power its own electronics cannot remain
-                    // electrically open. Capture that close in the graph before
-                    // SyncNodeToEntity invokes device-specific power-loss logic;
-                    // otherwise the entity can close after this pass while the
-                    // cached graph gate remains open until another grid event.
-                    if (!newPowered)
-                    {
-                        gateIsClosed = true;
-                    }
+                    // Do not force the cached gate closed merely because input
+                    // power is absent. The entity still fails safe via
+                    // LFPG_SetPowered(false), while the graph retains the demand
+                    // that caused the brownout and can converge to a stable
+                    // overload state instead of alternating probe/full demand.
                 }
 
                 // v2.2 (Fix Bug #2): SOURCE must publish m_OutputPower
