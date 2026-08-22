@@ -8,7 +8,7 @@
 // v4.0: Migrated from Inventory_Base to LFPG_WireOwnerBase.
 //   Wire store, wire API, persistence wireJSON, CanConnectTo — all in base.
 //   FIX: Per-instance CallLater(30s) replaced with RegisterFurnace/
-//   UnregisterFurnace in NM. BurnTick now checks m_BurnNextMs timing
+//   UnregisterFurnace in NM. BurnTick now checks m_BurnNextSec timing
 //   (NM polls every 5s, burn fires every 30s).
 //
 // Memory point: port_output_1 (matches base pattern, no override needed).
@@ -53,8 +53,11 @@ class LFPG_Furnace : LFPG_WireOwnerBase
 
     // ---- Burn timing (server-only, not persisted) ----
     // NM ticks every 5s, burn fires every 30s.
-    // BurnTick checks: if now < m_BurnNextMs, skip.
-    protected int m_BurnNextMs = 0;
+    // GetTime() is a signed millisecond counter and eventually wraps. An
+    // absolute int deadline can therefore strand an already-running furnace
+    // in generation mode without ever consuming fuel. GetTickTime() gives us
+    // a mission-scoped float clock that is safe for this short interval.
+    protected float m_BurnNextSec = 0.0;
 
     // ---- Client: sound + particle ----
 #ifndef SERVER
@@ -247,8 +250,8 @@ class LFPG_Furnace : LFPG_WireOwnerBase
         LFPG_NetworkManager nm = LFPG_NetworkManager.Get();
         if (m_SourceOn && m_FuelCurrent > 0)
         {
-            int now = g_Game.GetTime();
-            m_BurnNextMs = now + LFPG_FURNACE_BURN_INTERVAL_MS;
+            float nowSec = g_Game.GetTickTime();
+            m_BurnNextSec = nowSec + (LFPG_FURNACE_BURN_INTERVAL_MS / 1000.0);
             if (nm) nm.RegisterFurnace(this);
         }
 
@@ -258,8 +261,8 @@ class LFPG_Furnace : LFPG_WireOwnerBase
             bool restoreConsumed = LFPG_AutoConsumeLargestItem();
             if (restoreConsumed)
             {
-                int now2 = g_Game.GetTime();
-                m_BurnNextMs = now2 + LFPG_FURNACE_BURN_INTERVAL_MS;
+                float nowSec2 = g_Game.GetTickTime();
+                m_BurnNextSec = nowSec2 + (LFPG_FURNACE_BURN_INTERVAL_MS / 1000.0);
                 if (nm) nm.RegisterFurnace(this);
             }
             else
@@ -446,11 +449,11 @@ class LFPG_Furnace : LFPG_WireOwnerBase
             return;
 
         // Timing gate: NM polls every 5s, but burn happens every 30s
-        int now = g_Game.GetTime();
-        if (now < m_BurnNextMs)
+        float nowSec = g_Game.GetTickTime();
+        if (nowSec < m_BurnNextSec)
             return;
 
-        m_BurnNextMs = now + LFPG_FURNACE_BURN_INTERVAL_MS;
+        m_BurnNextSec = nowSec + (LFPG_FURNACE_BURN_INTERVAL_MS / 1000.0);
 
         if (m_FuelCurrent > 0)
         {
@@ -526,8 +529,8 @@ class LFPG_Furnace : LFPG_WireOwnerBase
             if (canIgnite)
             {
                 m_SourceOn = true;
-                int now = g_Game.GetTime();
-                m_BurnNextMs = now + LFPG_FURNACE_BURN_INTERVAL_MS;
+                float nowSec = g_Game.GetTickTime();
+                m_BurnNextSec = nowSec + (LFPG_FURNACE_BURN_INTERVAL_MS / 1000.0);
                 LFPG_NetworkManager nm2 = LFPG_NetworkManager.Get();
                 if (nm2) nm2.RegisterFurnace(this);
                 SetSynchDirty();
