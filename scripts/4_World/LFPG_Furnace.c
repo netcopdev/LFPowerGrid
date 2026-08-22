@@ -590,7 +590,23 @@ class LFPG_Furnace : LFPG_WireOwnerBase
             }
         }
 
-        fuel = w * h * qty;
+        // Valid inventory items from other mods do not always declare an
+        // itemSize. Treat them as a minimum 1x1 fuel item instead of returning
+        // zero and making the furnace reject them.
+        if (w <= 0)
+            w = 1;
+        if (h <= 0)
+            h = 1;
+
+        int squares = w * h;
+        if (qty > LFPG_FURNACE_MAX_FUEL / squares)
+        {
+            fuel = LFPG_FURNACE_MAX_FUEL;
+        }
+        else
+        {
+            fuel = squares * qty;
+        }
 
         GameInventory inv = item.GetInventory();
         if (!inv) return fuel;
@@ -602,7 +618,11 @@ class LFPG_Furnace : LFPG_WireOwnerBase
             for (ci = 0; ci < cargoCount; ci = ci + 1)
             {
                 EntityAI cargoItem = cargo.GetItem(ci);
-                fuel = fuel + LFPG_CalcFuelRecursive(cargoItem);
+                int cargoFuel = LFPG_CalcFuelRecursive(cargoItem);
+                if (cargoFuel >= LFPG_FURNACE_MAX_FUEL - fuel)
+                    fuel = LFPG_FURNACE_MAX_FUEL;
+                else
+                    fuel = fuel + cargoFuel;
             }
         }
 
@@ -611,7 +631,11 @@ class LFPG_Furnace : LFPG_WireOwnerBase
         for (ai = 0; ai < attCount; ai = ai + 1)
         {
             EntityAI att = item.GetInventory().GetAttachmentFromIndex(ai);
-            fuel = fuel + LFPG_CalcFuelRecursive(att);
+            int attachmentFuel = LFPG_CalcFuelRecursive(att);
+            if (attachmentFuel >= LFPG_FURNACE_MAX_FUEL - fuel)
+                fuel = LFPG_FURNACE_MAX_FUEL;
+            else
+                fuel = fuel + attachmentFuel;
         }
 
         return fuel;
@@ -655,26 +679,35 @@ class LFPG_Furnace : LFPG_WireOwnerBase
         return fuel;
     }
 
-    void LFPG_AddFuel(int amount)
+    int LFPG_AddFuel(int amount)
     {
         #ifdef SERVER
         if (amount <= 0)
-            return;
+            return 0;
 
-        m_FuelCurrent = m_FuelCurrent + amount;
-        if (m_FuelCurrent > LFPG_FURNACE_MAX_FUEL)
-        {
-            m_FuelCurrent = LFPG_FURNACE_MAX_FUEL;
-        }
+        int remaining = LFPG_FURNACE_MAX_FUEL - m_FuelCurrent;
+        if (remaining <= 0)
+            return 0;
+
+        int accepted = amount;
+        if (accepted > remaining)
+            accepted = remaining;
+
+        m_FuelCurrent = m_FuelCurrent + accepted;
         SetSynchDirty();
 
         string fuelMsg = "[LFPG_Furnace] Fuel added: +";
+        fuelMsg = fuelMsg + accepted.ToString();
+        fuelMsg = fuelMsg + "/";
         fuelMsg = fuelMsg + amount.ToString();
         fuelMsg = fuelMsg + " total=";
         fuelMsg = fuelMsg + m_FuelCurrent.ToString();
         fuelMsg = fuelMsg + " id=";
         fuelMsg = fuelMsg + m_DeviceId;
         LFPG_Util.Info(fuelMsg);
+        return accepted;
+        #else
+        return 0;
         #endif
     }
 
