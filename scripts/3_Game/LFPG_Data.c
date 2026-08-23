@@ -248,6 +248,11 @@ class LFPG_ElecNode
     float  m_SoftDemand;
     float  m_SoftDemandRatio;
 
+    // Last physical supplier count observed for this node. AllocateOutput
+    // uses transitions to re-evaluate sibling inputs of multi-source targets
+    // when a source is switched on or off without changing total demand.
+    int    m_ActiveSupplierCount;
+
     void LFPG_ElecNode()
     {
         m_DeviceId = "";
@@ -273,6 +278,7 @@ class LFPG_ElecNode
         m_VirtualGeneration = 0.0;
         m_SoftDemand = 0.0;
         m_SoftDemandRatio = 0.0;
+        m_ActiveSupplierCount = -1;
     }
 };
 
