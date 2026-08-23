@@ -2414,12 +2414,10 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                     // overload state instead of alternating probe/full demand.
                 }
 
-                // v2.2 (Fix Bug #2): SOURCE must publish m_OutputPower
-                // BEFORE AllocateOutput so CountPoweredIncoming sees it
-                // when evaluating multi-source PASSTHROUGH targets.
-                // Without this, a newly-powered SOURCE has m_OutputPower=0
-                // from the previous epoch, CountPoweredIncoming undercounts,
-                // demand is not split, and the SOURCE falsely overloads.
+                // SOURCE publishes its real output before AllocateOutput so
+                // downstream cold-start/fallback readers see current capacity.
+                // Multi-source supplier counting now uses powered state plus
+                // physical capacity rather than this output cache.
                 // PASSTHROUGH excluded: newOutput changes later (demand signal
                 // override), so early-set would be incorrect.
                 if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
@@ -3578,7 +3576,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     // request among suppliers that cannot actually deliver power.
     // Returns 0 if node has no incoming edges or none can supply power.
     // Cost: O(K) where K = incoming edge count (typically 1-2 for Combiner).
-    protected int CountPoweredIncoming(string nodeId)
+    protected int CountPoweredIncoming(string nodeId, string evaluatingSourceId)
     {
         ref array<ref LFPG_ElecEdge> inEdges;
         if (!m_Incoming.Find(nodeId, inEdges) || !inEdges)
@@ -3612,7 +3610,17 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                     // Consumption is reserved before anything can pass through.
                     // A closed gate has no deliverable output even while its own
                     // electronics remain powered.
-                    if (!cpSrcNode.m_GateClosed)
+                    bool supplierGateClosed = cpSrcNode.m_GateClosed;
+                    if (cpSrcNode.m_IsGated)
+                    {
+                        EntityAI supplierEntity = LFPG_DeviceRegistry.Get().FindById(cpEdge.m_SourceNodeId);
+                        if (supplierEntity)
+                        {
+                            supplierGateClosed = !LFPG_DeviceAPI.IsGateOpen(supplierEntity);
+                        }
+                    }
+
+                    if (!supplierGateClosed)
                     {
                         availablePower = cpSrcNode.m_InputPower + cpSrcNode.m_VirtualGeneration - cpSrcNode.m_Consumption;
                         if (availablePower < 0.0)
@@ -3632,6 +3640,33 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 }
             }
         }
+        // A supplier transition does not necessarily change the target's total
+        // demand, so normal upstream demand propagation will not revisit its
+        // sibling inputs. Requeue only those siblings when the physical count
+        // changes. The currently evaluating supplier already uses the new count.
+        ref LFPG_ElecNode targetNode;
+        if (m_Nodes.Find(nodeId, targetNode) && targetNode)
+        {
+            int previousCount = targetNode.m_ActiveSupplierCount;
+            targetNode.m_ActiveSupplierCount = count;
+            if (previousCount >= 0 && previousCount != count)
+            {
+                int spi;
+                for (spi = 0; spi < inEdges.Count(); spi = spi + 1)
+                {
+                    ref LFPG_ElecEdge siblingEdge = inEdges[spi];
+                    if (!siblingEdge)
+                        continue;
+                    if ((siblingEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                        continue;
+                    if (siblingEdge.m_SourceNodeId == "" || siblingEdge.m_SourceNodeId == evaluatingSourceId)
+                        continue;
+
+                    MarkNodeDirty(siblingEdge.m_SourceNodeId, LFPG_DIRTY_INPUT);
+                }
+            }
+        }
+
         return count;
     }
 
@@ -3768,7 +3803,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                     }
 
                     // v0.9.3: Multi-source demand split for Combiner pattern.
-                    int ptPoweredIn = CountPoweredIncoming(edge.m_TargetNodeId);
+                    int ptPoweredIn = CountPoweredIncoming(edge.m_TargetNodeId, nodeId);
                     if (ptPoweredIn > 1)
                     {
                         edgeDemand = edgeDemand / ptPoweredIn;
