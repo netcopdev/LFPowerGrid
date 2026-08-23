@@ -3571,10 +3571,12 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         return count;
     }
 
-    // v0.8.3: Count powered incoming edges for multi-source demand sharing.
-    // Used in AllocateOutput to proportionally divide
-    // PASSTHROUGH demand among active suppliers for LoadRatio calculation.
-    // Returns 0 if node has no incoming edges or none are powered.
+    // Count incoming edges whose source has physical power available for
+    // multi-source demand sharing. PASSTHROUGH m_OutputPower is an advertised
+    // demand signal, not real supply, so it must not be used here: an inactive
+    // branch can retain a positive demand signal and make a combiner divide its
+    // request among suppliers that cannot actually deliver power.
+    // Returns 0 if node has no incoming edges or none can supply power.
     // Cost: O(K) where K = incoming edge count (typically 1-2 for Combiner).
     protected int CountPoweredIncoming(string nodeId)
     {
@@ -3596,7 +3598,35 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             ref LFPG_ElecNode cpSrcNode;
             if (m_Nodes.Find(cpEdge.m_SourceNodeId, cpSrcNode) && cpSrcNode)
             {
-                if (cpSrcNode.m_OutputPower > LFPG_PROPAGATION_EPSILON)
+                float availablePower = 0.0;
+                if (cpSrcNode.m_DeviceType == LFPG_DeviceType.SOURCE)
+                {
+                    if (cpSrcNode.m_Powered)
+                    {
+                        availablePower = cpSrcNode.m_MaxOutput;
+                    }
+                }
+                else if (cpSrcNode.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
+                {
+                    // InputPower and VirtualGeneration are physical supply.
+                    // Consumption is reserved before anything can pass through.
+                    // A closed gate has no deliverable output even while its own
+                    // electronics remain powered.
+                    if (!cpSrcNode.m_GateClosed)
+                    {
+                        availablePower = cpSrcNode.m_InputPower + cpSrcNode.m_VirtualGeneration - cpSrcNode.m_Consumption;
+                        if (availablePower < 0.0)
+                        {
+                            availablePower = 0.0;
+                        }
+                        if (cpSrcNode.m_MaxOutput > LFPG_PROPAGATION_EPSILON && availablePower > cpSrcNode.m_MaxOutput)
+                        {
+                            availablePower = cpSrcNode.m_MaxOutput;
+                        }
+                    }
+                }
+
+                if (availablePower > LFPG_PROPAGATION_EPSILON)
                 {
                     count = count + 1;
                 }
