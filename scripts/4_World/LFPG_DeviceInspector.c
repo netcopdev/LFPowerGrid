@@ -129,6 +129,7 @@ class LFPG_DeviceInspector
     protected float m_LinkLineOffset;
     // v2.1: Battery line for charge display
     protected TextWidget m_wBatteryLine;
+    protected TextWidget m_wBatteryStatusLine;
     protected float m_BatteryLineOffset;
 
     // ---- Position smoothing (P1-A anti-jitter) ----
@@ -276,6 +277,7 @@ class LFPG_DeviceInspector
         m_wReserveLine = TextWidget.Cast(m_Root.FindAnyWidget("ReserveLine"));
         m_wLinkLine = TextWidget.Cast(m_Root.FindAnyWidget("LinkLine"));
         m_wBatteryLine = TextWidget.Cast(m_Root.FindAnyWidget("BatteryLine"));
+        m_wBatteryStatusLine = TextWidget.Cast(m_Root.FindAnyWidget("BatteryStatusLine"));
         m_wWiresHeader = TextWidget.Cast(m_Root.FindAnyWidget("WiresHeader"));
 
         // ---- Force geometry from code (layout pos/size unreliable in FrameWidgetClass) ----
@@ -400,6 +402,13 @@ class LFPG_DeviceInspector
             m_wBatteryLine.SetColor(COL_YELLOW);
             m_wBatteryLine.Show(false);
         }
+        if (m_wBatteryStatusLine)
+        {
+            m_wBatteryStatusLine.SetPos(14, 114);
+            m_wBatteryStatusLine.SetSize(contentW, 18);
+            m_wBatteryStatusLine.SetColor(COL_GRAY_MID);
+            m_wBatteryStatusLine.Show(false);
+        }
         m_BatteryLineOffset = 0.0;
         if (m_wWiresHeader)
         {
@@ -456,6 +465,7 @@ class LFPG_DeviceInspector
         m_wReserveLine = null;
         m_wLinkLine = null;
         m_wBatteryLine = null;
+        m_wBatteryStatusLine = null;
         m_wWiresHeader = null;
         m_wWireSlots.Clear();
         m_RespWires.Clear();
@@ -1213,7 +1223,9 @@ class LFPG_DeviceInspector
                 int batStoredInt = batStored;
                 int batMaxInt = batMax;
 
-                // Base text: "Charge: 5000/10000 (50%)"
+                // Keep capacity and operating state on separate rows. Large
+                // capacities plus the flow suffix do not fit reliably on one
+                // line at every UI scale.
                 string batText = "Charge: ";
                 batText = batText + batStoredInt.ToString();
                 batText = batText + "/";
@@ -1222,82 +1234,82 @@ class LFPG_DeviceInspector
                 batText = batText + batPct.ToString();
                 batText = batText + "%)";
 
-                // Status suffix + color
-                int batColor = COL_GRAY_DIM;
+                string batStatus = "Output: ";
+                int batStatusColor = COL_GRAY_DIM;
 
                 if (!batOutEnabled)
                 {
-                    // Output switch only gates discharge/passthrough. Continue
-                    // showing the live charge state so OFF is not mistaken for
-                    // a disabled battery charger.
-                    batText = batText + "  [OUT OFF]";
+                    batStatus = batStatus + "OFF | Flow: ";
                     if (batRate > 0.5)
                     {
                         int offChgRate = batRate;
-                        batText = batText + "  CHG +";
-                        batText = batText + offChgRate.ToString();
-                        batText = batText + " u/s";
-                        batColor = COL_CYAN;
+                        batStatus = batStatus + "CHG +";
+                        batStatus = batStatus + offChgRate.ToString();
+                        batStatus = batStatus + " u/s";
+                        batStatusColor = COL_CYAN;
                     }
                     else if (batPct >= 100)
                     {
-                        batText = batText + "  FULL";
-                        batColor = COL_GREEN_OK;
+                        batStatus = batStatus + "FULL";
+                        batStatusColor = COL_GREEN_OK;
                     }
                     else
                     {
-                        batText = batText + "  IDLE";
-                        batColor = COL_OLIVE;
+                        batStatus = batStatus + "IDLE";
+                        batStatusColor = COL_OLIVE;
                     }
                 }
                 else if (batRate > 0.5)
                 {
-                    // Charging
+                    batStatus = batStatus + "ON | Flow: CHG +";
                     int chgRate = batRate;
-                    batText = batText + "  >> CHG +";
-                    batText = batText + chgRate.ToString();
-                    batText = batText + " u/s";
-                    batColor = COL_CYAN;
+                    batStatus = batStatus + chgRate.ToString();
+                    batStatus = batStatus + " u/s";
+                    batStatusColor = COL_CYAN;
                 }
                 else if (batRate < -0.5)
                 {
-                    // Discharging
+                    batStatus = batStatus + "ON | Flow: DIS -";
                     float absRate = -batRate;
                     int disRate = absRate;
-                    batText = batText + "  << DIS -";
-                    batText = batText + disRate.ToString();
-                    batText = batText + " u/s";
-                    batColor = COL_ORANGE;
+                    batStatus = batStatus + disRate.ToString();
+                    batStatus = batStatus + " u/s";
+                    batStatusColor = COL_ORANGE;
                 }
                 else if (batPct >= 100)
                 {
-                    // Full and idle
-                    batText = batText + "  FULL";
-                    batColor = COL_GREEN_OK;
+                    batStatus = batStatus + "ON | Flow: FULL";
+                    batStatusColor = COL_GREEN_OK;
                 }
                 else if (batPct < 1)
                 {
-                    // Empty
-                    batText = batText + "  EMPTY";
-                    batColor = COL_RED_DARK;
+                    batStatus = batStatus + "ON | Flow: EMPTY";
+                    batStatusColor = COL_RED_DARK;
                 }
                 else
                 {
-                    // Idle (connected but not charging/discharging)
-                    batText = batText + "  IDLE";
-                    batColor = COL_GRAY_MID;
+                    batStatus = batStatus + "ON | Flow: IDLE";
+                    batStatusColor = COL_GRAY_MID;
                 }
 
                 float batY = 94.0 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + m_LinkLineOffset;
                 SetPosDirty(m_wBatteryLine, 14, batY);
                 SetTextDirty(m_wBatteryLine, batText);
-                SetColorDirty(m_wBatteryLine, batColor);
+                SetColorDirty(m_wBatteryLine, COL_YELLOW);
                 ShowDirty(m_wBatteryLine, true);
-                m_BatteryLineOffset = 26.0;
+                if (m_wBatteryStatusLine)
+                {
+                    SetPosDirty(m_wBatteryStatusLine, 14, batY + 20.0);
+                    SetTextDirty(m_wBatteryStatusLine, batStatus);
+                    SetColorDirty(m_wBatteryStatusLine, batStatusColor);
+                    ShowDirty(m_wBatteryStatusLine, true);
+                }
+                m_BatteryLineOffset = 44.0;
             }
             else
             {
                 ShowDirty(m_wBatteryLine, false);
+                ShowDirty(m_wBatteryStatusLine, false);
                 m_BatteryLineOffset = 0.0;
             }
         }
@@ -1433,22 +1445,23 @@ class LFPG_DeviceInspector
         }
 
         // Ensure separator + header are visible (may have been hidden by collapse)
+        float wireSectionOffset = m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + m_LinkLineOffset + m_BatteryLineOffset;
         if (m_wSeparator)
         {
             ShowDirty(m_wSeparator, true);
-            SetPosDirty(m_wSeparator, 12, 93 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset);
+            SetPosDirty(m_wSeparator, 12, 93 + wireSectionOffset);
         }
         ShowDirty(m_wWiresHeader, true);
-        SetPosDirty(m_wWiresHeader, 14, 99 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset);
+        SetPosDirty(m_wWiresHeader, 14, 99 + wireSectionOffset);
 
-        // Reposition wire slots with tank/fuel offset
+        // Reposition wire slots below every optional status row.
         int ri;
         for (ri = 0; ri < m_wWireSlots.Count(); ri = ri + 1)
         {
             TextWidget rSlot = m_wWireSlots[ri];
             if (rSlot)
             {
-                float rY = LFPG_INSPECT_PANEL_BASE_H + 2.0 + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + (ri * LFPG_INSPECT_WIRE_ROW_H);
+                float rY = LFPG_INSPECT_PANEL_BASE_H + 2.0 + wireSectionOffset + (ri * LFPG_INSPECT_WIRE_ROW_H);
                 SetPosDirty(rSlot, 14, rY);
             }
         }
@@ -1669,7 +1682,7 @@ class LFPG_DeviceInspector
         float panelH = m_CurrentPanelH;
         if (panelH < 1.0)
         {
-            panelH = ComputePanelHeight(m_VisibleWireCount) + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + m_BatteryLineOffset;
+            panelH = ComputePanelHeight(m_VisibleWireCount) + m_TankLineOffset + m_FuelLineOffset + m_ReserveLineOffset + m_LinkLineOffset + m_BatteryLineOffset;
         }
 
         float fScreenW = screenW;
