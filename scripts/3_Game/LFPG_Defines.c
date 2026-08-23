@@ -661,7 +661,7 @@ static const float LFPG_MOVE_DETECT_THRESHOLD_SQ = 0.09;   // 0.3² pre-computed
 static const string LFPG_CABLE_REEL_TYPE = "LFPG_CableReel";
 
 // ---- Device Inspector UI (Sprint 5, v0.8.0) ----
-static const float LFPG_INSPECT_PANEL_W          = 400.0;   // panel width (px)
+static const float LFPG_INSPECT_PANEL_W          = 350.0;   // panel width (px)
 static const float LFPG_INSPECT_PANEL_BASE_H     = 115.0;   // base height without wires
 static const float LFPG_INSPECT_WIRE_ROW_H       = 16.0;    // height per wire slot
 static const float LFPG_INSPECT_PANEL_PAD         = 12.0;    // bottom padding
