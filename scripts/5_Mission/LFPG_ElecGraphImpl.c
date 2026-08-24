@@ -3689,6 +3689,12 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                         ComponentEnergyManager vanEm = vanEnt.GetCompEM();
                         if (vanEm)
                         {
+                            // Keep LFPG's synthetic pool consumable by vanilla
+                            // zero-storage Spotlight appliances. Without this,
+                            // their 50s DeviceUpdate clamps the pool to zero and
+                            // briefly turns the client light off.
+                            LFPG_DeviceAPI.EnsureSyntheticVanillaCapacity(vanEnt, vanEm);
+
                             // v4.9 (BugFix): Top up energy regardless of IsSwitchedOn.
                             // Matches SetPowered v4.9 — energy injection is required
                             // for CanSwitchOn() to return true. Without this, vanilla

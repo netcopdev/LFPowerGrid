@@ -284,6 +284,57 @@ class LFPG_DeviceAPI
 
     // ----- Power delivery -----
 
+    // Vanilla Spotlight is an externally-powered appliance: its config has
+    // energyStorageMax=0. LFPG cannot use PlugThisInto safely, so it supplies a
+    // synthetic local energy pool instead. ComponentEnergyManager.SetEnergy()
+    // accepts that pool, but the next vanilla DeviceUpdate consumes through
+    // AddEnergy(), which clamps the remainder to energyStorageMax. With a zero
+    // maximum this drops the pool to zero every Spotlight update (50s) and
+    // briefly synchronizes CanWork=false to clients.
+    //
+    // Give only zero-storage Spotlight-class consumers a runtime capacity while
+    // LFPG powers them. Modded Spotlight descendants with real configured
+    // storage retain their own capacity and are not altered.
+    static bool NeedsSyntheticVanillaCapacity(EntityAI e)
+    {
+        if (!e)
+            return false;
+
+        string spotlightCls = "Spotlight";
+        if (!e.IsKindOf(spotlightCls))
+            return false;
+
+        string cfgPath = "CfgVehicles " + e.GetType() + " EnergyManager energyStorageMax";
+        if (!GetGame().ConfigIsExisting(cfgPath))
+            return true;
+
+        return GetGame().ConfigGetFloat(cfgPath) <= 0.0;
+    }
+
+    static void EnsureSyntheticVanillaCapacity(EntityAI e, ComponentEnergyManager em)
+    {
+        if (!em || !NeedsSyntheticVanillaCapacity(e))
+            return;
+
+        if (em.GetEnergyMaxPristine() < LFPG_VANILLA_ENERGY_POOL)
+        {
+            em.SetEnergyMaxPristine(LFPG_VANILLA_ENERGY_POOL);
+            LFPG_Util.Debug("[SetPowered] Enabled synthetic storage for " + e.GetType());
+        }
+    }
+
+    static void ReleaseSyntheticVanillaCapacity(EntityAI e, ComponentEnergyManager em)
+    {
+        if (!em || !NeedsSyntheticVanillaCapacity(e))
+            return;
+
+        // Remove LFPG's synthetic charge before restoring the appliance's
+        // configured zero-storage behavior. Spotlight has no legitimate local
+        // charge to preserve; modded descendants with storage are excluded.
+        em.SetEnergy(0.0);
+        em.SetEnergyMaxPristine(0.0);
+    }
+
     // Set powered state on any device (LFPG or vanilla/mod consumer).
     // LFPG devices: calls LFPG_SetPowered via dynamic dispatch.
     // Vanilla / mod consumers: inject energy + SwitchOn/Off on CompEM.
@@ -342,6 +393,8 @@ class LFPG_DeviceAPI
 
         if (powered)
         {
+            EnsureSyntheticVanillaCapacity(e, em);
+
             float curEnergy = em.GetEnergy();
             if (curEnergy < LFPG_VANILLA_ENERGY_POOL * 0.5)
             {
@@ -362,6 +415,8 @@ class LFPG_DeviceAPI
                 em.SwitchOff();
                 LFPG_Util.Debug("[SetPowered] SwitchOff for " + objType);
             }
+
+            ReleaseSyntheticVanillaCapacity(e, em);
         }
     }
 
