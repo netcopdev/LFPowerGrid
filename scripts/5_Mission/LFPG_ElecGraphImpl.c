@@ -92,16 +92,15 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     // The cache is cleared once per ProcessDirtyQueue epoch so every supplier
     // evaluated in a batch sees the same upstream-capability snapshot.
     protected ref map<string, float> m_PotentialSupplyCache;
-    protected ref map<string, bool>  m_PotentialSupplyVisiting;
+    protected bool m_PotentialSupplySnapshotReady;
     // Active root sources (and virtual generators) reachable at each node.
     // These prevent a split-then-recombined path from multiplying the same
     // generator's contribution merely because it reaches a target twice.
     protected ref map<string, ref array<string>> m_PotentialContributorCache;
-    protected ref map<string, bool> m_PotentialContributorVisiting;
     protected ref map<string, float> m_PotentialContributorCapacity;
-    // A recursion guard requests a completed-adjacency audit on the next safe
-    // scheduler boundary.  This heals cycles introduced by legacy/import code
-    // after startup instead of leaving one dirty node alive forever.
+    // A failed topological snapshot requests a completed-adjacency audit on the
+    // next safe scheduler boundary. This heals cycles introduced by
+    // legacy/import code without mutating adjacency while solving.
     protected bool m_RuntimeCycleAuditRequested;
 
     // --- v0.7.31 (Bloque B): Component Watchdog ---
@@ -174,9 +173,8 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         m_AllocChanged = false;
         m_LastAllocSoftDemand = 0.0;
         m_PotentialSupplyCache = new map<string, float>;
-        m_PotentialSupplyVisiting = new map<string, bool>;
+        m_PotentialSupplySnapshotReady = false;
         m_PotentialContributorCache = new map<string, ref array<string>>;
-        m_PotentialContributorVisiting = new map<string, bool>;
         m_PotentialContributorCapacity = new map<string, float>;
         m_RuntimeCycleAuditRequested = false;
 
@@ -233,9 +231,8 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         m_NodeNetHigh.Clear();
         m_RequeueEpoch.Clear();
         m_PotentialSupplyCache.Clear();
-        m_PotentialSupplyVisiting.Clear();
+        m_PotentialSupplySnapshotReady = false;
         m_PotentialContributorCache.Clear();
-        m_PotentialContributorVisiting.Clear();
         m_PotentialContributorCapacity.Clear();
         m_RuntimeCycleAuditRequested = false;
 
@@ -346,6 +343,11 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 AddEdgeInternal(vOwnerId, vwd.m_TargetDeviceId, srcPort, vwd.m_TargetPort, vwd);
             }
         }
+
+        // m_Outgoing owns the canonical runtime edge objects. Rebuild the
+        // secondary upstream index from those same objects before any solver
+        // or audit consumes it, so both traversal directions see one graph.
+        CanonicalizeIncomingAdjacency();
 
         // The incremental check above should make this graph a DAG.  Audit the
         // completed adjacency anyway: identity aliases, imported/legacy stores,
@@ -1150,6 +1152,114 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     // Cycle detection
     // ===========================
 
+    // m_Outgoing is the ownership index: every edge is created under its
+    // source and persisted by that source. m_Incoming is a derived acceleration
+    // index used by allocation and telemetry. Rebuild it from the canonical
+    // edge objects so an interrupted/legacy mutation cannot give upstream and
+    // downstream solvers different topologies.
+    protected bool CanonicalizeIncomingAdjacency()
+    {
+        #ifdef SERVER
+        bool mismatch = false;
+        int oldIncomingCount = 0;
+        int incomingOwnerIndex;
+
+        for (incomingOwnerIndex = 0; incomingOwnerIndex < m_Incoming.Count(); incomingOwnerIndex = incomingOwnerIndex + 1)
+        {
+            string incomingOwnerId = m_Incoming.GetKey(incomingOwnerIndex);
+            ref array<ref LFPG_ElecEdge> indexedIncoming = m_Incoming.GetElement(incomingOwnerIndex);
+            if (!indexedIncoming)
+                continue;
+
+            oldIncomingCount = oldIncomingCount + indexedIncoming.Count();
+            int indexedIncomingIndex;
+            for (indexedIncomingIndex = 0; indexedIncomingIndex < indexedIncoming.Count(); indexedIncomingIndex = indexedIncomingIndex + 1)
+            {
+                LFPG_ElecEdge incomingEdge = indexedIncoming[indexedIncomingIndex];
+                if (!incomingEdge || incomingEdge.m_TargetNodeId != incomingOwnerId)
+                {
+                    mismatch = true;
+                    continue;
+                }
+
+                ref array<ref LFPG_ElecEdge> matchingOutgoing;
+                if (!m_Outgoing.Find(incomingEdge.m_SourceNodeId, matchingOutgoing) || !matchingOutgoing || matchingOutgoing.Find(incomingEdge) < 0)
+                    mismatch = true;
+            }
+        }
+
+        int outgoingCount = 0;
+        int outgoingOwnerIndex;
+        for (outgoingOwnerIndex = 0; outgoingOwnerIndex < m_Outgoing.Count(); outgoingOwnerIndex = outgoingOwnerIndex + 1)
+        {
+            string outgoingOwnerId = m_Outgoing.GetKey(outgoingOwnerIndex);
+            ref array<ref LFPG_ElecEdge> indexedOutgoing = m_Outgoing.GetElement(outgoingOwnerIndex);
+            if (!indexedOutgoing)
+                continue;
+
+            int indexedOutgoingIndex;
+            for (indexedOutgoingIndex = 0; indexedOutgoingIndex < indexedOutgoing.Count(); indexedOutgoingIndex = indexedOutgoingIndex + 1)
+            {
+                LFPG_ElecEdge outgoingEdge = indexedOutgoing[indexedOutgoingIndex];
+                if (!outgoingEdge)
+                {
+                    mismatch = true;
+                    continue;
+                }
+
+                outgoingCount = outgoingCount + 1;
+                if (outgoingEdge.m_SourceNodeId != outgoingOwnerId)
+                    mismatch = true;
+
+                ref array<ref LFPG_ElecEdge> matchingIncoming;
+                if (!m_Incoming.Find(outgoingEdge.m_TargetNodeId, matchingIncoming) || !matchingIncoming || matchingIncoming.Find(outgoingEdge) < 0)
+                    mismatch = true;
+            }
+        }
+
+        if (oldIncomingCount != outgoingCount)
+            mismatch = true;
+
+        m_Incoming.Clear();
+        for (outgoingOwnerIndex = 0; outgoingOwnerIndex < m_Outgoing.Count(); outgoingOwnerIndex = outgoingOwnerIndex + 1)
+        {
+            string canonicalSourceId = m_Outgoing.GetKey(outgoingOwnerIndex);
+            ref array<ref LFPG_ElecEdge> canonicalOutgoing = m_Outgoing.GetElement(outgoingOwnerIndex);
+            if (!canonicalOutgoing)
+                continue;
+
+            int canonicalIndex;
+            for (canonicalIndex = 0; canonicalIndex < canonicalOutgoing.Count(); canonicalIndex = canonicalIndex + 1)
+            {
+                ref LFPG_ElecEdge canonicalEdge = canonicalOutgoing[canonicalIndex];
+                if (!canonicalEdge || canonicalEdge.m_TargetNodeId == "")
+                    continue;
+
+                canonicalEdge.m_SourceNodeId = canonicalSourceId;
+                ref array<ref LFPG_ElecEdge> canonicalIncoming;
+                if (!m_Incoming.Find(canonicalEdge.m_TargetNodeId, canonicalIncoming) || !canonicalIncoming)
+                {
+                    canonicalIncoming = new array<ref LFPG_ElecEdge>;
+                    m_Incoming.Set(canonicalEdge.m_TargetNodeId, canonicalIncoming);
+                }
+                canonicalIncoming.Insert(canonicalEdge);
+            }
+        }
+
+        m_EdgeCount = outgoingCount;
+        if (mismatch)
+        {
+            string canonicalMsg = "[ElecGraph] Canonicalized asymmetric adjacency incoming=";
+            canonicalMsg = canonicalMsg + oldIncomingCount.ToString();
+            canonicalMsg = canonicalMsg + " outgoing=" + outgoingCount.ToString();
+            LFPG_Util.Warn(canonicalMsg);
+        }
+        return mismatch;
+        #else
+        return false;
+        #endif
+    }
+
     // O(V+E) Kahn audit used as the normal fast path.  A legal large graph is
     // validated once without running a path search per edge.  The more detailed
     // path finder below is invoked only when this proves a cycle exists.
@@ -1445,9 +1555,8 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         if (removedCount > 0)
         {
             m_PotentialSupplyCache.Clear();
-            m_PotentialSupplyVisiting.Clear();
+            m_PotentialSupplySnapshotReady = false;
             m_PotentialContributorCache.Clear();
-            m_PotentialContributorVisiting.Clear();
             m_PotentialContributorCapacity.Clear();
             m_ComponentsDirty = true;
         }
@@ -2464,13 +2573,15 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
             m_DeferredOrphanCleanup.Clear();
         }
 
-        // Never mutate adjacency from inside a recursive capacity walk.  A
-        // guard raised on the previous tick lands here, where it is safe to
-        // audit and repair the completed graph before any new allocations are
-        // calculated.  Normal DAGs pay nothing beyond this bool check.
+        // Never mutate adjacency while a supply snapshot is being built. An
+        // incomplete topological pass lands here on the next scheduler tick,
+        // where it is safe to canonicalize both indexes and repair the graph
+        // before any new allocations are calculated. Normal DAGs pay nothing
+        // beyond this bool check.
         if (m_RuntimeCycleAuditRequested)
         {
             m_RuntimeCycleAuditRequested = false;
+            CanonicalizeIncomingAdjacency();
             int runtimeCycleEdges = SanitizeCompletedGraphCycles();
             if (runtimeCycleEdges > 0)
             {
@@ -2508,9 +2619,8 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         // Allocation results produced below must not change supplier membership
         // until the next epoch, otherwise a branch can become its own cause.
         m_PotentialSupplyCache.Clear();
-        m_PotentialSupplyVisiting.Clear();
+        m_PotentialSupplySnapshotReady = false;
         m_PotentialContributorCache.Clear();
-        m_PotentialContributorVisiting.Clear();
         m_PotentialContributorCapacity.Clear();
 
         int processed = 0;
@@ -4090,175 +4200,227 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         return gateClosed;
     }
 
-    // Return the maximum power this node could deliver from the current
-    // topology/state snapshot, without consulting m_InputPower, m_OutputPower,
-    // edge demand, or edge allocation. Because the runtime graph is a DAG, this
-    // recursive upstream walk terminates; the visiting map remains as a safety
-    // guard for corrupt persisted topology.
-    protected float GetPotentialSupplyCapacity(string nodeId)
+    // Build one immutable source-to-load snapshot for the current propagation
+    // epoch. Kahn order guarantees that every enabled predecessor is finalized
+    // before its target. This handles arbitrary legal DAG shapes (chains,
+    // branches, reconvergence, multiple sources, split/combine/split) without
+    // recursive call state or an order-dependent visiting guard.
+    protected void BuildPotentialSupplySnapshot()
     {
-        float cachedCapacity = 0.0;
-        if (m_PotentialSupplyCache.Find(nodeId, cachedCapacity))
-            return cachedCapacity;
+        if (m_PotentialSupplySnapshotReady)
+            return;
 
-        bool visiting = false;
-        if (m_PotentialSupplyVisiting.Find(nodeId, visiting) && visiting)
+        m_PotentialSupplyCache.Clear();
+        m_PotentialContributorCache.Clear();
+        m_PotentialContributorCapacity.Clear();
+
+        ref map<string, int> indegree = new map<string, int>;
+        ref array<string> readyQueue = new array<string>;
+
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < m_Nodes.Count(); nodeIndex = nodeIndex + 1)
         {
-            m_RuntimeCycleAuditRequested = true;
-            string cycleMsg = "[ElecGraph] Potential supply cycle guard for " + nodeId;
-            LFPG_Util.Warn(cycleMsg);
-            return 0.0;
+            indegree.Set(m_Nodes.GetKey(nodeIndex), 0);
         }
 
-        ref LFPG_ElecNode node;
-        if (!m_Nodes.Find(nodeId, node) || !node)
-            return 0.0;
-
-        m_PotentialSupplyVisiting.Set(nodeId, true);
-
-        float result = 0.0;
-        if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
+        int ownerIndex;
+        for (ownerIndex = 0; ownerIndex < m_Outgoing.Count(); ownerIndex = ownerIndex + 1)
         {
-            if (node.m_Powered && node.m_MaxOutput > LFPG_PROPAGATION_EPSILON)
+            string ownerId = m_Outgoing.GetKey(ownerIndex);
+            int ignoredOwnerDegree = 0;
+            if (!indegree.Find(ownerId, ignoredOwnerDegree))
+                indegree.Set(ownerId, 0);
+
+            ref array<ref LFPG_ElecEdge> ownerEdges = m_Outgoing.GetElement(ownerIndex);
+            if (!ownerEdges)
+                continue;
+
+            int edgeIndex;
+            for (edgeIndex = 0; edgeIndex < ownerEdges.Count(); edgeIndex = edgeIndex + 1)
             {
-                result = node.m_MaxOutput;
+                LFPG_ElecEdge edge = ownerEdges[edgeIndex];
+                if (!edge || (edge.m_Flags & LFPG_EDGE_ENABLED) == 0 || edge.m_TargetNodeId == "")
+                    continue;
+
+                int targetDegree = 0;
+                indegree.Find(edge.m_TargetNodeId, targetDegree);
+                indegree.Set(edge.m_TargetNodeId, targetDegree + 1);
             }
         }
-        else if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
+
+        int degreeIndex;
+        for (degreeIndex = 0; degreeIndex < indegree.Count(); degreeIndex = degreeIndex + 1)
         {
-            bool gateClosed = IsPotentialSupplyGateClosed(nodeId, node);
+            if (indegree.GetElement(degreeIndex) == 0)
+                readyQueue.Insert(indegree.GetKey(degreeIndex));
+        }
 
-            if (!gateClosed)
+        int queueHead = 0;
+        int processedCount = 0;
+        while (queueHead < readyQueue.Count())
+        {
+            string currentId = readyQueue[queueHead];
+            queueHead = queueHead + 1;
+            processedCount = processedCount + 1;
+
+            float result = 0.0;
+            ref array<string> contributors = new array<string>;
+            ref LFPG_ElecNode node;
+            if (m_Nodes.Find(currentId, node) && node)
             {
-                result = node.m_VirtualGeneration;
-
-                ref array<ref LFPG_ElecEdge> supplyInEdges;
-                if (m_Incoming.Find(nodeId, supplyInEdges) && supplyInEdges)
+                if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
                 {
-                    int psi;
-                    for (psi = 0; psi < supplyInEdges.Count(); psi = psi + 1)
+                    if (node.m_Powered && node.m_MaxOutput > LFPG_PROPAGATION_EPSILON)
                     {
-                        m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
-                        ref LFPG_ElecEdge supplyEdge = supplyInEdges[psi];
-                        if (!supplyEdge)
-                            continue;
-                        if ((supplyEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
-                            continue;
-                        if (supplyEdge.m_SourceNodeId == "")
-                            continue;
-
-                        result = result + GetPotentialSupplyCapacity(supplyEdge.m_SourceNodeId);
+                        result = node.m_MaxOutput;
+                        string sourceKey = "S:" + currentId;
+                        contributors.Insert(sourceKey);
+                        m_PotentialContributorCapacity.Set(sourceKey, node.m_MaxOutput);
                     }
                 }
-
-                result = result - node.m_Consumption;
-                if (result < 0.0)
+                else if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH && !IsPotentialSupplyGateClosed(currentId, node))
                 {
-                    result = 0.0;
-                }
-                if (node.m_MaxOutput > LFPG_PROPAGATION_EPSILON && result > node.m_MaxOutput)
-                {
-                    result = node.m_MaxOutput;
-                }
-            }
-        }
-
-        m_PotentialSupplyVisiting.Set(nodeId, false);
-        m_PotentialSupplyCache.Set(nodeId, result);
-        return result;
-    }
-
-    // Return unique active generation roots that can contribute to this node.
-    // Source keys and virtual-generation keys use separate prefixes so a
-    // battery can expose stored power without hiding a generator feeding it.
-    protected array<string> GetPotentialSupplyContributors(string nodeId)
-    {
-        ref array<string> cachedContributors;
-        if (m_PotentialContributorCache.Find(nodeId, cachedContributors) && cachedContributors)
-            return cachedContributors;
-
-        ref array<string> contributors = new array<string>;
-
-        bool contributorVisiting = false;
-        if (m_PotentialContributorVisiting.Find(nodeId, contributorVisiting) && contributorVisiting)
-        {
-            m_RuntimeCycleAuditRequested = true;
-            string cycleMsg = "[ElecGraph] Potential contributor cycle guard for " + nodeId;
-            LFPG_Util.Warn(cycleMsg);
-            return contributors;
-        }
-
-        ref LFPG_ElecNode node;
-        if (!m_Nodes.Find(nodeId, node) || !node)
-        {
-            m_PotentialContributorCache.Set(nodeId, contributors);
-            return contributors;
-        }
-
-        float nodePotential = GetPotentialSupplyCapacity(nodeId);
-        if (nodePotential <= LFPG_PROPAGATION_EPSILON)
-        {
-            m_PotentialContributorCache.Set(nodeId, contributors);
-            return contributors;
-        }
-
-        m_PotentialContributorVisiting.Set(nodeId, true);
-
-        if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
-        {
-            string sourceKey = "S:" + nodeId;
-            contributors.Insert(sourceKey);
-            m_PotentialContributorCapacity.Set(sourceKey, node.m_MaxOutput);
-        }
-        else if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
-        {
-            if (!IsPotentialSupplyGateClosed(nodeId, node))
-            {
-                if (node.m_VirtualGeneration > LFPG_PROPAGATION_EPSILON)
-                {
-                    string virtualKey = "V:" + nodeId;
-                    contributors.Insert(virtualKey);
-                    m_PotentialContributorCapacity.Set(virtualKey, node.m_VirtualGeneration);
-                }
-
-                ref array<ref LFPG_ElecEdge> contributorInEdges;
-                if (m_Incoming.Find(nodeId, contributorInEdges) && contributorInEdges)
-                {
-                    int pci;
-                    for (pci = 0; pci < contributorInEdges.Count(); pci = pci + 1)
+                    result = node.m_VirtualGeneration;
+                    ref array<ref LFPG_ElecEdge> supplyInEdges;
+                    if (m_Incoming.Find(currentId, supplyInEdges) && supplyInEdges)
                     {
-                        m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
-                        ref LFPG_ElecEdge contributorEdge = contributorInEdges[pci];
-                        if (!contributorEdge)
-                            continue;
-                        if ((contributorEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
-                            continue;
-                        if (contributorEdge.m_SourceNodeId == "")
-                            continue;
-                        if (GetPotentialSupplyCapacity(contributorEdge.m_SourceNodeId) <= LFPG_PROPAGATION_EPSILON)
-                            continue;
-
-                        ref array<string> upstreamContributors = GetPotentialSupplyContributors(contributorEdge.m_SourceNodeId);
-                        if (!upstreamContributors)
-                            continue;
-
-                        int uci;
-                        for (uci = 0; uci < upstreamContributors.Count(); uci = uci + 1)
+                        int supplyIndex;
+                        for (supplyIndex = 0; supplyIndex < supplyInEdges.Count(); supplyIndex = supplyIndex + 1)
                         {
-                            string contributorKey = upstreamContributors[uci];
-                            if (contributorKey != "" && contributors.Find(contributorKey) < 0)
+                            m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
+                            LFPG_ElecEdge supplyEdge = supplyInEdges[supplyIndex];
+                            if (!supplyEdge || (supplyEdge.m_Flags & LFPG_EDGE_ENABLED) == 0 || supplyEdge.m_SourceNodeId == "")
+                                continue;
+
+                            float upstreamCapacity = 0.0;
+                            m_PotentialSupplyCache.Find(supplyEdge.m_SourceNodeId, upstreamCapacity);
+                            result = result + upstreamCapacity;
+                        }
+                    }
+
+                    result = result - node.m_Consumption;
+                    if (result < 0.0)
+                        result = 0.0;
+                    if (node.m_MaxOutput > LFPG_PROPAGATION_EPSILON && result > node.m_MaxOutput)
+                        result = node.m_MaxOutput;
+
+                    // Preserve the previous contributor semantics: a node whose
+                    // own consumption absorbs all potential has no deliverable
+                    // roots, while every live root is retained once across a
+                    // reconvergent graph.
+                    if (result > LFPG_PROPAGATION_EPSILON)
+                    {
+                        if (node.m_VirtualGeneration > LFPG_PROPAGATION_EPSILON)
+                        {
+                            string virtualKey = "V:" + currentId;
+                            contributors.Insert(virtualKey);
+                            m_PotentialContributorCapacity.Set(virtualKey, node.m_VirtualGeneration);
+                        }
+
+                        if (supplyInEdges)
+                        {
+                            int contributorEdgeIndex;
+                            for (contributorEdgeIndex = 0; contributorEdgeIndex < supplyInEdges.Count(); contributorEdgeIndex = contributorEdgeIndex + 1)
                             {
-                                contributors.Insert(contributorKey);
+                                LFPG_ElecEdge contributorEdge = supplyInEdges[contributorEdgeIndex];
+                                if (!contributorEdge || (contributorEdge.m_Flags & LFPG_EDGE_ENABLED) == 0 || contributorEdge.m_SourceNodeId == "")
+                                    continue;
+
+                                float contributorUpstreamCapacity = 0.0;
+                                m_PotentialSupplyCache.Find(contributorEdge.m_SourceNodeId, contributorUpstreamCapacity);
+                                if (contributorUpstreamCapacity <= LFPG_PROPAGATION_EPSILON)
+                                    continue;
+
+                                ref array<string> upstreamContributors;
+                                if (!m_PotentialContributorCache.Find(contributorEdge.m_SourceNodeId, upstreamContributors) || !upstreamContributors)
+                                    continue;
+
+                                int upstreamIndex;
+                                for (upstreamIndex = 0; upstreamIndex < upstreamContributors.Count(); upstreamIndex = upstreamIndex + 1)
+                                {
+                                    string contributorKey = upstreamContributors[upstreamIndex];
+                                    if (contributorKey != "" && contributors.Find(contributorKey) < 0)
+                                        contributors.Insert(contributorKey);
+                                }
                             }
                         }
                     }
                 }
             }
+
+            m_PotentialSupplyCache.Set(currentId, result);
+            m_PotentialContributorCache.Set(currentId, contributors);
+
+            ref array<ref LFPG_ElecEdge> currentEdges;
+            if (!m_Outgoing.Find(currentId, currentEdges) || !currentEdges)
+                continue;
+
+            int currentEdgeIndex;
+            for (currentEdgeIndex = 0; currentEdgeIndex < currentEdges.Count(); currentEdgeIndex = currentEdgeIndex + 1)
+            {
+                LFPG_ElecEdge currentEdge = currentEdges[currentEdgeIndex];
+                if (!currentEdge || (currentEdge.m_Flags & LFPG_EDGE_ENABLED) == 0 || currentEdge.m_TargetNodeId == "")
+                    continue;
+
+                int remainingDegree = 0;
+                if (!indegree.Find(currentEdge.m_TargetNodeId, remainingDegree))
+                    continue;
+                remainingDegree = remainingDegree - 1;
+                indegree.Set(currentEdge.m_TargetNodeId, remainingDegree);
+                if (remainingDegree == 0)
+                    readyQueue.Insert(currentEdge.m_TargetNodeId);
+            }
         }
 
-        m_PotentialContributorVisiting.Set(nodeId, false);
-        m_PotentialContributorCache.Set(nodeId, contributors);
-        return contributors;
+        if (processedCount < indegree.Count())
+        {
+            m_RuntimeCycleAuditRequested = true;
+            string snapshotMsg = "[ElecGraph] Potential supply snapshot incomplete processed=";
+            snapshotMsg = snapshotMsg + processedCount.ToString();
+            snapshotMsg = snapshotMsg + " nodes=" + indegree.Count().ToString();
+            LFPG_Util.Warn(snapshotMsg);
+
+            // Keep the current epoch conservative and total: unresolved nodes
+            // expose zero capacity until the scheduler-boundary audit repairs
+            // the corrupt topology on the next tick.
+            for (degreeIndex = 0; degreeIndex < indegree.Count(); degreeIndex = degreeIndex + 1)
+            {
+                string unresolvedId = indegree.GetKey(degreeIndex);
+                float resolvedCapacity = 0.0;
+                if (!m_PotentialSupplyCache.Find(unresolvedId, resolvedCapacity))
+                {
+                    m_PotentialSupplyCache.Set(unresolvedId, 0.0);
+                    ref array<string> noContributors = new array<string>;
+                    m_PotentialContributorCache.Set(unresolvedId, noContributors);
+                }
+            }
+        }
+
+        m_PotentialSupplySnapshotReady = true;
+    }
+
+    // Return the maximum deliverable capacity from the immutable current-epoch
+    // snapshot, excluding mutable demand/allocation/output state.
+    protected float GetPotentialSupplyCapacity(string nodeId)
+    {
+        BuildPotentialSupplySnapshot();
+        float cachedCapacity = 0.0;
+        m_PotentialSupplyCache.Find(nodeId, cachedCapacity);
+        return cachedCapacity;
+    }
+
+    // Return unique active generation roots that can contribute to this node.
+    // Source and virtual-generation keys remain distinct.
+    protected array<string> GetPotentialSupplyContributors(string nodeId)
+    {
+        BuildPotentialSupplySnapshot();
+        ref array<string> cachedContributors;
+        if (m_PotentialContributorCache.Find(nodeId, cachedContributors) && cachedContributors)
+            return cachedContributors;
+
+        ref array<string> emptyContributors = new array<string>;
+        m_PotentialContributorCache.Set(nodeId, emptyContributors);
+        return emptyContributors;
     }
 
     // Capacity-weighted share for an incoming edge of a multi-source target.

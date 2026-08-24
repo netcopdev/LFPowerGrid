@@ -92,6 +92,140 @@ Assert-Topology 'battery branch loop' @(@('generator','battery'), @('battery','s
 Assert-Topology 'self loop' @(@('switch','switch'), @('switch','load')) 1
 Assert-Topology 'two independent loops' @(@('a','b'), @('b','a'), @('c','d'), @('d','e'), @('e','c')) 2
 
+# Model the shipped non-recursive, source-to-load potential-supply snapshot.
+# Capacity intentionally preserves reconvergent branch capacity while root
+# contributors are de-duplicated; GetIncomingSupplyShare uses both values.
+function Get-SupplySnapshot {
+    param([hashtable]$Nodes, [object[]]$Edges)
+
+    $indegree = @{}
+    foreach ($id in $Nodes.Keys) { $indegree[$id] = 0 }
+    foreach ($edge in $Edges) {
+        if ($edge.Enabled -and $indegree.ContainsKey($edge.Target)) {
+            $indegree[$edge.Target]++
+        }
+    }
+
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    foreach ($id in $indegree.Keys) {
+        if ($indegree[$id] -eq 0) { $queue.Enqueue($id) }
+    }
+
+    $capacity = @{}
+    $contributors = @{}
+    $processed = 0
+    while ($queue.Count -gt 0) {
+        $id = $queue.Dequeue()
+        $processed++
+        $node = $Nodes[$id]
+        $value = 0.0
+        $roots = [System.Collections.Generic.HashSet[string]]::new()
+
+        if ($node.Type -eq 'source') {
+            if ($node.Powered -and $node.Max -gt 0) {
+                $value = [double]$node.Max
+                [void]$roots.Add("S:$id")
+            }
+        }
+        elseif ($node.Type -eq 'passthrough' -and $node.GateOpen) {
+            $value = [double]$node.Virtual
+            foreach ($edge in $Edges) {
+                if (-not $edge.Enabled -or $edge.Target -ne $id) { continue }
+                if ($capacity.ContainsKey($edge.Source)) {
+                    $value += $capacity[$edge.Source]
+                }
+            }
+            $value = [Math]::Max(0.0, $value - [double]$node.Consumption)
+            if ($node.Max -gt 0) { $value = [Math]::Min($value, [double]$node.Max) }
+
+            if ($value -gt 0) {
+                if ($node.Virtual -gt 0) { [void]$roots.Add("V:$id") }
+                foreach ($edge in $Edges) {
+                    if (-not $edge.Enabled -or $edge.Target -ne $id) { continue }
+                    if (-not $capacity.ContainsKey($edge.Source) -or $capacity[$edge.Source] -le 0) { continue }
+                    foreach ($root in $contributors[$edge.Source]) { [void]$roots.Add($root) }
+                }
+            }
+        }
+
+        $capacity[$id] = $value
+        $contributors[$id] = @($roots)
+        foreach ($edge in $Edges) {
+            if (-not $edge.Enabled -or $edge.Source -ne $id) { continue }
+            $indegree[$edge.Target]--
+            if ($indegree[$edge.Target] -eq 0) { $queue.Enqueue($edge.Target) }
+        }
+    }
+
+    return [pscustomobject]@{
+        Processed = $processed
+        Capacity = $capacity
+        Contributors = $contributors
+    }
+}
+
+function New-SupplyNode {
+    param(
+        [string]$Type,
+        [double]$Max = 0,
+        [bool]$Powered = $false,
+        [double]$Virtual = 0,
+        [double]$Consumption = 0,
+        [bool]$GateOpen = $true
+    )
+    return [pscustomobject]@{
+        Type = $Type; Max = $Max; Powered = $Powered; Virtual = $Virtual
+        Consumption = $Consumption; GateOpen = $GateOpen
+    }
+}
+
+function New-SupplyEdge {
+    param([string]$Source, [string]$Target, [bool]$Enabled = $true)
+    return [pscustomobject]@{ Source = $Source; Target = $Target; Enabled = $Enabled }
+}
+
+$diamondNodes = @{
+    source = New-SupplyNode source 100 $true
+    left = New-SupplyNode passthrough 200
+    right = New-SupplyNode passthrough 200
+    combiner = New-SupplyNode passthrough 200
+}
+$diamondEdges = @(
+    New-SupplyEdge source left
+    New-SupplyEdge source right
+    New-SupplyEdge left combiner
+    New-SupplyEdge right combiner
+)
+$diamondSnapshot = Get-SupplySnapshot $diamondNodes $diamondEdges
+Assert-True ($diamondSnapshot.Processed -eq 4) 'topological snapshot did not process a legal diamond'
+Assert-True ($diamondSnapshot.Capacity.combiner -eq 200) 'diamond branch capacity changed'
+Assert-True ($diamondSnapshot.Contributors.combiner.Count -eq 1) 'diamond duplicated one source root'
+
+$multiNodes = @{
+    generator = New-SupplyNode source 100 $true
+    battery = New-SupplyNode passthrough 80 $false 25 5
+    closedSwitch = New-SupplyNode passthrough 200 $false 0 0 $false
+    combiner = New-SupplyNode passthrough 200
+}
+$multiEdges = @(
+    New-SupplyEdge generator battery
+    New-SupplyEdge generator closedSwitch
+    New-SupplyEdge battery combiner
+    New-SupplyEdge closedSwitch combiner
+    New-SupplyEdge generator combiner $false
+)
+$multiSnapshot = Get-SupplySnapshot $multiNodes $multiEdges
+Assert-True ($multiSnapshot.Processed -eq 4) 'topological snapshot did not process multi-source/gated graph'
+Assert-True ($multiSnapshot.Capacity.battery -eq 80) 'battery input, virtual generation, consumption, or cap changed'
+Assert-True ($multiSnapshot.Capacity.closedSwitch -eq 0) 'closed gate leaked potential supply'
+Assert-True ($multiSnapshot.Capacity.combiner -eq 80) 'disabled or closed branch contributed capacity'
+Assert-True ($multiSnapshot.Contributors.combiner.Count -eq 2) 'source plus battery virtual roots were not preserved'
+
+$cycleNodes = @{ a = New-SupplyNode passthrough 100; b = New-SupplyNode passthrough 100 }
+$cycleEdges = @(New-SupplyEdge a b; New-SupplyEdge b a)
+$cycleSnapshot = Get-SupplySnapshot $cycleNodes $cycleEdges
+Assert-True ($cycleSnapshot.Processed -lt $cycleNodes.Count) 'topological snapshot failed to expose a corrupt cycle'
+
 # Model the EEInit -> OnStoreLoad registry transition.  One entity must own one
 # authoritative key, and a correlational alias must resolve to that key instead
 # of creating another graph identity.
@@ -125,5 +259,10 @@ Assert-True ($registrySource.Contains('m_IdByEntity')) 'registry reverse ownersh
 Assert-True ($deviceSource.Contains('preLoadDeviceId')) 'persistence transition cleanup is missing'
 Assert-True ($graphSource.Contains('SanitizeCompletedGraphCycles')) 'completed graph DAG audit is missing'
 Assert-True ($graphSource.Contains('FindDirectedPathExcludingEdge')) 'independent cycle path search is missing'
+Assert-True ($graphSource.Contains('CanonicalizeIncomingAdjacency')) 'incoming adjacency canonicalization is missing'
+Assert-True ($graphSource.Contains('BuildPotentialSupplySnapshot')) 'topological potential-supply snapshot is missing'
+Assert-True (-not $graphSource.Contains('m_PotentialSupplyVisiting')) 'recursive supply visitation state returned'
+Assert-True (-not $graphSource.Contains('m_PotentialContributorVisiting')) 'recursive contributor visitation state returned'
+Assert-True (-not $graphSource.Contains('result = result + GetPotentialSupplyCapacity')) 'recursive capacity traversal returned'
 
-Write-Host 'PASS: registry identity and graph topology invariants'
+Write-Host 'PASS: registry identity, graph topology, and supply snapshot invariants'
