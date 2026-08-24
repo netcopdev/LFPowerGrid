@@ -257,6 +257,22 @@ class LFPG_ElecNode
     int    m_ActiveSupplierCount;
     float  m_ActiveSupplierCapacity;
 
+    // --- Deterministic component solver staging ---
+    // These fields hold one complete, unpublished solution. Demand is computed
+    // from device intent in reverse topology order; delivery is then computed
+    // from that frozen demand in forward order. Public electrical fields above
+    // are updated only after every node and edge has a final value, preventing
+    // intermediate allocation states from reaching entities or clients.
+    float  m_SolveDemand;
+    float  m_SolveSoftRatio;
+    float  m_SolveInputPower;
+    float  m_SolveOutputPower;
+    float  m_SolveRealOutput;
+    float  m_SolveLoadRatio;
+    bool   m_SolvePowered;
+    bool   m_SolveOverloaded;
+    bool   m_SolveGateClosed;
+
     void LFPG_ElecNode()
     {
         m_DeviceId = "";
@@ -284,6 +300,15 @@ class LFPG_ElecNode
         m_SoftDemandRatio = 0.0;
         m_ActiveSupplierCount = -1;
         m_ActiveSupplierCapacity = -1.0;
+        m_SolveDemand = 0.0;
+        m_SolveSoftRatio = 0.0;
+        m_SolveInputPower = 0.0;
+        m_SolveOutputPower = 0.0;
+        m_SolveRealOutput = 0.0;
+        m_SolveLoadRatio = 0.0;
+        m_SolvePowered = false;
+        m_SolveOverloaded = false;
+        m_SolveGateClosed = false;
     }
 };
 
@@ -302,6 +327,9 @@ class LFPG_ElecEdge
     // --- Sprint 4.3 + v1.0: load allocation ---
     float           m_Demand;         // Downstream demand seen through this edge
     float           m_AllocatedPower; // Power actually allocated to this edge this epoch
+    float           m_SolveDemand;         // Frozen demand for the pending solution
+    float           m_SolveSoftDemand;     // Soft portion of m_SolveDemand
+    float           m_SolveAllocatedPower; // Unpublished allocation for the pending solution
 
     void LFPG_ElecEdge()
     {
@@ -313,5 +341,8 @@ class LFPG_ElecEdge
         m_Flags = LFPG_EDGE_ENABLED;
         m_Demand = 0.0;
         m_AllocatedPower = 0.0;
+        m_SolveDemand = 0.0;
+        m_SolveSoftDemand = 0.0;
+        m_SolveAllocatedPower = 0.0;
     }
 };

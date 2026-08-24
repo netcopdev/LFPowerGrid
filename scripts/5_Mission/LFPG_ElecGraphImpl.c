@@ -145,6 +145,11 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     // converges while the node is limit-skipped.
     protected ref array<string> m_DeferredRequeue;
 
+    // True only while a complete graph solution is being calculated and
+    // committed. Entity callbacks caused by applying that solution must not
+    // feed the just-committed state back into the scheduler as a new event.
+    protected bool m_DeterministicSolveActive;
+
     // --- v0.7.43 (Fix 3): NetworkID backup for entity re-resolution ---
     // When DeviceRegistry ref goes stale (entity streamed/recreated),
     // SyncNodeToEntity can re-resolve via GetObjectByNetworkId.
@@ -197,6 +202,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
 
         // v0.8.3: Deferred requeue
         m_DeferredRequeue = new array<string>;
+        m_DeterministicSolveActive = false;
 
         // v0.7.43 (Fix 3): NetworkID backup maps
         m_NodeNetLow = new map<string, int>;
@@ -2468,6 +2474,9 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     override void MarkNodeDirty(string nodeId, int mask)
     {
         #ifdef SERVER
+        if (m_DeterministicSolveActive)
+            return;
+
         if (nodeId == "")
             return;
 
@@ -2542,825 +2551,775 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     }
 
     // ===========================
-    // Sprint 4.3: Budgeted propagation with load allocation
+    // Deterministic transactional propagation
     // ===========================
 
+    // A dirty event schedules one complete graph solve. Demand and allocation
+    // are never derived from partially updated live state:
+    //   1. reverse topological pass freezes requested demand;
+    //   2. forward topological pass allocates real power once;
+    //   3. every node/edge is committed before any entity is synchronized.
+    //
+    // The previous asynchronous node solver was removed. Its per-node requeue
+    // guard could bound a single epoch without bounding the number of epochs,
+    // allowing one allocation feedback loop to flicker forever at 10 Hz.
     override int ProcessDirtyQueue(int nodeBudget, int edgeBudget)
     {
         #ifdef SERVER
         m_PropagationEdgeAccountingActive = true;
         m_EdgesVisitedThisEpoch = 0;
-
-        // v0.7.32 (Bloque C): Tick counter advances on every call,
-        // including when queue is empty. Used for validation gating.
         m_ValidateTickCount = m_ValidateTickCount + 1;
 
-        // v0.7.34 (Bloque E): Auto-close stale mutation if caller forgot
-        // EndGraphMutation. This is a safety net — should never trigger
-        // in normal operation. If it does, the log helps diagnose the
-        // caller that forgot to close its batch.
         if (m_MutationActive)
         {
-            string mutMsg = "[ElecGraph] ProcessDirtyQueue: mutation still active (depth=" + m_MutationDepth.ToString() + "), force-closing";
-            LFPG_Util.Warn(mutMsg);
+            string solveMutationMsg = "[ElecGraph] Deterministic solve found an open mutation (depth=";
+            solveMutationMsg = solveMutationMsg + m_MutationDepth.ToString() + "), force-closing";
+            LFPG_Util.Warn(solveMutationMsg);
             m_MutationActive = false;
             m_MutationDepth = 0;
-            int sci;
-            for (sci = 0; sci < m_DeferredOrphanCleanup.Count(); sci = sci + 1)
+            int solveCleanupIndex;
+            for (solveCleanupIndex = 0; solveCleanupIndex < m_DeferredOrphanCleanup.Count(); solveCleanupIndex = solveCleanupIndex + 1)
             {
-                CleanupOrphanNode(m_DeferredOrphanCleanup[sci]);
+                CleanupOrphanNode(m_DeferredOrphanCleanup[solveCleanupIndex]);
             }
             m_DeferredOrphanCleanup.Clear();
         }
 
-        // Never mutate adjacency while a supply snapshot is being built. An
-        // incomplete topological pass lands here on the next scheduler tick,
-        // where it is safe to canonicalize both indexes and repair the graph
-        // before any new allocations are calculated. Normal DAGs pay nothing
-        // beyond this bool check.
         if (m_RuntimeCycleAuditRequested)
         {
             m_RuntimeCycleAuditRequested = false;
             CanonicalizeIncomingAdjacency();
-            int runtimeCycleEdges = SanitizeCompletedGraphCycles();
-            if (runtimeCycleEdges > 0)
+            int pendingCycleEdges = SanitizeCompletedGraphCycles();
+            if (pendingCycleEdges > 0)
             {
-                string runtimeAuditMsg = "[ElecGraph] Runtime DAG audit healed ";
-                runtimeAuditMsg = runtimeAuditMsg + runtimeCycleEdges.ToString();
-                runtimeAuditMsg = runtimeAuditMsg + " cycle-closing edge(s)";
-                LFPG_Util.Warn(runtimeAuditMsg);
+                string pendingCycleMsg = "[ElecGraph] Deterministic pre-solve audit healed ";
+                pendingCycleMsg = pendingCycleMsg + pendingCycleEdges.ToString() + " cycle-closing edge(s)";
+                LFPG_Util.Warn(pendingCycleMsg);
             }
         }
 
-        int queueLen = m_DirtyQueue.Count() - m_DirtyQueueHead;
-        if (queueLen <= 0)
+        int pendingCount = m_DirtyQueue.Count() - m_DirtyQueueHead;
+        if (pendingCount <= 0)
         {
             if (m_DirtyQueue.Count() > 0)
             {
                 m_DirtyQueue.Clear();
                 m_DirtyQueueHead = 0;
             }
-
-            // v0.7.32 (Bloque C): Also validate during idle periods.
-            // Queue is empty — all propagation is complete, safe to check.
             ValidateConsumerStates(edgeBudget);
-
             m_PropagationEdgeAccountingActive = false;
             return m_DirtyQueue.Count() - m_DirtyQueueHead;
         }
 
-        int startMs = g_Game.GetTime();
-
+        int solveStartMs = g_Game.GetTime();
         if (m_ComponentsDirty)
             RebuildComponents();
 
         m_CurrentEpoch = m_CurrentEpoch + 1;
-        // Freeze a topology/capacity-derived supplier snapshot for this epoch.
-        // Allocation results produced below must not change supplier membership
-        // until the next epoch, otherwise a branch can become its own cause.
         m_PotentialSupplyCache.Clear();
         m_PotentialSupplySnapshotReady = false;
         m_PotentialContributorCache.Clear();
         m_PotentialContributorCapacity.Clear();
 
-        int processed = 0;
-
-        while (m_DirtyQueueHead < m_DirtyQueue.Count())
+        ref array<string> solveOrder = new array<string>;
+        bool orderComplete = BuildSolveTopologicalOrder(solveOrder);
+        if (!orderComplete)
         {
-            if (processed >= nodeBudget)
-                break;
-            if (m_EdgesVisitedThisEpoch >= edgeBudget)
-                break;
+            // Adjacency is allowed to change only at this scheduler boundary.
+            // Canonicalize and quarantine cycle-closing edges, then try once
+            // more. A still-invalid graph is committed safe-off below.
+            CanonicalizeIncomingAdjacency();
+            int healedCycleEdges = SanitizeCompletedGraphCycles();
+            if (healedCycleEdges > 0)
+            {
+                RebuildComponents();
+                string healedCycleMsg = "[ElecGraph] Deterministic solve quarantined ";
+                healedCycleMsg = healedCycleMsg + healedCycleEdges.ToString() + " cycle-closing edge(s)";
+                LFPG_Util.Warn(healedCycleMsg);
+            }
+            orderComplete = BuildSolveTopologicalOrder(solveOrder);
+        }
 
-            string nodeId = m_DirtyQueue[m_DirtyQueueHead];
-            m_DirtyQueueHead = m_DirtyQueueHead + 1;
+        m_DeterministicSolveActive = true;
+        if (orderComplete)
+        {
+            ResetSolveStaging(solveOrder);
+            BuildFrozenDemand(solveOrder);
+            BuildFrozenDelivery(solveOrder);
+            if (ValidateFrozenSolution(solveOrder))
+            {
+                CommitSolveState(solveOrder);
+            }
+            else
+            {
+                CommitSolveFailSafe();
+                LFPG_Util.Error("[ElecGraph] Deterministic solution violated an electrical invariant; graph committed safe-off");
+            }
+        }
+        else
+        {
+            CommitSolveFailSafe();
+            LFPG_Util.Error("[ElecGraph] Deterministic solve could not produce a complete order; graph committed safe-off");
+        }
+        m_DeterministicSolveActive = false;
 
+        ClearSolvedDirtyState();
+        m_LastProcessMs = g_Game.GetTime() - solveStartMs;
+
+        string solveMsg = "[ElecGraph] ProcessDirtyQueue: deterministic processed=";
+        solveMsg = solveMsg + solveOrder.Count().ToString();
+        solveMsg = solveMsg + " edges=" + m_EdgesVisitedThisEpoch.ToString();
+        solveMsg = solveMsg + " remaining=0 epoch=" + m_CurrentEpoch.ToString();
+        solveMsg = solveMsg + " ms=" + m_LastProcessMs.ToString();
+        LFPG_Util.Debug(solveMsg);
+
+        m_PropagationEdgeAccountingActive = false;
+        return 0;
+        #else
+        return 0;
+        #endif
+    }
+
+    protected bool BuildSolveTopologicalOrder(array<string> solveOrder)
+    {
+        #ifdef SERVER
+        if (!solveOrder)
+            return false;
+
+        solveOrder.Clear();
+        ref map<string, int> indegree = new map<string, int>;
+        ref array<string> ready = new array<string>;
+
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < m_Nodes.Count(); nodeIndex = nodeIndex + 1)
+        {
+            indegree.Set(m_Nodes.GetKey(nodeIndex), 0);
+        }
+
+        int ownerIndex;
+        for (ownerIndex = 0; ownerIndex < m_Outgoing.Count(); ownerIndex = ownerIndex + 1)
+        {
+            ref array<ref LFPG_ElecEdge> ownerEdges = m_Outgoing.GetElement(ownerIndex);
+            if (!ownerEdges)
+                continue;
+
+            int edgeIndex;
+            for (edgeIndex = 0; edgeIndex < ownerEdges.Count(); edgeIndex = edgeIndex + 1)
+            {
+                LFPG_ElecEdge edge = ownerEdges[edgeIndex];
+                if (!edge || (edge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                    continue;
+
+                int targetDegree = 0;
+                if (!indegree.Find(edge.m_TargetNodeId, targetDegree))
+                    continue;
+                indegree.Set(edge.m_TargetNodeId, targetDegree + 1);
+            }
+        }
+
+        int degreeIndex;
+        for (degreeIndex = 0; degreeIndex < indegree.Count(); degreeIndex = degreeIndex + 1)
+        {
+            if (indegree.GetElement(degreeIndex) == 0)
+                ready.Insert(indegree.GetKey(degreeIndex));
+        }
+
+        int readyHead = 0;
+        while (readyHead < ready.Count())
+        {
+            string currentId = ready[readyHead];
+            readyHead = readyHead + 1;
+            solveOrder.Insert(currentId);
+
+            ref array<ref LFPG_ElecEdge> currentEdges;
+            if (!m_Outgoing.Find(currentId, currentEdges) || !currentEdges)
+                continue;
+
+            int currentEdgeIndex;
+            for (currentEdgeIndex = 0; currentEdgeIndex < currentEdges.Count(); currentEdgeIndex = currentEdgeIndex + 1)
+            {
+                LFPG_ElecEdge currentEdge = currentEdges[currentEdgeIndex];
+                if (!currentEdge || (currentEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                    continue;
+
+                int remainingDegree = 0;
+                if (!indegree.Find(currentEdge.m_TargetNodeId, remainingDegree))
+                    continue;
+                remainingDegree = remainingDegree - 1;
+                indegree.Set(currentEdge.m_TargetNodeId, remainingDegree);
+                if (remainingDegree == 0)
+                    ready.Insert(currentEdge.m_TargetNodeId);
+            }
+        }
+
+        return solveOrder.Count() == m_Nodes.Count();
+        #else
+        return false;
+        #endif
+    }
+
+    protected void ResetSolveStaging(array<string> solveOrder)
+    {
+        #ifdef SERVER
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < solveOrder.Count(); nodeIndex = nodeIndex + 1)
+        {
+            ref LFPG_ElecNode node;
+            if (!m_Nodes.Find(solveOrder[nodeIndex], node) || !node)
+                continue;
+
+            node.m_SolveDemand = 0.0;
+            node.m_SolveSoftRatio = 0.0;
+            node.m_SolveInputPower = 0.0;
+            node.m_SolveOutputPower = 0.0;
+            node.m_SolveRealOutput = 0.0;
+            node.m_SolveLoadRatio = 0.0;
+            node.m_SolvePowered = false;
+            node.m_SolveOverloaded = false;
+            node.m_SolveGateClosed = node.m_GateClosed;
+        }
+
+        int ownerIndex;
+        for (ownerIndex = 0; ownerIndex < m_Outgoing.Count(); ownerIndex = ownerIndex + 1)
+        {
+            ref array<ref LFPG_ElecEdge> edges = m_Outgoing.GetElement(ownerIndex);
+            if (!edges)
+                continue;
+            int edgeIndex;
+            for (edgeIndex = 0; edgeIndex < edges.Count(); edgeIndex = edgeIndex + 1)
+            {
+                LFPG_ElecEdge edge = edges[edgeIndex];
+                if (!edge)
+                    continue;
+                edge.m_SolveDemand = 0.0;
+                edge.m_SolveSoftDemand = 0.0;
+                edge.m_SolveAllocatedPower = 0.0;
+            }
+        }
+        #endif
+    }
+
+    protected bool ResolveSolveGateClosed(string nodeId, LFPG_ElecNode node)
+    {
+        #ifdef SERVER
+        if (!node || !node.m_IsGated)
+            return false;
+
+        bool gateClosed = node.m_GateClosed;
+        EntityAI gateEntity = LFPG_DeviceRegistry.Get().FindById(nodeId);
+        if (!gateEntity)
+            gateEntity = LFPG_DeviceAPI.ResolveVanillaDevice(nodeId);
+
+        if (!gateEntity)
+            return gateClosed;
+
+        gateClosed = !LFPG_DeviceAPI.IsGateOpen(gateEntity);
+        if (gateClosed && !LFPG_DeviceAPI.IsGateControlPowerIndependent(gateEntity) && !node.m_GateClosed)
+        {
+            // A power-dependent gate may report closed only because the last
+            // committed solution browned it out. Preserve its commanded-open
+            // demand while an upstream overload exists.
+            if (HasUpstreamOverload(nodeId))
+                gateClosed = false;
+        }
+        return gateClosed;
+        #else
+        return false;
+        #endif
+    }
+
+    protected void BuildFrozenDemand(array<string> solveOrder)
+    {
+        #ifdef SERVER
+        // Resolve every gate command before the potential-supply snapshot is
+        // built. The snapshot and both solve passes must observe the same gate
+        // state, including a gate changed by the event that triggered this solve.
+        int gateIndex;
+        for (gateIndex = 0; gateIndex < solveOrder.Count(); gateIndex = gateIndex + 1)
+        {
+            string gateId = solveOrder[gateIndex];
+            ref LFPG_ElecNode gateNode;
+            if (m_Nodes.Find(gateId, gateNode) && gateNode && gateNode.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
+                gateNode.m_SolveGateClosed = ResolveSolveGateClosed(gateId, gateNode);
+        }
+
+        // Supplier weights are topology/capacity-only and immutable for the
+        // entire solve. No allocation produced below can change them.
+        BuildPotentialSupplySnapshot();
+
+        int reverseIndex;
+        for (reverseIndex = solveOrder.Count() - 1; reverseIndex >= 0; reverseIndex = reverseIndex - 1)
+        {
+            string nodeId = solveOrder[reverseIndex];
             ref LFPG_ElecNode node;
             if (!m_Nodes.Find(nodeId, node) || !node)
                 continue;
 
-            EnsureRequeueEpoch(nodeId, node);
+            float requestedDemand = 0.0;
+            float requestedSoft = 0.0;
 
-            // Skip if already processed this epoch (dedup)
-            if (node.m_LastEpoch == m_CurrentEpoch)
+            if (node.m_DeviceType == LFPG_DeviceType.CONSUMER || node.m_DeviceType == LFPG_DeviceType.CAMERA)
             {
-                // A same-epoch duplicate cannot be processed safely without an
-                // explicit epoch reset. Preserve it for the next epoch instead
-                // of leaving m_Dirty=true with no queue membership. That orphaned
-                // state made branches remain dormant until an unrelated event
-                // happened to mark the node again.
-                node.m_InQueue = false;
-                if (node.m_Dirty && m_DeferredRequeue.Find(nodeId) < 0)
-                {
-                    m_DeferredRequeue.Insert(nodeId);
-                }
-                continue;  // Sprint 4.3 fix: processed NOT incremented here
-            }
-
-            // NOW increment processed (after dedup check)
-            processed = processed + 1;
-
-            if (node.m_RequeueCount > LFPG_MAX_REQUEUE_PER_EPOCH)
-            {
-                LogRequeueLimit(nodeId, node);
-                // v0.8.3: Preserve dirty state for next-epoch recovery.
-                // Previous behavior cleared m_Dirty+m_DirtyMask, permanently
-                // orphaning the node when all downstream converged and stopped
-                // sending re-dirty signals (Bug: 3rd CeilingLight in chain at
-                // zero consumption). Now: keep dirty, defer to next epoch.
-                // m_InQueue=false allows future MarkNodeDirty to re-enqueue if
-                // an upstream re-dirty arrives before the deferred sweep runs.
-                node.m_InQueue = false;
-                if (m_DeferredRequeue.Find(nodeId) < 0)
-                {
-                    m_DeferredRequeue.Insert(nodeId);
-                }
-                continue;
-            }
-
-            int dirtyMask = node.m_DirtyMask;
-
-            // v0.7.46: Reset per-node (not per-branch) to prevent stale flag
-            // from a previous SOURCE/PASSTHROUGH leaking into a CONSUMER iteration.
-            m_AllocChanged = false;
-            m_LastAllocSoftDemand = 0.0;
-
-            // --- Step 1: Evaluate inputs ---
-            bool skipInputEval = false;
-            if (node.m_DeviceType == LFPG_DeviceType.SOURCE && dirtyMask == LFPG_DIRTY_INTERNAL)
-            {
-                skipInputEval = true;
-            }
-
-            float inputSum = 0.0;
-            if (!skipInputEval)
-            {
-                ref array<ref LFPG_ElecEdge> inEdges;
-                if (m_Incoming.Find(nodeId, inEdges) && inEdges)
-                {
-                    int ii;
-                    for (ii = 0; ii < inEdges.Count(); ii = ii + 1)
-                    {
-                        m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
-                        ref LFPG_ElecEdge inEdge = inEdges[ii];
-                        if (!inEdge)
-                            continue;
-
-                        if ((inEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
-                            continue;
-
-                        // Sprint 4.3: Use priority-aware allocated power
-                        float edgePower = GetEdgeAllocatedPower(inEdge);
-                        // v0.7.26 (Audit 4): Guard against NaN/negative from floating point corruption
-                        if (edgePower < 0.0)
-                        {
-                            edgePower = 0.0;
-                        }
-                        // [DIAG PT-CHAIN] Point 3: Per input edge detail (PASSTHROUGH only)
-                        if (LFPG_DIAG_PT_CHAIN && node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
-                        {
-                            string ptLog3 = "[PT-CHAIN] InputEdge: tgt=";
-                            ptLog3 = ptLog3 + nodeId;
-                            ptLog3 = ptLog3 + " src=" + inEdge.m_SourceNodeId;
-                            ptLog3 = ptLog3 + " alloc=" + inEdge.m_AllocatedPower.ToString();
-                            ptLog3 = ptLog3 + " resolved=" + edgePower.ToString();
-                            ptLog3 = ptLog3 + " flags=" + inEdge.m_Flags.ToString();
-                            LFPG_Util.Info(ptLog3);
-                        }
-                        inputSum = inputSum + edgePower;
-                    }
-                }
-                // v0.7.27 (Audit 5): Final guard on accumulated inputSum.
-                // Individual edgePower is guarded, but accumulated sum could
-                // theoretically go negative from floating point corruption.
-                if (inputSum < 0.0)
-                {
-                    inputSum = 0.0;
-                }
-                node.m_InputPower = inputSum;
-            }
-            else
-            {
-                inputSum = node.m_InputPower;
-            }
-
-            // --- Step 2: Compute output based on device type ---
-            float newOutput = 0.0;
-            bool newPowered = false;
-
-            if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
-            {
-                if (node.m_Powered)
-                {
-                    newOutput = node.m_MaxOutput;
-                }
-                newPowered = node.m_Powered;
+                requestedDemand = node.m_Consumption;
             }
             else if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
             {
-                // v2.0: Battery support — m_VirtualGeneration adds discharge
-                // power from storage to effective input. For non-battery
-                // PASSTHROUGH devices this is 0.0 (zero regression).
-                float effectiveInput = inputSum + node.m_VirtualGeneration;
+                float downstreamDemand = 0.0;
+                float downstreamSoft = 0.0;
+                ref array<ref LFPG_ElecEdge> outEdges;
+                if (m_Outgoing.Find(nodeId, outEdges) && outEdges)
+                {
+                    int outIndex;
+                    for (outIndex = 0; outIndex < outEdges.Count(); outIndex = outIndex + 1)
+                    {
+                        LFPG_ElecEdge outEdge = outEdges[outIndex];
+                        if (!outEdge || (outEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                            continue;
+                        m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
+                        downstreamDemand = downstreamDemand + outEdge.m_SolveDemand;
+                        downstreamSoft = downstreamSoft + outEdge.m_SolveSoftDemand;
+                    }
+                }
 
+                if (node.m_SolveGateClosed)
+                {
+                    float gateBaseDemand = LFPG_GATE_PROBE_DEMAND;
+                    if (node.m_Consumption > gateBaseDemand)
+                        gateBaseDemand = node.m_Consumption;
+                    requestedSoft = node.m_SoftDemand;
+                    requestedDemand = gateBaseDemand + requestedSoft;
+                }
+                else
+                {
+                    float downstreamHard = downstreamDemand - downstreamSoft;
+                    if (downstreamHard < 0.0)
+                        downstreamHard = 0.0;
+
+                    float hardDemand = downstreamHard + node.m_Consumption;
+                    float virtualOffset = node.m_VirtualGeneration;
+                    if (virtualOffset > hardDemand)
+                        virtualOffset = hardDemand;
+
+                    requestedSoft = downstreamSoft + node.m_SoftDemand;
+                    requestedDemand = hardDemand - virtualOffset + requestedSoft;
+
+                    // Throughput capacity is a demand ceiling. When a battery
+                    // contributes soft charging demand, shed soft demand first.
+                    if (node.m_MaxOutput > LFPG_PROPAGATION_EPSILON && requestedDemand > node.m_MaxOutput)
+                    {
+                        float excess = requestedDemand - node.m_MaxOutput;
+                        requestedDemand = node.m_MaxOutput;
+                        requestedSoft = requestedSoft - excess;
+                        if (requestedSoft < 0.0)
+                            requestedSoft = 0.0;
+                    }
+                }
+            }
+
+            if (requestedDemand < 0.0)
+                requestedDemand = 0.0;
+            node.m_SolveDemand = requestedDemand;
+
+            if (requestedDemand > LFPG_PROPAGATION_EPSILON && requestedSoft > LFPG_PROPAGATION_EPSILON)
+            {
+                node.m_SolveSoftRatio = requestedSoft / requestedDemand;
+                if (node.m_SolveSoftRatio > 1.0)
+                    node.m_SolveSoftRatio = 1.0;
+            }
+
+            ref array<ref LFPG_ElecEdge> inEdges;
+            if (!m_Incoming.Find(nodeId, inEdges) || !inEdges)
+                continue;
+
+            int inIndex;
+            for (inIndex = 0; inIndex < inEdges.Count(); inIndex = inIndex + 1)
+            {
+                LFPG_ElecEdge inEdge = inEdges[inIndex];
+                if (!inEdge || (inEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                    continue;
+
+                m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
+                float supplyShare = GetIncomingSupplyShare(nodeId, inEdge);
+                inEdge.m_SolveDemand = requestedDemand * supplyShare;
+                inEdge.m_SolveSoftDemand = inEdge.m_SolveDemand * node.m_SolveSoftRatio;
+            }
+        }
+        #endif
+    }
+
+    protected void AllocateFrozenOutput(string nodeId, LFPG_ElecNode node, float availableOutput)
+    {
+        #ifdef SERVER
+        if (!node)
+            return;
+        if (availableOutput < 0.0)
+            availableOutput = 0.0;
+
+        ref array<ref LFPG_ElecEdge> outEdges;
+        if (!m_Outgoing.Find(nodeId, outEdges) || !outEdges)
+        {
+            node.m_SolveLoadRatio = 0.0;
+            node.m_SolveOverloaded = false;
+            return;
+        }
+
+        float totalDemand = 0.0;
+        float totalSoft = 0.0;
+        int edgeIndex;
+        for (edgeIndex = 0; edgeIndex < outEdges.Count(); edgeIndex = edgeIndex + 1)
+        {
+            LFPG_ElecEdge demandEdge = outEdges[edgeIndex];
+            if (!demandEdge || (demandEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                continue;
+            m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
+            totalDemand = totalDemand + demandEdge.m_SolveDemand;
+            totalSoft = totalSoft + demandEdge.m_SolveSoftDemand;
+        }
+
+        float totalHard = totalDemand - totalSoft;
+        if (totalHard < 0.0)
+            totalHard = 0.0;
+        bool overloaded = totalHard > availableOutput + LFPG_PROPAGATION_EPSILON;
+
+        float softSurplus = 0.0;
+        if (!overloaded && totalSoft > LFPG_PROPAGATION_EPSILON)
+        {
+            softSurplus = availableOutput - totalHard;
+            if (softSurplus < 0.0)
+                softSurplus = 0.0;
+            if (softSurplus > totalSoft)
+                softSurplus = totalSoft;
+        }
+
+        float totalAllocated = 0.0;
+        for (edgeIndex = 0; edgeIndex < outEdges.Count(); edgeIndex = edgeIndex + 1)
+        {
+            LFPG_ElecEdge allocEdge = outEdges[edgeIndex];
+            if (!allocEdge || (allocEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                continue;
+            m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
+
+            float allocation = 0.0;
+            if (!overloaded)
+            {
+                float edgeHard = allocEdge.m_SolveDemand - allocEdge.m_SolveSoftDemand;
+                if (edgeHard < 0.0)
+                    edgeHard = 0.0;
+                allocation = edgeHard;
+                if (allocEdge.m_SolveSoftDemand > LFPG_PROPAGATION_EPSILON && totalSoft > LFPG_PROPAGATION_EPSILON)
+                {
+                    allocation = allocation + (softSurplus * allocEdge.m_SolveSoftDemand / totalSoft);
+                }
+            }
+            allocEdge.m_SolveAllocatedPower = allocation;
+            totalAllocated = totalAllocated + allocation;
+        }
+
+        node.m_SolveOverloaded = overloaded;
+        if (availableOutput > LFPG_PROPAGATION_EPSILON)
+        {
+            node.m_SolveLoadRatio = totalAllocated / availableOutput;
+            if (node.m_SolveLoadRatio > 100.0)
+                node.m_SolveLoadRatio = 100.0;
+        }
+        else
+        {
+            node.m_SolveLoadRatio = 0.0;
+        }
+        #endif
+    }
+
+    protected void BuildFrozenDelivery(array<string> solveOrder)
+    {
+        #ifdef SERVER
+        int orderIndex;
+        for (orderIndex = 0; orderIndex < solveOrder.Count(); orderIndex = orderIndex + 1)
+        {
+            string nodeId = solveOrder[orderIndex];
+            ref LFPG_ElecNode node;
+            if (!m_Nodes.Find(nodeId, node) || !node)
+                continue;
+
+            float inputPower = 0.0;
+            ref array<ref LFPG_ElecEdge> inEdges;
+            if (m_Incoming.Find(nodeId, inEdges) && inEdges)
+            {
+                int inIndex;
+                for (inIndex = 0; inIndex < inEdges.Count(); inIndex = inIndex + 1)
+                {
+                    LFPG_ElecEdge inEdge = inEdges[inIndex];
+                    if (!inEdge || (inEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                        continue;
+                    m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
+                    inputPower = inputPower + inEdge.m_SolveAllocatedPower;
+                }
+            }
+            node.m_SolveInputPower = inputPower;
+
+            if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
+            {
+                node.m_SolvePowered = node.m_Powered;
+                if (node.m_SolvePowered)
+                    node.m_SolveRealOutput = node.m_MaxOutput;
+                node.m_SolveOutputPower = node.m_SolveRealOutput;
+                AllocateFrozenOutput(nodeId, node, node.m_SolveRealOutput);
+            }
+            else if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
+            {
+                float effectiveInput = inputPower + node.m_VirtualGeneration;
                 if (effectiveInput > LFPG_PROPAGATION_EPSILON)
                 {
-                    // v0.7.47: Subtract self-consumption before passing downstream.
-                    // CeilingLight consumes 10 u/s for its own light, rest goes out.
-                    // Splitter has consumption=0 → afterSelf = effectiveInput (no regression).
-                    float selfCons = node.m_Consumption;
-                    if (selfCons > LFPG_PROPAGATION_EPSILON)
+                    if (node.m_Consumption > LFPG_PROPAGATION_EPSILON)
                     {
-                        // Has self-consumption: check if input covers it
-                        if (effectiveInput + LFPG_PROPAGATION_EPSILON >= selfCons)
+                        if (effectiveInput + LFPG_PROPAGATION_EPSILON >= node.m_Consumption)
                         {
-                            // Enough for self → powered, pass remainder downstream
-                            newPowered = true;
-                            float afterSelf = effectiveInput - selfCons;
-                            if (afterSelf < 0.0)
-                            {
-                                afterSelf = 0.0;
-                            }
-                            newOutput = afterSelf;
-                        }
-                        else
-                        {
-                            // Insufficient for self → unpowered, nothing downstream
-                            // Matches CONSUMER logic: input must cover consumption.
-                            newPowered = false;
-                            newOutput = 0.0;
+                            node.m_SolvePowered = true;
+                            node.m_SolveRealOutput = effectiveInput - node.m_Consumption;
+                            if (node.m_SolveRealOutput < 0.0)
+                                node.m_SolveRealOutput = 0.0;
                         }
                     }
                     else
                     {
-                        // Zero self-consumption (Splitter pattern) → pass everything
-                        // v1.1.0: Only powered if actually receiving input.
-                        if (effectiveInput > LFPG_PROPAGATION_EPSILON)
-                        {
-                            newPowered = true;
-                        }
-                        newOutput = effectiveInput;
-                    }
-
-                    // v0.7.33 (Fix #22): Cap output to max throughput capacity.
-                    // Without this, passthrough relayed infinite power.
-                    if (node.m_MaxOutput > LFPG_PROPAGATION_EPSILON && newOutput > node.m_MaxOutput)
-                    {
-                        newOutput = node.m_MaxOutput;
+                        node.m_SolvePowered = true;
+                        node.m_SolveRealOutput = effectiveInput;
                     }
                 }
-                // [DIAG PT-CHAIN] Punto 2: PASSTHROUGH evaluation result
-                if (LFPG_DIAG_PT_CHAIN)
+
+                if (node.m_MaxOutput > LFPG_PROPAGATION_EPSILON && node.m_SolveRealOutput > node.m_MaxOutput)
+                    node.m_SolveRealOutput = node.m_MaxOutput;
+
+                float availableForDownstream = node.m_SolveRealOutput;
+                if (node.m_SolveGateClosed)
+                    availableForDownstream = 0.0;
+                AllocateFrozenOutput(nodeId, node, availableForDownstream);
+
+                // Preserve the public graph contract: PASSTHROUGH output fields
+                // carry advertised demand upstream; edge allocations carry real
+                // delivered power downstream.
+                node.m_SolveOutputPower = node.m_SolveDemand;
+
+                // Off and intentionally closed devices are not overloads.
+                if (node.m_SolveRealOutput < LFPG_PROPAGATION_EPSILON || node.m_SolveGateClosed)
                 {
-                    string ptLog2 = "[PT-CHAIN] PDQ PASSTHROUGH: ";
-                    ptLog2 = ptLog2 + nodeId;
-                    ptLog2 = ptLog2 + " mask=" + dirtyMask.ToString();
-                    ptLog2 = ptLog2 + " inSum=" + inputSum.ToString();
-                    ptLog2 = ptLog2 + " selfCons=" + node.m_Consumption.ToString();
-                    ptLog2 = ptLog2 + " newOut=" + newOutput.ToString();
-                    ptLog2 = ptLog2 + " powered=" + newPowered.ToString();
-                    ptLog2 = ptLog2 + " lastStable=" + node.m_LastStableOutput.ToString();
-                    ptLog2 = ptLog2 + " maxOut=" + node.m_MaxOutput.ToString();
-                    ptLog2 = ptLog2 + " epoch=" + m_CurrentEpoch.ToString();
-                    ptLog2 = ptLog2 + " requeue=" + node.m_RequeueCount.ToString();
-                    LFPG_Util.Info(ptLog2);
+                    node.m_SolveOverloaded = false;
+                    node.m_SolveLoadRatio = 0.0;
                 }
             }
             else if (node.m_DeviceType == LFPG_DeviceType.CONSUMER || node.m_DeviceType == LFPG_DeviceType.CAMERA)
             {
                 if (node.m_Consumption > LFPG_PROPAGATION_EPSILON)
-                {
-                    if (inputSum + LFPG_PROPAGATION_EPSILON >= node.m_Consumption)
-                    {
-                        newPowered = true;
-                    }
-                }
+                    node.m_SolvePowered = inputPower + LFPG_PROPAGATION_EPSILON >= node.m_Consumption;
                 else
-                {
-                    if (inputSum > LFPG_PROPAGATION_EPSILON)
-                    {
-                        newPowered = true;
-                    }
-                }
-                newOutput = 0.0;
+                    node.m_SolvePowered = inputPower > LFPG_PROPAGATION_EPSILON;
             }
             else
             {
-                if (inputSum > LFPG_PROPAGATION_EPSILON)
-                    newPowered = true;
+                node.m_SolvePowered = inputPower > LFPG_PROPAGATION_EPSILON;
             }
+        }
+        #endif
+    }
 
-            node.m_Powered = newPowered;
-
-            // --- Step 2b (v1.0): Binary power allocation + demand signaling ---
-            // AllocateOutput always runs for SOURCE/PASSTHROUGH (even with newOutput=0)
-            // to compute totalDemand for upstream demand signaling.
-            if (node.m_DeviceType == LFPG_DeviceType.SOURCE || node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
+    protected void CommitSolveState(array<string> solveOrder)
+    {
+        #ifdef SERVER
+        // Commit all graph data first. Entity callbacks therefore observe one
+        // internally consistent solution even though entity sync is sequential.
+        int ownerIndex;
+        for (ownerIndex = 0; ownerIndex < m_Outgoing.Count(); ownerIndex = ownerIndex + 1)
+        {
+            ref array<ref LFPG_ElecEdge> edges = m_Outgoing.GetElement(ownerIndex);
+            if (!edges)
+                continue;
+            int edgeIndex;
+            for (edgeIndex = 0; edgeIndex < edges.Count(); edgeIndex = edgeIndex + 1)
             {
-                // v2.1: Pre-gate check — determine if gate blocks downstream.
-                // Must run BEFORE AllocateOutput so we pass availableOutput=0
-                // for closed gates. This prevents the allocate→zero→requeue
-                // ping-pong: AllocateOutput with 0 produces overload→all-edges-0,
-                // matching steady-state for closed gates → no allocDelta →
-                // no m_AllocChanged → no wasted requeue cycles per epoch.
-                // Non-gated devices (Splitter, Combiner, CeilingLight, Monitor):
-                // m_IsGated=false → gateIsClosed stays false → zero regression.
-                bool gateIsClosed = false;
-                bool gateEntityResolved = false;
-                bool gateControlPowerIndependent = false;
-                if (node.m_IsGated)
-                {
-                    EntityAI gateEnt = LFPG_DeviceRegistry.Get().FindById(nodeId);
-                    if (gateEnt)
-                    {
-                        gateEntityResolved = true;
-                        gateControlPowerIndependent = LFPG_DeviceAPI.IsGateControlPowerIndependent(gateEnt);
-                        bool gateOpen = LFPG_DeviceAPI.IsGateOpen(gateEnt);
-                        if (!gateOpen)
-                        {
-                            gateIsClosed = true;
-
-                            // Brownout latch applies only to power-dependent gates
-                            // whose input disappeared behind an actual upstream
-                            // overload. This preserves open-path demand so binary
-                            // all-off allocation converges to a stable overload.
-                            //
-                            // Power-independent controls (latching switches,
-                            // battery selectors, motion/pad state) are always
-                            // authoritative. A normal source shutdown or an
-                            // upstream gate closing is also authoritative because
-                            // there is no overloaded ancestor. The old broad
-                            // !newPowered test conflated those cases and could make
-                            // a user's OFF command ineffective during a flicker.
-                            bool latchBrownoutOpen = false;
-                            if (!gateControlPowerIndependent && !newPowered && !node.m_GateClosed)
-                            {
-                                latchBrownoutOpen = HasUpstreamOverload(nodeId);
-                            }
-                            if (latchBrownoutOpen)
-                            {
-                                gateIsClosed = false;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Entity unresolvable (streamed out / registry stale).
-                        // Preserve last known gate state to avoid phantom
-                        // transition (closed→open surge or open→closed blackout).
-                        gateIsClosed = node.m_GateClosed;
-                    }
-
-                    // Do not force the cached gate closed merely because input
-                    // power is absent. The entity still fails safe via
-                    // LFPG_SetPowered(false), while the graph retains the demand
-                    // that caused the brownout and can converge to a stable
-                    // overload state instead of alternating probe/full demand.
-                }
-
-                // SOURCE publishes its real output before AllocateOutput so
-                // downstream cold-start/fallback readers see current capacity.
-                // Multi-source sharing uses topology-derived potential supply
-                // rather than this allocation/demand cache.
-                // PASSTHROUGH excluded: newOutput changes later (demand signal
-                // override), so early-set would be incorrect.
-                if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
-                {
-                    node.m_OutputPower = newOutput;
-                }
-
-                float allocAvail = newOutput;
-                if (gateIsClosed)
-                {
-                    allocAvail = 0.0;
-                }
-
-                float downstreamDemand = AllocateOutput(nodeId, allocAvail);
-
-                // Off source/passthrough: clear overload state.
-                // "Off" is not "overloaded" — cables should show IDLE, not CRITICAL.
-                if (newOutput < LFPG_PROPAGATION_EPSILON)
-                {
-                    node.m_Overloaded = false;
-                    node.m_LoadRatio = 0.0;
-                }
-
-                // v2.1: Closed gate is not "overloaded". AllocateOutput with 0
-                // as available marks the node overloaded (0 < demand), but a
-                // closed gate is blocking by design, not overloaded. Clear the
-                // stale overload state so cables show IDLE, not CRITICAL.
-                if (gateIsClosed)
-                {
-                    node.m_Overloaded = false;
-                    node.m_LoadRatio = 0.0;
-                }
-
-                // PASSTHROUGH: always report real demand (self + downstream)
-                // via m_LastStableOutput so upstream sources allocate correctly.
-                // This replaces Step 2c demand probe — demand is always signaled,
-                // even when unpowered or overloaded, preventing oscillation.
-                if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
-                {
-                    // v2.0: Read downstream soft demand from AllocateOutput cache.
-                    // AllocateOutput already iterated all outgoing edges and computed
-                    // totalSoftDemand → stored in m_LastAllocSoftDemand.
-                    // Eliminates redundant O(K) edge iteration + map lookups.
-                    float downstreamSoft = m_LastAllocSoftDemand;
-
-                    // v2.5 (Battery charge fix): Demand signal split into hard + soft.
-                    //   hard = (downstreamDemand - downstreamSoft) + selfConsumption
-                    //   soft = downstreamSoft + node.m_SoftDemand (charge want)
-                    //   virtualGen offsets ONLY hard portion (storage covers downstream).
-                    //   Soft demand (charging) is NEVER cancelled by virtualGen.
-                    //   Without this, virtualGen > hardBase makes demandSignal=0
-                    //   and the battery stops requesting charge power from upstream.
-                    float totalSoft = downstreamSoft + node.m_SoftDemand;
-                    float hardBase = downstreamDemand - downstreamSoft + node.m_Consumption;
-                    if (hardBase < 0.0)
-                    {
-                        hardBase = 0.0;
-                    }
-                    float virtualOffset = node.m_VirtualGeneration;
-                    if (virtualOffset > hardBase)
-                    {
-                        virtualOffset = hardBase;
-                    }
-                    float demandSignal = hardBase - virtualOffset + totalSoft;
-                    if (demandSignal < 0.0)
-                    {
-                        demandSignal = 0.0;
-                    }
-
-                    if (demandSignal > LFPG_PROPAGATION_EPSILON)
-                    {
-                        newOutput = demandSignal;
-
-                        // v2.0 (Fix C1): MaxOutput cap with hard-priority.
-                        // When throughput bottleneck forces a cap, reduce soft FIRST
-                        // so hard consumers retain full demand signal upstream.
-                        // Without this, uniform scaling starves hard demand when
-                        // soft demand is large relative to total.
-                        if (node.m_MaxOutput > LFPG_PROPAGATION_EPSILON && newOutput > node.m_MaxOutput)
-                        {
-                            float excess = newOutput - node.m_MaxOutput;
-                            newOutput = node.m_MaxOutput;
-                            // Reduce soft by the excess amount (cap soft first).
-                            totalSoft = totalSoft - excess;
-                            if (totalSoft < 0.0)
-                            {
-                                totalSoft = 0.0;
-                            }
-                        }
-
-                        // Compute soft ratio for upstream propagation.
-                        // Non-battery PASSTHROUGH: totalSoft=0 → ratio=0 (no regression).
-                        float ratioVal = totalSoft / newOutput;
-                        if (ratioVal < 0.0)
-                        {
-                            ratioVal = 0.0;
-                        }
-                        if (ratioVal > 1.0)
-                        {
-                            ratioVal = 1.0;
-                        }
-                        node.m_SoftDemandRatio = ratioVal;
-                    }
-                    else
-                    {
-                        node.m_SoftDemandRatio = 0.0;
-
-                        if (node.m_Consumption > LFPG_PROPAGATION_EPSILON)
-                        {
-                            newOutput = node.m_Consumption;
-                        }
-                        else
-                        {
-                            // B1 fix: No downstream demand, no self-consumption.
-                            // Without this, newOutput retains effectiveInput from Step 2a,
-                            // causing phantom load on upstream source via stale
-                            // m_LastStableOutput. Zero it explicitly.
-                            newOutput = 0.0;
-                        }
-                    }
-
-                    // v2.1: Post-gate — override demand signal for closed gates
-                    // and track gate state transitions for re-evaluation.
-                    // This runs AFTER the demand signal section so it can override
-                    // newOutput cleanly. The pre-gate check already prevented
-                    // AllocateOutput from producing non-zero allocations.
-                    if (node.m_IsGated)
-                    {
-                        bool prevGateClosed = node.m_GateClosed;
-
-                        // Only update m_GateClosed when entity was resolved.
-                        // If stale (streamed out), preserve last known state —
-                        // gateIsClosed already copied from node.m_GateClosed in
-                        // pre-gate, so behavior is consistent but no false transition.
-                        if (gateEntityResolved)
-                        {
-                            if (gateIsClosed)
-                            {
-                                node.m_GateClosed = true;
-                            }
-                            else
-                            {
-                                node.m_GateClosed = false;
-                            }
-                        }
-
-                        if (gateIsClosed)
-                        {
-                            // v2.3: Closed gate demand = max(probe, selfCons).
-                            // Device needs enough input to power itself and run
-                            // detection logic (LaserDetector raycast, PressurePad step).
-                            // Gate only blocks downstream output, not self-powering.
-                            float selfForGate = node.m_Consumption;
-                            float baseDemand = LFPG_GATE_PROBE_DEMAND;
-                            if (selfForGate > baseDemand)
-                            {
-                                baseDemand = selfForGate;
-                            }
-                            float gatedDemand = baseDemand + node.m_SoftDemand;
-                            newOutput = gatedDemand;
-                            if (node.m_SoftDemand > LFPG_PROPAGATION_EPSILON)
-                            {
-                                node.m_SoftDemandRatio = node.m_SoftDemand / gatedDemand;
-                            }
-                            else
-                            {
-                                node.m_SoftDemandRatio = 0.0;
-                            }
-                        }
-
-                        // Force upstream re-evaluation on gate state transition.
-                        // Without this, opening a gate after steady-state (demand=0)
-                        // produces no outputDelta, so upstream never re-allocates
-                        // and the chain stays dead.
-                        // Only fire on real transitions (entity resolved), not
-                        // stale reads where m_GateClosed is preserved unchanged.
-                        if (gateEntityResolved && prevGateClosed != node.m_GateClosed)
-                        {
-                            m_AllocChanged = true;
-
-                            // v4.1: Mark upstream sources dirty so they re-evaluate
-                            // allocation through this gate. Without this, upstream
-                            // keeps stale allocation (e.g. probe-only 1.0 u/s) and
-                            // downstream consumers never receive enough power.
-                            ref array<ref LFPG_ElecEdge> gateInEdges;
-                            if (m_Incoming.Find(nodeId, gateInEdges) && gateInEdges)
-                            {
-                                int gi;
-                                for (gi = 0; gi < gateInEdges.Count(); gi = gi + 1)
-                                {
-                                    m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
-                                    ref LFPG_ElecEdge gInEdge = gateInEdges[gi];
-                                    if (gInEdge && gInEdge.m_SourceNodeId != "")
-                                    {
-                                        MarkNodeDirty(gInEdge.m_SourceNodeId, LFPG_DIRTY_INPUT);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                LFPG_ElecEdge edge = edges[edgeIndex];
+                if (!edge)
+                    continue;
+                edge.m_Demand = edge.m_SolveDemand;
+                edge.m_AllocatedPower = edge.m_SolveAllocatedPower;
             }
+        }
 
-            // --- Step 3: If output changed, mark downstream dirty ---
-            float outputDelta = newOutput - node.m_LastStableOutput;
-            if (outputDelta < 0.0)
-                outputDelta = -outputDelta;
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < solveOrder.Count(); nodeIndex = nodeIndex + 1)
+        {
+            ref LFPG_ElecNode node;
+            if (!m_Nodes.Find(solveOrder[nodeIndex], node) || !node)
+                continue;
 
-            // PASSTHROUGH input change detection. A changed input allocation must
-            // be propagated downstream even when the node's advertised demand is
-            // stable. It must NOT, by itself, invalidate upstream: doing that
-            // creates a bidirectional feedback wave (upstream reallocates -> input
-            // changes -> upstream reallocates again) which can alternate binary
-            // allocations until the per-epoch requeue guard is reached.
-            // Upstream is invalidated below only when the advertised demand really
-            // changes. Gate transitions have their own explicit upstream mark.
-            bool inputChanged = false;
-            if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
-            {
-                float inputDelta = inputSum - node.m_PrevInputPower;
-                if (inputDelta < 0.0)
-                {
-                    inputDelta = 0.0 - inputDelta;
-                }
-                if (inputDelta > LFPG_PROPAGATION_EPSILON)
-                {
-                    inputChanged = true;
-                }
-                node.m_PrevInputPower = inputSum;
-            }
-
-            // v0.7.38 (BugFix B1): Force downstream re-evaluation when topology
-            // changed on a source/passthrough, even if total output is unchanged.
-            // Wire replace creates fresh edges with m_AllocatedPower=0.
-            // If a consumer processes BEFORE the source in the same epoch,
-            // it reads stale allocation via equal-split fallback (e.g. 50/2=25
-            // for a 50W consumer → incorrectly powers off).
-            // AllocateOutput on the source DOES set correct per-edge
-            // allocations, but outputDelta=0 means Step 3 never re-queues
-            // consumers to read them.
-            // Fix: always re-queue downstream when DIRTY_TOPOLOGY on a producer.
-            // Additionally, reset m_LastEpoch on consumers that already processed
-            // this epoch so they can re-evaluate in the SAME epoch with correct
-            // allocations. Both SetPowered calls (stale→correct) land in the same
-            // frame, so DayZ SyncVar batching sends only the final value to clients
-            // — zero visible flicker. Safe: m_RequeueCount prevents infinite loops.
-            bool forceDownstream = false;
-            if ((dirtyMask & LFPG_DIRTY_TOPOLOGY) != 0)
-            {
-                if (node.m_DeviceType == LFPG_DeviceType.SOURCE || node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
-                {
-                    forceDownstream = true;
-                }
-            }
-
-            // v0.7.46: m_AllocChanged — per-edge allocation changed even if
-            // total output (outputDelta) is unchanged. Example: SOURCE always
-            // outputs 50, but splits 10→20 for a splitter after demand increase.
-            // Without this, downstream never re-reads the new allocation.
-            // inputChanged — PASSTHROUGH input changed but demand signal (output)
-            // is stable. This refreshes downstream power state without feeding the
-            // allocation result back into its upstream cause.
-            if (outputDelta > LFPG_PROPAGATION_EPSILON || forceDownstream || m_AllocChanged || inputChanged)
-            {
-                node.m_OutputPower = newOutput;
-                node.m_LastStableOutput = newOutput;
-
-                ref array<ref LFPG_ElecEdge> outEdges;
-                if (m_Outgoing.Find(nodeId, outEdges) && outEdges)
-                {
-                    int oi;
-                    for (oi = 0; oi < outEdges.Count(); oi = oi + 1)
-                    {
-                        ref LFPG_ElecEdge outEdge = outEdges[oi];
-                        m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
-                        if (outEdge && outEdge.m_TargetNodeId != "")
-                        {
-                            ref LFPG_ElecNode tgtNode;
-                            if (m_Nodes.Find(outEdge.m_TargetNodeId, tgtNode) && tgtNode)
-                            {
-                                EnsureRequeueEpoch(outEdge.m_TargetNodeId, tgtNode);
-                                tgtNode.m_RequeueCount = tgtNode.m_RequeueCount + 1;
-
-                                // B1: Allow same-epoch reprocessing for consumers
-                                // that already ran this epoch with stale allocations.
-                                // Only reset if they were actually processed this epoch
-                                // (m_LastEpoch == current); otherwise they haven't run
-                                // yet and don't need the reset.
-                                // Every path entering this block represents a real
-                                // downstream invalidation: outputDelta, topology,
-                                // allocation change, or input change. Reset any
-                                // target already processed this epoch so its queued
-                                // update is not consumed by the epoch-dedup guard.
-                                if (tgtNode.m_LastEpoch == m_CurrentEpoch)
-                                {
-                                    int prevEpoch = m_CurrentEpoch - 1;
-                                    tgtNode.m_LastEpoch = prevEpoch;
-                                }
-                            }
-                            MarkNodeDirty(outEdge.m_TargetNodeId, LFPG_DIRTY_INPUT);
-                        }
-                    }
-                }
-
-                // Upstream demand propagation for PASSTHROUGH nodes. Only a real
-                // advertised-demand change belongs upstream. m_AllocChanged and
-                // inputChanged are allocation results and flow downstream only;
-                // reflecting either upstream creates a solver feedback loop.
-                // When a PASSTHROUGH output changes, upstream sources must
-                // re-evaluate because they use m_LastStableOutput as demand.
-                // Without this, the source processes first during warmup with
-                // cold-start fallback demand (inflated), the passthrough caps
-                // to real demand, but the source never re-evaluates — its
-                // loadRatio stays permanently inflated, causing false
-                // WARNING/CRITICAL cable colors on the upstream wire.
-                // Mirrors the B1 pattern: reset m_LastEpoch so upstream can
-                // re-process in the SAME epoch with corrected demand values.
-                // Safe: bounded by m_RequeueCount (LFPG_MAX_REQUEUE_PER_EPOCH).
-                // Convergence: SOURCE output is fixed (m_MaxOutput), so re-processing
-                // only updates loadRatio/masks — no cascading downstream changes.
-                if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH && outputDelta > LFPG_PROPAGATION_EPSILON)
-                {
-                    ref array<ref LFPG_ElecEdge> upEdges;
-                    if (m_Incoming.Find(nodeId, upEdges) && upEdges)
-                    {
-                        int ui;
-                        for (ui = 0; ui < upEdges.Count(); ui = ui + 1)
-                        {
-                            ref LFPG_ElecEdge upEdge = upEdges[ui];
-                            m_EdgesVisitedThisEpoch = m_EdgesVisitedThisEpoch + 1;
-                            if (upEdge && upEdge.m_SourceNodeId != "")
-                            {
-                                ref LFPG_ElecNode upNode;
-                                if (m_Nodes.Find(upEdge.m_SourceNodeId, upNode) && upNode)
-                                {
-                                    EnsureRequeueEpoch(upEdge.m_SourceNodeId, upNode);
-                                    upNode.m_RequeueCount = upNode.m_RequeueCount + 1;
-                                    // Allow same-epoch reprocessing (B1 pattern).
-                                    // Without this reset, epoch-skip (line ~1647)
-                                    // consumes the node without clearing m_InQueue,
-                                    // leaving a zombie that blocks future re-enqueue.
-                                    if (upNode.m_LastEpoch == m_CurrentEpoch)
-                                    {
-                                        int prevUp = m_CurrentEpoch - 1;
-                                        upNode.m_LastEpoch = prevUp;
-                                    }
-                                }
-                                MarkNodeDirty(upEdge.m_SourceNodeId, LFPG_DIRTY_INPUT);
-                            }
-                        }
-                    }
-                }
-            }
-            else
-            {
-                node.m_OutputPower = newOutput;
-            }
-
-            // --- Step 4: Mark as processed ---
+            node.m_InputPower = node.m_SolveInputPower;
+            node.m_PrevInputPower = node.m_SolveInputPower;
+            node.m_OutputPower = node.m_SolveOutputPower;
+            node.m_LastStableOutput = node.m_SolveOutputPower;
+            node.m_Powered = node.m_SolvePowered;
+            node.m_Overloaded = node.m_SolveOverloaded;
+            node.m_LoadRatio = node.m_SolveLoadRatio;
+            node.m_SoftDemandRatio = node.m_SolveSoftRatio;
+            node.m_GateClosed = node.m_SolveGateClosed;
             node.m_LastEpoch = m_CurrentEpoch;
+        }
+
+        for (nodeIndex = 0; nodeIndex < solveOrder.Count(); nodeIndex = nodeIndex + 1)
+        {
+            string nodeId = solveOrder[nodeIndex];
+            ref LFPG_ElecNode syncNode;
+            if (m_Nodes.Find(nodeId, syncNode) && syncNode)
+                SyncNodeToEntity(nodeId, syncNode);
+        }
+        #endif
+    }
+
+    protected bool ValidateFrozenSolution(array<string> solveOrder)
+    {
+        #ifdef SERVER
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < solveOrder.Count(); nodeIndex = nodeIndex + 1)
+        {
+            string nodeId = solveOrder[nodeIndex];
+            ref LFPG_ElecNode node;
+            if (!m_Nodes.Find(nodeId, node) || !node)
+                return false;
+
+            // NaN is the only floating-point value that is not equal to itself.
+            if (node.m_SolveDemand != node.m_SolveDemand || node.m_SolveInputPower != node.m_SolveInputPower || node.m_SolveRealOutput != node.m_SolveRealOutput)
+                return false;
+            if (node.m_SolveDemand < 0.0 || node.m_SolveInputPower < 0.0 || node.m_SolveRealOutput < 0.0)
+                return false;
+
+            float outgoingAllocated = 0.0;
+            ref array<ref LFPG_ElecEdge> outEdges;
+            if (m_Outgoing.Find(nodeId, outEdges) && outEdges)
+            {
+                int edgeIndex;
+                for (edgeIndex = 0; edgeIndex < outEdges.Count(); edgeIndex = edgeIndex + 1)
+                {
+                    LFPG_ElecEdge edge = outEdges[edgeIndex];
+                    if (!edge || (edge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                        continue;
+                    if (edge.m_SolveDemand != edge.m_SolveDemand || edge.m_SolveAllocatedPower != edge.m_SolveAllocatedPower)
+                        return false;
+                    if (edge.m_SolveDemand < 0.0 || edge.m_SolveAllocatedPower < 0.0)
+                        return false;
+                    if (edge.m_SolveAllocatedPower > edge.m_SolveDemand + LFPG_PROPAGATION_EPSILON)
+                        return false;
+                    outgoingAllocated = outgoingAllocated + edge.m_SolveAllocatedPower;
+                }
+            }
+
+            if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
+            {
+                float sourceLimit = 0.0;
+                if (node.m_SolvePowered)
+                    sourceLimit = node.m_MaxOutput;
+                if (outgoingAllocated > sourceLimit + LFPG_PROPAGATION_EPSILON)
+                    return false;
+            }
+            else if (node.m_DeviceType == LFPG_DeviceType.PASSTHROUGH)
+            {
+                float passthroughLimit = node.m_SolveRealOutput;
+                if (node.m_SolveGateClosed)
+                    passthroughLimit = 0.0;
+                if (outgoingAllocated > passthroughLimit + LFPG_PROPAGATION_EPSILON)
+                    return false;
+            }
+            else if (node.m_DeviceType == LFPG_DeviceType.CONSUMER || node.m_DeviceType == LFPG_DeviceType.CAMERA)
+            {
+                bool shouldBePowered = false;
+                if (node.m_Consumption > LFPG_PROPAGATION_EPSILON)
+                    shouldBePowered = node.m_SolveInputPower + LFPG_PROPAGATION_EPSILON >= node.m_Consumption;
+                else
+                    shouldBePowered = node.m_SolveInputPower > LFPG_PROPAGATION_EPSILON;
+                if (node.m_SolvePowered != shouldBePowered)
+                    return false;
+            }
+        }
+        return true;
+        #else
+        return false;
+        #endif
+    }
+
+    protected void CommitSolveFailSafe()
+    {
+        #ifdef SERVER
+        int ownerIndex;
+        for (ownerIndex = 0; ownerIndex < m_Outgoing.Count(); ownerIndex = ownerIndex + 1)
+        {
+            ref array<ref LFPG_ElecEdge> edges = m_Outgoing.GetElement(ownerIndex);
+            if (!edges)
+                continue;
+            int edgeIndex;
+            for (edgeIndex = 0; edgeIndex < edges.Count(); edgeIndex = edgeIndex + 1)
+            {
+                LFPG_ElecEdge edge = edges[edgeIndex];
+                if (!edge)
+                    continue;
+                edge.m_Demand = 0.0;
+                edge.m_AllocatedPower = 0.0;
+            }
+        }
+
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < m_Nodes.Count(); nodeIndex = nodeIndex + 1)
+        {
+            string nodeId = m_Nodes.GetKey(nodeIndex);
+            ref LFPG_ElecNode node = m_Nodes.GetElement(nodeIndex);
+            if (!node)
+                continue;
+
+            node.m_InputPower = 0.0;
+            node.m_PrevInputPower = 0.0;
+            node.m_Overloaded = false;
+            node.m_LoadRatio = 0.0;
+            node.m_SoftDemandRatio = 0.0;
+            if (node.m_DeviceType == LFPG_DeviceType.SOURCE)
+            {
+                if (node.m_Powered)
+                    node.m_OutputPower = node.m_MaxOutput;
+                else
+                    node.m_OutputPower = 0.0;
+                node.m_LastStableOutput = node.m_OutputPower;
+            }
+            else
+            {
+                node.m_Powered = false;
+                node.m_OutputPower = 0.0;
+                node.m_LastStableOutput = 0.0;
+            }
+            node.m_LastEpoch = m_CurrentEpoch;
+        }
+
+        for (nodeIndex = 0; nodeIndex < m_Nodes.Count(); nodeIndex = nodeIndex + 1)
+        {
+            string syncId = m_Nodes.GetKey(nodeIndex);
+            ref LFPG_ElecNode syncNode = m_Nodes.GetElement(nodeIndex);
+            if (syncNode)
+                SyncNodeToEntity(syncId, syncNode);
+        }
+        #endif
+    }
+
+    protected void ClearSolvedDirtyState()
+    {
+        #ifdef SERVER
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < m_Nodes.Count(); nodeIndex = nodeIndex + 1)
+        {
+            ref LFPG_ElecNode node = m_Nodes.GetElement(nodeIndex);
+            if (!node)
+                continue;
             node.m_Dirty = false;
             node.m_InQueue = false;
             node.m_DirtyMask = 0;
-
-            // --- Step 5: Sync state to entity ---
-            SyncNodeToEntity(nodeId, node);
+            node.m_RequeueCount = 0;
         }
-
-        // v0.8.3: Re-enqueue nodes deferred by requeue limit.
-        // Dirty state was preserved in Edit 4. These nodes will process in
-        // the next epoch with a lazy reset when each node is touched.
-        // O(K) where K = deferred nodes (typically 1-3).
-        // Convergence: each deferred epoch makes at least one node's worth
-        // of progress, so topologies with N layers converge in ≤N extra epochs.
-        if (m_DeferredRequeue.Count() > 0)
-        {
-            int dri;
-            for (dri = 0; dri < m_DeferredRequeue.Count(); dri = dri + 1)
-            {
-                string drNodeId = m_DeferredRequeue[dri];
-                ref LFPG_ElecNode drNode;
-                if (m_Nodes.Find(drNodeId, drNode) && drNode)
-                {
-                    if (drNode.m_Dirty && !drNode.m_InQueue)
-                    {
-                        drNode.m_InQueue = true;
-                        m_DirtyQueue.Insert(drNodeId);
-                    }
-                }
-            }
-            m_DeferredRequeue.Clear();
-        }
-
-        // H4: Compact the queue only when head passes threshold
-        int remaining = m_DirtyQueue.Count() - m_DirtyQueueHead;
-        if (remaining <= 0)
-        {
-            m_DirtyQueue.Clear();
-            m_DirtyQueueHead = 0;
-
-            // v0.7.32 (Bloque C): Validate consumers in steady-state.
-            // Only runs when no pending propagation (queue fully drained).
-            ValidateConsumerStates(edgeBudget);
-            // Validation can enqueue PASSTHROUGH nodes for a full graph-driven
-            // repair. Report those nodes to the scheduler instead of claiming
-            // the graph is quiescent for one tick.
-            remaining = m_DirtyQueue.Count() - m_DirtyQueueHead;
-        }
-        else if (m_DirtyQueueHead >= LFPG_DIRTY_QUEUE_COMPACT_THRESHOLD)
-        {
-            ref array<string> compacted = new array<string>;
-            int ci;
-            for (ci = m_DirtyQueueHead; ci < m_DirtyQueue.Count(); ci = ci + 1)
-            {
-                compacted.Insert(m_DirtyQueue[ci]);
-            }
-            m_DirtyQueue.Clear();
-            int cc;
-            for (cc = 0; cc < compacted.Count(); cc = cc + 1)
-            {
-                m_DirtyQueue.Insert(compacted[cc]);
-            }
-            m_DirtyQueueHead = 0;
-            remaining = m_DirtyQueue.Count();
-        }
-
-        int elapsed = g_Game.GetTime() - startMs;
-        m_LastProcessMs = elapsed;
-
-        if (processed > 0)
-        {
-            string dbgProc = "[ElecGraph] ProcessDirtyQueue: processed=" + processed.ToString() + " edges=" + m_EdgesVisitedThisEpoch.ToString() + " remaining=" + remaining.ToString() + " epoch=" + m_CurrentEpoch.ToString() + " ms=" + elapsed.ToString();
-            LFPG_Util.Debug(dbgProc);
-        }
-
-        m_PropagationEdgeAccountingActive = false;
-        return remaining;
-        #else
-        return 0;
+        m_DirtyQueue.Clear();
+        m_DirtyQueueHead = 0;
+        m_DeferredRequeue.Clear();
+        m_RequeueEpoch.Clear();
         #endif
     }
 
@@ -4190,6 +4149,9 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     {
         if (!node || !node.m_IsGated)
             return false;
+
+        if (m_DeterministicSolveActive)
+            return node.m_SolveGateClosed;
 
         bool gateClosed = node.m_GateClosed;
         EntityAI gateEntity = LFPG_DeviceRegistry.Get().FindById(nodeId);
