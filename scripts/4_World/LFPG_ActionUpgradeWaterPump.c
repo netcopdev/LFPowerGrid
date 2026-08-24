@@ -12,7 +12,7 @@
 //
 // On completion:
 //   1. Capture pos/ori and filter state
-//   2. Create and validate T2 at same pos/ori
+//   2. Create and validate T2 above T1, then align its base to T1's base
 //   3. Consume materials (excess dropped to ground)
 //   4. DeviceLifecycle.OnDeviceKilled (cuts wires, cleans graph)
 //   5. Delete T1
@@ -40,6 +40,11 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
     // vacated position after T1's physics body has been removed.
     static const float PUMP_UPGRADE_STAGING_HEIGHT_M = 2.0;
     static const int PUMP_UPGRADE_FINALIZE_DELAY_MS = 50;
+
+    // The T2 P3D extends farther below its object origin than the T1 P3D.
+    // Visual LOD minima are -0.929 m (T2) and -0.587 m (T1), so copying the
+    // T1 origin directly buries T2 by their 0.342 m difference.
+    static const float PUMP_T2_BASE_ALIGNMENT_Y_M = 0.342;
 
     void LFPG_ActionUpgradeWaterPump()
     {
@@ -225,8 +230,12 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
 
         // ObjectDelete is deferred. Moving T2 next tick guarantees that its
         // physics body never overlaps the old T1 body at the target position.
+        // Raise the final origin by the models' base-height difference so the
+        // replacement preserves T1's ground contact instead of sinking.
+        vector finalPos = pos;
+        finalPos[1] = finalPos[1] + PUMP_T2_BASE_ALIGNMENT_Y_M;
         bool finalizeOnce = false;
-        g_Game.GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(FinalizeT2Placement, PUMP_UPGRADE_FINALIZE_DELAY_MS, finalizeOnce, t2, pos, ori);
+        g_Game.GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(FinalizeT2Placement, PUMP_UPGRADE_FINALIZE_DELAY_MS, finalizeOnce, t2, finalPos, ori);
     }
 
     protected static void FinalizeT2Placement(EntityAI t2, vector finalPos, vector finalOri)
