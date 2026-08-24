@@ -248,10 +248,14 @@ class LFPG_ElecNode
     float  m_SoftDemand;
     float  m_SoftDemandRatio;
 
-    // Last physical supplier count observed for this node. AllocateOutput
+    // Last topology-derived supplier state observed for this node. The graph
     // uses transitions to re-evaluate sibling inputs of multi-source targets
-    // when a source is switched on or off without changing total demand.
+    // when a source, gate, battery, or upstream capacity changes without
+    // changing the target's advertised demand. These values must never be
+    // derived from current edge allocations; doing so feeds the allocation
+    // result back into demand sharing and can create a permanent oscillation.
     int    m_ActiveSupplierCount;
+    float  m_ActiveSupplierCapacity;
 
     void LFPG_ElecNode()
     {
@@ -279,6 +283,7 @@ class LFPG_ElecNode
         m_SoftDemand = 0.0;
         m_SoftDemandRatio = 0.0;
         m_ActiveSupplierCount = -1;
+        m_ActiveSupplierCapacity = -1.0;
     }
 };
 

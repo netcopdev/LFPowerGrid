@@ -118,6 +118,11 @@ class LFPG_SwitchV2 : LFPG_WireOwnerBase
         return m_SwitchOn;
     }
 
+    override bool LFPG_IsGateControlPowerIndependent()
+    {
+        return true;
+    }
+
     override float LFPG_GetConsumption()
     {
         return 0.0;

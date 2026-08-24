@@ -528,6 +528,15 @@ class LFPG_DeviceBase : Inventory_Base
         return true;
     }
 
+    // True when LFPG_IsGateOpen is a control state that remains meaningful
+    // without electrical input (for example a latching switch or battery
+    // output selector). Power-dependent devices keep the default false so the
+    // graph can distinguish an induced fail-safe close from a real command.
+    bool LFPG_IsGateControlPowerIndependent()
+    {
+        return false;
+    }
+
     bool LFPG_HasWireStore()
     {
         return false;

@@ -20,7 +20,7 @@
 // - ProcessDirtyQueue: BFS propagation with node+edge budgets,
 //   requeue limits, and deferred requeue for deep chains.
 // - AllocateOutput: binary demand/allocation on outgoing edges.
-//   Multi-source split via CountPoweredIncoming (Combiner pattern).
+//   Multi-source split via stable potential-supply capacity.
 // - SyncNodeToEntity: syncs LoadRatio+Overloaded (SOURCE),
 //   Powered+Overloaded (PASSTHROUGH), Powered (CONSUMER/CAMERA).
 // - ValidateConsumerStates: bidirectional zombie/dark detection.
