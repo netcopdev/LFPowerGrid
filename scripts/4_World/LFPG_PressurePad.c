@@ -73,6 +73,7 @@ class LFPG_PressurePad : LFPG_WireOwnerBase
     override bool LFPG_GetSourceOn() { return m_PoweredNet; }
     override bool LFPG_IsGateCapable() { return true; }
     override bool LFPG_IsGateOpen() { return m_GateOpen; }
+    override bool LFPG_IsGateControlPowerIndependent() { return true; }
     override float LFPG_GetConsumption() { return LFPG_PAD_CONSUMPTION; }
     override float LFPG_GetCapacity() { return LFPG_PAD_CAPACITY; }
     override bool LFPG_IsPowered() { return m_PoweredNet; }

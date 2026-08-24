@@ -809,6 +809,8 @@ class LFPG_Generator : PowerGenerator
         if (!super.OnStoreLoad(ctx, version))
             return false;
 
+        string preLoadDeviceId = m_DeviceId;
+
         if (!ctx.Read(m_DeviceIdLow))
         {
             string slErrLow = "OnStoreLoad: failed to read m_DeviceIdLow";
@@ -824,6 +826,18 @@ class LFPG_Generator : PowerGenerator
         }
 
         LFPG_UpdateDeviceIdString();
+
+        #ifdef SERVER
+        if (preLoadDeviceId != "" && preLoadDeviceId != m_DeviceId)
+        {
+            LFPG_DeviceRegistry.Get().Unregister(preLoadDeviceId, this);
+        }
+        if (m_DeviceId != "")
+        {
+            LFPG_DeviceRegistry.Get().Register(this, m_DeviceId);
+        }
+        SetSynchDirty();
+        #endif
 
         if (!ctx.Read(m_SourceOn))
         {
@@ -1234,6 +1248,8 @@ class LF_TestLamp : Spotlight
         if (!super.OnStoreLoad(ctx, version))
             return false;
 
+        string preLoadDeviceId = m_DeviceId;
+
         if (!ctx.Read(m_DeviceIdLow))
         {
             string tlErrLow = "LF_TestLamp.OnStoreLoad: failed to read m_DeviceIdLow";
@@ -1249,6 +1265,18 @@ class LF_TestLamp : Spotlight
         }
 
         LFPG_UpdateDeviceIdString();
+
+        #ifdef SERVER
+        if (preLoadDeviceId != "" && preLoadDeviceId != m_DeviceId)
+        {
+            LFPG_DeviceRegistry.Get().Unregister(preLoadDeviceId, this);
+        }
+        if (m_DeviceId != "")
+        {
+            LFPG_DeviceRegistry.Get().Register(this, m_DeviceId);
+        }
+        SetSynchDirty();
+        #endif
 
         // v0.7.42: m_PoweredNet no longer persisted.
         // Field default (false) is correct; propagation re-derives it.

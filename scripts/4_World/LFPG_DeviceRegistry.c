@@ -12,10 +12,17 @@ class LFPG_DeviceRegistry
     protected static ref LFPG_DeviceRegistry s_Instance;
 
     protected ref map<string, EntityAI> m_ById;
+    // Reverse ownership makes the registry a one-to-one identity map.  DayZ
+    // calls EEInit before OnStoreLoad, so a persisted LFPG entity briefly owns
+    // a generated ID and then restores its saved ID.  Without the reverse map
+    // both keys survived and the graph could address one physical device as
+    // two electrical nodes.
+    protected ref map<EntityAI, string> m_IdByEntity;
 
     void LFPG_DeviceRegistry()
     {
         m_ById = new map<string, EntityAI>;
+        m_IdByEntity = new map<EntityAI, string>;
     }
 
     static LFPG_DeviceRegistry Get()
@@ -30,6 +37,7 @@ class LFPG_DeviceRegistry
         if (s_Instance)
         {
             s_Instance.m_ById.Clear();
+            s_Instance.m_IdByEntity.Clear();
             s_Instance = null;
         }
     }
@@ -39,7 +47,54 @@ class LFPG_DeviceRegistry
         if (!obj || deviceId == "")
             return;
 
-        m_ById[deviceId] = obj;
+        // Native LFPG IDs live on the entity and are authoritative.  Several
+        // RPC/legacy resolution paths pass a correlational ID to Register;
+        // accepting that as another key recreates the alias problem even after
+        // the persistence lifecycle has been fixed.  Vanilla devices have no
+        // LFPG ID and retain the deterministic ID supplied by their caller.
+        string authoritativeId = LFPG_DeviceAPI.GetDeviceId(obj);
+        if (authoritativeId != "" && authoritativeId != deviceId)
+        {
+            string aliasMsg = "[DeviceRegistry] Ignored non-authoritative alias ";
+            aliasMsg = aliasMsg + deviceId + " canonical=" + authoritativeId;
+            aliasMsg = aliasMsg + " type=" + obj.GetType();
+            LFPG_Util.Warn(aliasMsg);
+            deviceId = authoritativeId;
+        }
+
+        // Remove the previous key owned by this same entity.  This is the
+        // normal EEInit -> OnStoreLoad transition for persisted devices.
+        string previousId;
+        if (m_IdByEntity.Find(obj, previousId) && previousId != "" && previousId != deviceId)
+        {
+            EntityAI previousOwner;
+            if (m_ById.Find(previousId, previousOwner) && previousOwner == obj)
+            {
+                m_ById.Remove(previousId);
+            }
+        }
+
+        // A DeviceId may never name two live entities.  Preserve the existing
+        // registry behaviour (the latest authoritative registration wins), but
+        // also detach the displaced entity's reverse entry so it cannot later
+        // remove the new owner by mistake.
+        EntityAI displaced;
+        if (m_ById.Find(deviceId, displaced) && displaced && displaced != obj)
+        {
+            string displacedId;
+            if (m_IdByEntity.Find(displaced, displacedId) && displacedId == deviceId)
+            {
+                m_IdByEntity.Remove(displaced);
+            }
+
+            string collisionMsg = "[DeviceRegistry] DeviceId collision replaced key=";
+            collisionMsg = collisionMsg + deviceId + " oldType=" + displaced.GetType();
+            collisionMsg = collisionMsg + " newType=" + obj.GetType();
+            LFPG_Util.Warn(collisionMsg);
+        }
+
+        m_ById.Set(deviceId, obj);
+        m_IdByEntity.Set(obj, deviceId);
     }
 
     void Unregister(string deviceId, EntityAI objExpected = null)
@@ -51,7 +106,15 @@ class LFPG_DeviceRegistry
         if (m_ById.Find(deviceId, current))
         {
             if (!objExpected || objExpected == current)
+            {
                 m_ById.Remove(deviceId);
+
+                string reverseId;
+                if (current && m_IdByEntity.Find(current, reverseId) && reverseId == deviceId)
+                {
+                    m_IdByEntity.Remove(current);
+                }
+            }
         }
     }
 
@@ -76,9 +139,9 @@ class LFPG_DeviceRegistry
     }
 
     // v0.7.44 (Level 4, hallazgo 1a): Filter null refs in GetAll.
-    // v0.9.3: Deduplicate by entity pointer — same entity can be registered
-    // under multiple keys if TryRegister misses cleanup of old key.
-    // Without dedup, RebuildFromWires iterates wires twice → double edges.
+    // The registry now enforces one key per entity in Register.  Keep the
+    // pointer dedup as a defensive read barrier for state created by an older
+    // hot-reloaded script instance; encountering it is an invariant failure.
     void GetAll(array<EntityAI> outArr)
     {
         if (!outArr)
@@ -140,6 +203,20 @@ class LFPG_DeviceRegistry
         for (k = 0; k < nullKeys.Count(); k = k + 1)
         {
             m_ById.Remove(nullKeys[k]);
+        }
+
+        // Entity handles can be invalidated without EEDelete.  Rebuild the
+        // reverse ownership table from the surviving authoritative map so it
+        // cannot retain dead object keys or drift after a collision repair.
+        m_IdByEntity.Clear();
+        int reverseIndex;
+        for (reverseIndex = 0; reverseIndex < m_ById.Count(); reverseIndex = reverseIndex + 1)
+        {
+            EntityAI reverseEntity = m_ById.GetElement(reverseIndex);
+            if (reverseEntity)
+            {
+                m_IdByEntity.Set(reverseEntity, m_ById.GetKey(reverseIndex));
+            }
         }
 
         if (nullKeys.Count() > 0)

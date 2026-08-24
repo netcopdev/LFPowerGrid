@@ -64,6 +64,7 @@ class LFPG_SwitchV2Remote : LFPG_WireOwnerBase
     override bool LFPG_GetSourceOn() { return m_PoweredNet; }
     override bool LFPG_IsGateCapable() { return true; }
     override bool LFPG_IsGateOpen() { return m_SwitchOn; }
+    override bool LFPG_IsGateControlPowerIndependent() { return true; }
     override float LFPG_GetConsumption() { return 0.0; }
     override float LFPG_GetCapacity() { return LFPG_DEFAULT_PASSTHROUGH_CAPACITY; }
     override bool LFPG_IsPowered() { return m_PoweredNet; }

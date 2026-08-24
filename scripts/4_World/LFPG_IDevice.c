@@ -538,6 +538,15 @@ class LFPG_DeviceAPI
         return CallBool(e, "LFPG_IsGateCapable", null, false);
     }
 
+    static bool IsGateControlPowerIndependent(EntityAI e)
+    {
+        if (!e) return false;
+        LFPG_DeviceBase dev = LFPG_DeviceBase.Cast(e);
+        if (dev)
+            return dev.LFPG_IsGateControlPowerIndependent();
+        return CallBool(e, "LFPG_IsGateControlPowerIndependent", null, false);
+    }
+
     static bool GetPowered(Object obj)
     {
         if (!obj) return false;

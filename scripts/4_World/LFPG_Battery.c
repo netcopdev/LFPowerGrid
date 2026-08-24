@@ -187,6 +187,13 @@ class LFPG_BatteryBase : LFPG_WireOwnerBase
         return m_PoweredNet;
     }
 
+    // The output selector is a mechanical/latching command. It remains
+    // authoritative while the battery has no input or is in brownout.
+    override bool LFPG_IsGateControlPowerIndependent()
+    {
+        return true;
+    }
+
     override void LFPG_SetPowered(bool powered)
     {
         #ifdef SERVER

@@ -362,6 +362,11 @@ class LFPG_DeviceBase : Inventory_Base
         if (!super.OnStoreLoad(ctx, version))
             return false;
 
+        // EEInit runs before persistence is restored and registers a temporary
+        // generated ID.  Retain it long enough to remove that exact registry
+        // entry after the saved ID has been read.
+        string preLoadDeviceId = m_DeviceId;
+
         if (!ctx.Read(m_DeviceIdLow))
         {
             string errLow = "[LFPG_DeviceBase] OnStoreLoad failed: m_DeviceIdLow on " + GetType();
@@ -377,6 +382,18 @@ class LFPG_DeviceBase : Inventory_Base
         }
 
         LFPG_UpdateDeviceIdString();
+
+        #ifdef SERVER
+        if (preLoadDeviceId != "" && preLoadDeviceId != m_DeviceId)
+        {
+            LFPG_DeviceRegistry.Get().Unregister(preLoadDeviceId, this);
+        }
+        if (m_DeviceId != "")
+        {
+            LFPG_DeviceRegistry.Get().Register(this, m_DeviceId);
+        }
+        SetSynchDirty();
+        #endif
 
         int deviceVer = 0;
         if (!ctx.Read(deviceVer))
@@ -526,6 +543,15 @@ class LFPG_DeviceBase : Inventory_Base
     bool LFPG_IsGateOpen()
     {
         return true;
+    }
+
+    // True when LFPG_IsGateOpen is a control state that remains meaningful
+    // without electrical input (for example a latching switch or battery
+    // output selector). Power-dependent devices keep the default false so the
+    // graph can distinguish an induced fail-safe close from a real command.
+    bool LFPG_IsGateControlPowerIndependent()
+    {
+        return false;
     }
 
     bool LFPG_HasWireStore()

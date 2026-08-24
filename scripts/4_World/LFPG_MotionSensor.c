@@ -203,6 +203,13 @@ class LFPG_MotionSensor : LFPG_WireOwnerBase
         return m_GateOpen;
     }
 
+    // Detection is evaluated by the centralized sensor tick independently of
+    // the graph's current input allocation.
+    override bool LFPG_IsGateControlPowerIndependent()
+    {
+        return true;
+    }
+
     override bool LFPG_IsPowered()
     {
         return m_PoweredNet;
