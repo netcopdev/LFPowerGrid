@@ -99,6 +99,10 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     protected ref map<string, ref array<string>> m_PotentialContributorCache;
     protected ref map<string, bool> m_PotentialContributorVisiting;
     protected ref map<string, float> m_PotentialContributorCapacity;
+    // A recursion guard requests a completed-adjacency audit on the next safe
+    // scheduler boundary.  This heals cycles introduced by legacy/import code
+    // after startup instead of leaving one dirty node alive forever.
+    protected bool m_RuntimeCycleAuditRequested;
 
     // --- v0.7.31 (Bloque B): Component Watchdog ---
     // m_ComponentSizes: populated in RebuildComponents(), keyed by componentId.
@@ -174,6 +178,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         m_PotentialContributorCache = new map<string, ref array<string>>;
         m_PotentialContributorVisiting = new map<string, bool>;
         m_PotentialContributorCapacity = new map<string, float>;
+        m_RuntimeCycleAuditRequested = false;
 
         // v0.7.31 (Bloque B): Component Watchdog buffers
         m_ComponentSizes = new map<int, int>;
@@ -232,6 +237,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         m_PotentialContributorCache.Clear();
         m_PotentialContributorVisiting.Clear();
         m_PotentialContributorCapacity.Clear();
+        m_RuntimeCycleAuditRequested = false;
 
         // v0.7.34 (Bloque E): Full rebuild invalidates any active mutation
         if (m_MutationActive)
@@ -339,6 +345,21 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
 
                 AddEdgeInternal(vOwnerId, vwd.m_TargetDeviceId, srcPort, vwd.m_TargetPort, vwd);
             }
+        }
+
+        // The incremental check above should make this graph a DAG.  Audit the
+        // completed adjacency anyway: identity aliases, imported/legacy stores,
+        // or an asymmetric mutation can make an edge-by-edge assumption differ
+        // from the graph the capacity solver will actually traverse.  Legal
+        // split/recombine diamonds remain untouched because they have no path
+        // from an edge target back to its source.
+        int auditedCycleEdges = SanitizeCompletedGraphCycles();
+        if (auditedCycleEdges > 0)
+        {
+            string auditSummary = "[ElecGraph] Rebuild runtime DAG audit omitted ";
+            auditSummary = auditSummary + auditedCycleEdges.ToString();
+            auditSummary = auditSummary + " cycle-closing edge(s)";
+            LFPG_Util.Warn(auditSummary);
         }
 
         // Step 4: Prune nodes with no edges
@@ -1128,6 +1149,314 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
     // ===========================
     // Cycle detection
     // ===========================
+
+    // O(V+E) Kahn audit used as the normal fast path.  A legal large graph is
+    // validated once without running a path search per edge.  The more detailed
+    // path finder below is invoked only when this proves a cycle exists.
+    protected bool CompletedGraphHasDirectedCycle()
+    {
+        #ifdef SERVER
+        ref map<string, int> indegree = new map<string, int>;
+        ref array<string> zeroQueue = new array<string>;
+
+        int nodeIndex;
+        for (nodeIndex = 0; nodeIndex < m_Nodes.Count(); nodeIndex = nodeIndex + 1)
+        {
+            indegree.Set(m_Nodes.GetKey(nodeIndex), 0);
+        }
+
+        int ownerIndex;
+        for (ownerIndex = 0; ownerIndex < m_Outgoing.Count(); ownerIndex = ownerIndex + 1)
+        {
+            string ownerId = m_Outgoing.GetKey(ownerIndex);
+            int ownerDegree;
+            if (!indegree.Find(ownerId, ownerDegree))
+            {
+                indegree.Set(ownerId, 0);
+            }
+
+            ref array<ref LFPG_ElecEdge> ownerEdges = m_Outgoing.GetElement(ownerIndex);
+            if (!ownerEdges)
+                continue;
+
+            int edgeIndex;
+            for (edgeIndex = 0; edgeIndex < ownerEdges.Count(); edgeIndex = edgeIndex + 1)
+            {
+                LFPG_ElecEdge edge = ownerEdges[edgeIndex];
+                if (!edge)
+                    continue;
+                if ((edge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                    continue;
+                if (edge.m_TargetNodeId == "")
+                    continue;
+
+                int targetDegree = 0;
+                indegree.Find(edge.m_TargetNodeId, targetDegree);
+                indegree.Set(edge.m_TargetNodeId, targetDegree + 1);
+            }
+        }
+
+        int degreeIndex;
+        for (degreeIndex = 0; degreeIndex < indegree.Count(); degreeIndex = degreeIndex + 1)
+        {
+            if (indegree.GetElement(degreeIndex) == 0)
+            {
+                zeroQueue.Insert(indegree.GetKey(degreeIndex));
+            }
+        }
+
+        int queueHead = 0;
+        int processedCount = 0;
+        while (queueHead < zeroQueue.Count())
+        {
+            string currentId = zeroQueue[queueHead];
+            queueHead = queueHead + 1;
+            processedCount = processedCount + 1;
+
+            ref array<ref LFPG_ElecEdge> currentEdges;
+            if (!m_Outgoing.Find(currentId, currentEdges) || !currentEdges)
+                continue;
+
+            int currentEdgeIndex;
+            for (currentEdgeIndex = 0; currentEdgeIndex < currentEdges.Count(); currentEdgeIndex = currentEdgeIndex + 1)
+            {
+                LFPG_ElecEdge currentEdge = currentEdges[currentEdgeIndex];
+                if (!currentEdge)
+                    continue;
+                if ((currentEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                    continue;
+                if (currentEdge.m_TargetNodeId == "")
+                    continue;
+
+                int remainingDegree = 0;
+                if (!indegree.Find(currentEdge.m_TargetNodeId, remainingDegree))
+                    continue;
+                remainingDegree = remainingDegree - 1;
+                indegree.Set(currentEdge.m_TargetNodeId, remainingDegree);
+                if (remainingDegree == 0)
+                {
+                    zeroQueue.Insert(currentEdge.m_TargetNodeId);
+                }
+            }
+        }
+
+        return processedCount < indegree.Count();
+        #else
+        return false;
+        #endif
+    }
+
+    // Search the actual enabled adjacency for startId -> targetId while
+    // ignoring one candidate edge.  When found, outPath contains both path
+    // endpoints in traversal order.  This is intentionally independent from
+    // DetectCycleIfAdded so the rebuild audit does not share its assumptions.
+    protected bool FindDirectedPathExcludingEdge(string startId, string targetId, LFPG_ElecEdge excludedEdge, array<string> outPath)
+    {
+        #ifdef SERVER
+        if (!outPath)
+            return false;
+
+        outPath.Clear();
+        if (startId == "" || targetId == "")
+            return false;
+
+        if (startId == targetId)
+        {
+            outPath.Insert(startId);
+            return true;
+        }
+
+        ref array<string> stack = new array<string>;
+        ref map<string, bool> visited = new map<string, bool>;
+        ref map<string, string> parent = new map<string, string>;
+        stack.Insert(startId);
+
+        int visitedCount = 0;
+        while (stack.Count() > 0)
+        {
+            if (visitedCount >= LFPG_DFS_MAX_VISITED)
+            {
+                string limitMsg = "[ElecGraph] Completed DAG audit reached DFS limit from ";
+                limitMsg = limitMsg + startId + " to " + targetId;
+                LFPG_Util.Warn(limitMsg);
+                return false;
+            }
+
+            int topIndex = stack.Count() - 1;
+            string currentId = stack[topIndex];
+            stack.Remove(topIndex);
+
+            bool wasVisited = false;
+            visited.Find(currentId, wasVisited);
+            if (wasVisited)
+                continue;
+
+            visited.Set(currentId, true);
+            visitedCount = visitedCount + 1;
+
+            if (currentId == targetId)
+            {
+                ref array<string> reversePath = new array<string>;
+                string cursor = targetId;
+                reversePath.Insert(cursor);
+
+                int parentSteps = 0;
+                while (cursor != startId && parentSteps <= LFPG_DFS_MAX_VISITED)
+                {
+                    string parentId;
+                    if (!parent.Find(cursor, parentId) || parentId == "")
+                        return false;
+                    cursor = parentId;
+                    reversePath.Insert(cursor);
+                    parentSteps = parentSteps + 1;
+                }
+
+                if (cursor != startId)
+                    return false;
+
+                int reverseIndex;
+                for (reverseIndex = reversePath.Count() - 1; reverseIndex >= 0; reverseIndex = reverseIndex - 1)
+                {
+                    outPath.Insert(reversePath[reverseIndex]);
+                }
+                return true;
+            }
+
+            ref array<ref LFPG_ElecEdge> outgoingEdges;
+            if (!m_Outgoing.Find(currentId, outgoingEdges) || !outgoingEdges)
+                continue;
+
+            int edgeIndex;
+            for (edgeIndex = 0; edgeIndex < outgoingEdges.Count(); edgeIndex = edgeIndex + 1)
+            {
+                LFPG_ElecEdge walkEdge = outgoingEdges[edgeIndex];
+                if (!walkEdge || walkEdge == excludedEdge)
+                    continue;
+                if ((walkEdge.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                    continue;
+                if (walkEdge.m_TargetNodeId == "")
+                    continue;
+
+                bool targetVisited = false;
+                visited.Find(walkEdge.m_TargetNodeId, targetVisited);
+                if (targetVisited)
+                    continue;
+
+                string existingParent;
+                if (!parent.Find(walkEdge.m_TargetNodeId, existingParent))
+                {
+                    parent.Set(walkEdge.m_TargetNodeId, currentId);
+                    stack.Insert(walkEdge.m_TargetNodeId);
+                }
+            }
+        }
+
+        return false;
+        #else
+        return false;
+        #endif
+    }
+
+    // Validate the graph after every persisted edge source has been merged.
+    // For each edge U->V, a path V->U (excluding that edge) proves the edge is
+    // part of a directed cycle.  Remove one runtime edge, then restart the scan
+    // until no such path remains.  Wire persistence stays read-only; the full
+    // path in the warning identifies the data that an admin or repair pass can
+    // remove later.  Complexity is acceptable because rebuild is infrequent
+    // and graph size is bounded.
+    protected int SanitizeCompletedGraphCycles()
+    {
+        #ifdef SERVER
+        int removedCount = 0;
+        bool removedOne = true;
+
+        while (removedOne && removedCount <= LFPG_DFS_MAX_VISITED)
+        {
+            removedOne = false;
+            if (!CompletedGraphHasDirectedCycle())
+                break;
+
+            LFPG_ElecEdge cycleEdge = null;
+            ref array<string> cycleReturnPath = new array<string>;
+
+            int ownerIndex;
+            for (ownerIndex = 0; ownerIndex < m_Outgoing.Count() && !cycleEdge; ownerIndex = ownerIndex + 1)
+            {
+                ref array<ref LFPG_ElecEdge> ownerEdges = m_Outgoing.GetElement(ownerIndex);
+                if (!ownerEdges)
+                    continue;
+
+                int candidateIndex;
+                for (candidateIndex = 0; candidateIndex < ownerEdges.Count(); candidateIndex = candidateIndex + 1)
+                {
+                    LFPG_ElecEdge candidate = ownerEdges[candidateIndex];
+                    if (!candidate)
+                        continue;
+                    if ((candidate.m_Flags & LFPG_EDGE_ENABLED) == 0)
+                        continue;
+
+                    ref array<string> returnPath = new array<string>;
+                    if (FindDirectedPathExcludingEdge(candidate.m_TargetNodeId, candidate.m_SourceNodeId, candidate, returnPath))
+                    {
+                        cycleEdge = candidate;
+                        cycleReturnPath = returnPath;
+                        break;
+                    }
+                }
+            }
+
+            if (cycleEdge)
+            {
+                string cyclePath = cycleEdge.m_SourceNodeId;
+                int pathIndex;
+                for (pathIndex = 0; pathIndex < cycleReturnPath.Count(); pathIndex = pathIndex + 1)
+                {
+                    cyclePath = cyclePath + " -> " + cycleReturnPath[pathIndex];
+                }
+
+                string cycleMsg = "[ElecGraph] Completed DAG audit omitted runtime edge ";
+                cycleMsg = cycleMsg + cycleEdge.m_SourceNodeId + " -> " + cycleEdge.m_TargetNodeId;
+                cycleMsg = cycleMsg + " port=" + cycleEdge.m_SourcePort + "->" + cycleEdge.m_TargetPort;
+                cycleMsg = cycleMsg + " cycle=" + cyclePath;
+                LFPG_Util.Warn(cycleMsg);
+
+                string removeSource = cycleEdge.m_SourceNodeId;
+                string removeTarget = cycleEdge.m_TargetNodeId;
+                string removeSourcePort = cycleEdge.m_SourcePort;
+                string removeTargetPort = cycleEdge.m_TargetPort;
+                RemoveEdgeInternal(removeSource, removeTarget, removeSourcePort, removeTargetPort);
+                MarkNodeDirty(removeSource, LFPG_DIRTY_TOPOLOGY);
+                MarkNodeDirty(removeTarget, LFPG_DIRTY_TOPOLOGY);
+                MarkIncomingSuppliersDirty(removeTarget);
+                removedCount = removedCount + 1;
+                removedOne = true;
+            }
+            else
+            {
+                LFPG_Util.Error("[ElecGraph] Completed DAG audit found a cycle but could not isolate an edge");
+            }
+        }
+
+        if (CompletedGraphHasDirectedCycle())
+        {
+            LFPG_Util.Error("[ElecGraph] Completed DAG audit did not converge within its safety limit");
+        }
+
+        if (removedCount > 0)
+        {
+            m_PotentialSupplyCache.Clear();
+            m_PotentialSupplyVisiting.Clear();
+            m_PotentialContributorCache.Clear();
+            m_PotentialContributorVisiting.Clear();
+            m_PotentialContributorCapacity.Clear();
+            m_ComponentsDirty = true;
+        }
+
+        return removedCount;
+        #else
+        return 0;
+        #endif
+    }
 
     override bool DetectCycleIfAdded(string sourceId, string targetId)
     {
@@ -2133,6 +2462,23 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
                 CleanupOrphanNode(m_DeferredOrphanCleanup[sci]);
             }
             m_DeferredOrphanCleanup.Clear();
+        }
+
+        // Never mutate adjacency from inside a recursive capacity walk.  A
+        // guard raised on the previous tick lands here, where it is safe to
+        // audit and repair the completed graph before any new allocations are
+        // calculated.  Normal DAGs pay nothing beyond this bool check.
+        if (m_RuntimeCycleAuditRequested)
+        {
+            m_RuntimeCycleAuditRequested = false;
+            int runtimeCycleEdges = SanitizeCompletedGraphCycles();
+            if (runtimeCycleEdges > 0)
+            {
+                string runtimeAuditMsg = "[ElecGraph] Runtime DAG audit healed ";
+                runtimeAuditMsg = runtimeAuditMsg + runtimeCycleEdges.ToString();
+                runtimeAuditMsg = runtimeAuditMsg + " cycle-closing edge(s)";
+                LFPG_Util.Warn(runtimeAuditMsg);
+            }
         }
 
         int queueLen = m_DirtyQueue.Count() - m_DirtyQueueHead;
@@ -3758,6 +4104,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         bool visiting = false;
         if (m_PotentialSupplyVisiting.Find(nodeId, visiting) && visiting)
         {
+            m_RuntimeCycleAuditRequested = true;
             string cycleMsg = "[ElecGraph] Potential supply cycle guard for " + nodeId;
             LFPG_Util.Warn(cycleMsg);
             return 0.0;
@@ -3835,6 +4182,7 @@ class LFPG_ElecGraphImpl : LFPG_ElecGraph
         bool contributorVisiting = false;
         if (m_PotentialContributorVisiting.Find(nodeId, contributorVisiting) && contributorVisiting)
         {
+            m_RuntimeCycleAuditRequested = true;
             string cycleMsg = "[ElecGraph] Potential contributor cycle guard for " + nodeId;
             LFPG_Util.Warn(cycleMsg);
             return contributors;

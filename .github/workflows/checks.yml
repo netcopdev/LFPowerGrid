@@ -36,3 +36,7 @@ jobs:
 
       - name: Sweep the addon
         run: python .github/tools/enforce_checks.py --root .
+
+      - name: Graph identity and topology invariants
+        shell: pwsh
+        run: ./.github/tools/test_graph_invariants.ps1
