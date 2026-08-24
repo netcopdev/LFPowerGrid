@@ -35,6 +35,12 @@ class LFPG_ActionUpgradeWaterPumpCB : ActionContinuousBaseCB
 
 class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
 {
+    // T2 must exist before T1 materials are consumed so the upgrade remains
+    // rollback-safe. Stage it above the old pump, then move it into the
+    // vacated position after T1's physics body has been removed.
+    static const float PUMP_UPGRADE_STAGING_HEIGHT_M = 2.0;
+    static const int PUMP_UPGRADE_FINALIZE_DELAY_MS = 50;
+
     void LFPG_ActionUpgradeWaterPump()
     {
         m_CallbackClass = LFPG_ActionUpgradeWaterPumpCB;
@@ -151,36 +157,15 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
         if (filterItem)
             filterQty = filterItem.GetQuantity();
     
-        // Resolve the T2 surface position while T1 is still in the physics world.
-        vector rayFrom = pos;
-        rayFrom[1] = rayFrom[1] + 0.5;
-        vector rayTo = pos;
-        rayTo[1] = rayTo[1] - 1.0;
-        vector spawnPos = pos;
-        float groundY = 0.0;
-        float surfY = 0.0;
-        RaycastRVParams surfRay = new RaycastRVParams(rayFrom, rayTo, pump, 0);
-        surfRay.sorted = true;
-        array<ref RaycastRVResult> surfResults = new array<ref RaycastRVResult>;
-        DayZPhysics.RaycastRVProxy(surfRay, surfResults);
-    
-        if (surfResults.Count() > 0)
-        {
-            groundY = surfResults[0].pos[1];
-            spawnPos[1] = groundY;
-        }
-        else
-        {
-            surfY = g_Game.SurfaceY(pos[0], pos[2]);
-            spawnPos[1] = surfY;
-        }
-    
         if (!pump.LFPG_TryBeginExclusiveOp())
         {
             LFPG_Util.Warn("[UpgradePump] Another destructive operation already owns the target.");
             return;
         }
-        EntityAI t2 = EntityAI.Cast(g_Game.CreateObjectEx("LFPG_WaterPump_T2", spawnPos, ECE_CREATEPHYSICS));
+
+        vector stagingPos = pos;
+        stagingPos[1] = stagingPos[1] + PUMP_UPGRADE_STAGING_HEIGHT_M;
+        EntityAI t2 = EntityAI.Cast(g_Game.CreateObjectEx("LFPG_WaterPump_T2", stagingPos, ECE_CREATEPHYSICS));
         if (!t2)
         {
             pump.LFPG_EndExclusiveOp();
@@ -188,7 +173,7 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
             return;
         }
     
-        t2.SetPosition(spawnPos);
+        t2.SetPosition(stagingPos);
         t2.SetOrientation(ori);
         t2.Update();
     
@@ -237,9 +222,25 @@ class LFPG_ActionUpgradeWaterPump : ActionContinuousBase
         g_Game.ObjectDelete(nails);
         LFPG_DeviceLifecycle.OnDeviceKilled(pump, deviceId);
         g_Game.ObjectDelete(pump);
-    
-        // The exclusive flag intentionally remains set until EEDelete completes.
-        LFPG_Util.Info("[UpgradePump] T2 created at " + spawnPos.ToString() + " ori=" + ori.ToString() + " (T1 was " + pos.ToString() + ")");
+
+        // ObjectDelete is deferred. Moving T2 next tick guarantees that its
+        // physics body never overlaps the old T1 body at the target position.
+        bool finalizeOnce = false;
+        g_Game.GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(FinalizeT2Placement, PUMP_UPGRADE_FINALIZE_DELAY_MS, finalizeOnce, t2, pos, ori);
+    }
+
+    protected static void FinalizeT2Placement(EntityAI t2, vector finalPos, vector finalOri)
+    {
+        if (!t2)
+        {
+            LFPG_Util.Error("[UpgradePump] T2 vanished before final placement.");
+            return;
+        }
+
+        t2.SetPosition(finalPos);
+        t2.SetOrientation(finalOri);
+        t2.Update();
+        LFPG_Util.Info("[UpgradePump] T2 finalized at " + finalPos.ToString() + " ori=" + finalOri.ToString());
     }
 
     // Helpers stage every excess output before source materials are consumed.
