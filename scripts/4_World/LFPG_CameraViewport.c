@@ -128,6 +128,7 @@ class LFPG_CameraViewport
     protected bool      m_KeyS;
     protected bool      m_KeyD;
     protected bool      m_AimDirty;
+    protected int       m_AimReapplyFrames;
 
     // ---- Two-phase exit (COT pattern) ----
     // ---- Two-phase exit + server confirmation (COT pattern) ----
@@ -181,6 +182,7 @@ class LFPG_CameraViewport
         m_KeyS           = false;
         m_KeyD           = false;
         m_AimDirty       = false;
+        m_AimReapplyFrames = 0;
         m_ExitPhase      = 0;
         m_ExitWaitTimer  = 0.0;
         m_ExitCooldown   = 0;
@@ -541,6 +543,10 @@ class LFPG_CameraViewport
             m_ViewCamObj.SetPosition(viewPos);
             m_ViewCamObj.SetOrientation(viewOri);
             m_CameraIndex = index;
+            // The engine can restore the static camera's spawn orientation
+            // after this input/RPC callback. Reapply from normal update once
+            // that transition has settled so stored PTZ is visible at once.
+            m_AimReapplyFrames = 2;
             LFPG_Util.Debug("[CameraViewport] DIAG: Reused existing camera object");
             return true;
         }
@@ -564,6 +570,7 @@ class LFPG_CameraViewport
 
         m_ViewCamObj  = currentCam;
         m_CameraIndex = index;
+        m_AimReapplyFrames = 2;
         return true;
     }
 
@@ -784,6 +791,7 @@ class LFPG_CameraViewport
         m_KeyS = false;
         m_KeyD = false;
         m_AimDirty = false;
+        m_AimReapplyFrames = 0;
 
         if (m_ViewCamObj)
         {
@@ -886,6 +894,7 @@ class LFPG_CameraViewport
         m_KeyS = false;
         m_KeyD = false;
         m_AimDirty = false;
+        m_AimReapplyFrames = 0;
         m_CameraList = null;
         m_CameraIndex = 0;
         m_CameraTotal = 0;
@@ -966,6 +975,7 @@ class LFPG_CameraViewport
             m_KeyS = false;
             m_KeyD = false;
             m_AimDirty = false;
+            m_AimReapplyFrames = 0;
             m_CameraList     = null;
             m_CameraIndex    = 0;
             m_CameraTotal    = 0;
@@ -1008,6 +1018,15 @@ class LFPG_CameraViewport
 
         if (!m_Active)
             return;
+
+        // SelectSpectator/staticcamera may overwrite SetOrientation after
+        // EnterCamera returns. A short deferred reapply avoids showing center
+        // until the first pan input without adding a permanent per-frame set.
+        if (m_AimReapplyFrames > 0)
+        {
+            ApplyCurrentAim();
+            m_AimReapplyFrames = m_AimReapplyFrames - 1;
+        }
 
         // ---- Timeout ----
         m_ActiveDuration = m_ActiveDuration + timeslice;
